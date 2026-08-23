@@ -440,6 +440,12 @@ fn which(program: &str) -> bool {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let mut found = false;
     for dir in std::env::split_paths(&path) {
+        // Git Bash and other MSYS environments put a GNU coreutils
+        // `link.exe` (hardlink creator) in `<root>\usr\bin`, ahead of the
+        // MSVC tools; it rejects `/ENTRY:`-style flags, so skip those dirs.
+        if is_msys_bin_dir(&dir) {
+            continue;
+        }
         let candidate = dir.join(program);
         if candidate.is_file() {
             found = true;
@@ -447,6 +453,18 @@ fn which(program: &str) -> bool {
         }
     }
     found
+}
+
+#[cfg(target_os = "windows")]
+fn is_msys_bin_dir(dir: &std::path::Path) -> bool {
+    use std::path::Component;
+
+    match dir.components().rev().take(2).collect::<Vec<_>>()[..] {
+        [Component::Normal(a), Component::Normal(b)] => {
+            a.eq_ignore_ascii_case("usr") && b.eq_ignore_ascii_case("bin")
+        }
+        _ => false,
+    }
 }
 
 fn run_linker(command: &mut std::process::Command) -> Result<(), CodegenError> {
