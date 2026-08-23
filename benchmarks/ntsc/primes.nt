@@ -1,0 +1,24 @@
+// Prime number generation in NTSC - all in main()
+fun main() -> int {
+    var int count = 0;
+    var int i = 2;
+    while (i <= 1000) {
+        var int n = i;
+        var bool prime = true;
+        if (n >= 2) {
+            if (n == 2) { prime = true; } else {
+                if (n % 2 == 0) { prime = false; } else {
+                    var int j = 3;
+                    while (j * j <= n) {
+                        if (n % j == 0) { prime = false; }
+                        j = j + 2;
+                    }
+                }
+            }
+        } else { prime = false; }
+        if (prime) { count = count + 1; }
+        i = i + 1;
+    }
+    say("primes");
+    return count;
+}

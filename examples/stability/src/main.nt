@@ -1,0 +1,172 @@
+// stability — a large, deliberately complex example that shows the pieces of
+// Neutron holding together in one program.
+//
+// It combines classes with owned fields (including an `init`-less class whose
+// array fields are default-initialized and reclaimed), the iterator protocol,
+// views, moves, `copy()`, shared reference counting, `match`, exceptions,
+// recursion, string byte iteration, math, a threaded telemetry channel, an
+// async flight timeline, and `test` blocks.
+//
+// Build and run with:
+//   ntsc build
+//   ./build/debug/stability
+//
+// Run the unit tests with:
+//   ntsc test
+//
+// The debug build checks that every heap array and shared box is reclaimed
+// before the process exits: any leftover allocation prints an
+// `NTSC WARNING: Memory leak detected!` line on stderr. This example prints
+// none.
+
+use testing
+
+use "flight.nt"
+use "systems.nt"
+use "telemetry.nt"
+
+test orbital_velocity_range {
+    var v = orbital_velocity(398600.4418, 6371.0, 420.0)
+    testing.assert_true(v > 7600.0 && v < 7800.0)
+}
+
+test escape_exceeds_orbital {
+    var v = orbital_velocity(398600.4418, 6371.0, 420.0)
+    var ve = escape_velocity(398600.4418, 6371.0, 420.0)
+    testing.assert_true(ve > v)
+}
+
+test checksum_known_values {
+    testing.assert_eq(checksum("abc"), 294)
+    testing.assert_eq(checksum(""), 0)
+}
+
+test classify_edges {
+    testing.assert_eq(classify(0), "zero")
+    testing.assert_eq(classify(1), "one")
+    testing.assert_eq(classify(2), "two")
+    testing.assert_eq(classify(99), "many")
+}
+
+test recursion_terminates {
+    testing.assert_eq(sum_to(5), 15)
+    testing.assert_eq(sum_to(1), 1)
+}
+
+test mission_manifest_counts {
+    var mission = Mission()
+    mission.add_astronaut("a", 60.0)
+    mission.add_payload("p", 100.0)
+    mission.add_subsystem("s", 95)
+    testing.assert_eq(arrays.length(mission.crew), 1)
+    testing.assert_eq(arrays.length(mission.payloads), 1)
+    testing.assert_eq(mission.total_crew_mass(), 60.0)
+    testing.assert_eq(mission.total_payload_mass(), 100.0)
+    testing.assert_eq(mission.average_health(), 95)
+}
+
+fun run_build() {
+    say("  creating the flight manifest")
+    var mission = Mission()
+    mission.add_astronaut("anna", 62.0)
+    mission.add_astronaut("bob", 74.5)
+    mission.add_astronaut("carol", 58.0)
+    mission.add_payload("P-1 core", 120.0)
+    mission.add_payload("P-2 cargo", 260.0)
+    mission.add_subsystem("avionics", 97)
+    mission.add_subsystem("power", 100)
+    mission.add_subsystem("thermal", 91)
+    say("  crew " + arrays.length(mission.crew) + ", payloads " + arrays.length(mission.payloads) + ", subsystems " + arrays.length(mission.subsystems))
+    say("  total crew mass: " + mission.total_crew_mass() + " kg")
+    say("  total payload mass: " + mission.total_payload_mass() + " kg")
+    say("  average subsystem health: " + mission.average_health() + "%")
+    mission.manifest()
+
+    var astro = Astronaut("ray", 71.0)
+    say("  solo astronaut badge: " + astro.badge())
+}
+
+fun run_orbit() {
+    say("  sampling an orbit with the iterator protocol")
+    var orbit = Orbit(6771.0, 7.5, 5)
+    for (var r in orbit) {
+        say("    radius " + r + " km")
+    }
+
+    var gm = 398600.4418
+    say("  orbital velocity at 420 km: " + orbital_velocity(gm, 6371.0, 420.0) + " m/s")
+    say("  escape velocity at 420 km:  " + escape_velocity(gm, 6371.0, 420.0) + " m/s")
+    say("  delta-v to raise orbit to 1000 km: " + delta_v_for(gm, 6371.0, 420.0, 1000.0) + " m/s")
+    say("  acceleration at 500 kN thrust: " + thrust_to_acceleration(500.0, 194.5) + " m/s^2")
+
+    say("  countdown:")
+    countdown(3)
+    say("  sum_to(5) = " + sum_to(5))
+    say("  checksum(T+1 AOK) = " + checksum("T+1 AOK"))
+    say("  classify(0) = " + classify(0))
+    say("  classify(1) = " + classify(1))
+    say("  classify(9) = " + classify(9))
+}
+
+fun run_safety() {
+    say("  parsing telemetry headers under exceptions")
+    try {
+        var n = fmt.to_int("T+1 NOT-A-NUMBER")
+        say("    unreached " + n)
+    } catch (err) {
+        say("    caught: " + err)
+    } finally {
+        say("    finally: parser recovered")
+    }
+    try {
+        var code = -1
+        if (code < 0) {
+            throw "negative check code " + code
+        }
+        say("    unreached")
+    } catch (err) {
+        say("    thrown: " + err)
+    }
+
+    say("  shared marks written through a helper")
+    shared array[int] marks = []
+    record_mark(marks, 7)
+    record_mark(marks, 11)
+    record_mark(marks, 13)
+    say("    marks has " + arrays.length(marks) + " entries")
+
+    var floats = [1.0, 2.0, 3.0, 4.0]
+    say("    view total: " + total_mass(floats))
+    apply_rate(floats, 0.5)
+    say("    view mut applied 50%: first is now " + floats[0])
+
+    var original = [10, 20, 30]
+    var cloned = copy(original)
+    cloned[0] = 99
+    say("    copy() stays independent: original " + original[0] + ", cloned " + cloned[0])
+
+    var seq = build_sequence()
+    say("    moved array sums to " + sum_ints(seq))
+}
+
+async fun main() -> int {
+    var float t0 = time.now()
+    say("== stability: manifest build ==")
+    run_build()
+    say("== stability: orbital mechanics ==")
+    run_orbit()
+    say("== stability: safety and ownership ==")
+    run_safety()
+    say("== stability: telemetry link ==")
+    run_link()
+
+    say("== stability: async flight timeline ==")
+    say("    t+0 ignition sequence start")
+    await async.sleep(1)
+    say("    t+1 main engine cutoff")
+    await async.sleep(1)
+    say("    t+2 payload deployment")
+    say("    elapsed " + (time.now() - t0) + " ms")
+    say("done")
+    return 0
+}

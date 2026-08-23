@@ -1,0 +1,63 @@
+// systems — flight-software helpers: orbital mechanics, recursion, string
+// checksums, and bounded state classification.
+//
+// Stability notes:
+//   - Pure functions with no hidden state: the same inputs always produce the
+//     same output, which is what the `test` blocks at the bottom of `main.nt`
+//     assert.
+//   - `match` on an integer with a guard runs exactly one case and has a
+//     `default`, so every input is covered.
+//   - Recursion and string byte iteration are stack-safe for the sizes used
+//     here and are deterministic.
+
+// Standard gravitational parameter for Earth (km^3/s^2) and its mean radius.
+fun orbital_velocity(float gm, float radius_km, float altitude_km) -> float {
+    return math.sqrt(gm / (radius_km + altitude_km)) * 1000.0
+}
+
+fun escape_velocity(float gm, float radius_km, float altitude_km) -> float {
+    return math.sqrt(2.0 * gm / (radius_km + altitude_km)) * 1000.0
+}
+
+fun delta_v_for(float gm, float radius_km, float altitude_a, float altitude_b) -> float {
+    var va = orbital_velocity(gm, radius_km, altitude_a)
+    var vb = orbital_velocity(gm, radius_km, altitude_b)
+    return math.abs(vb - va)
+}
+
+fun thrust_to_acceleration(float thrust_kn, float mass_kg) -> float {
+    return thrust_kn * 1000.0 / mass_kg
+}
+
+fun countdown(int n) {
+    if (n > 0) {
+        say("      " + n)
+        countdown(n - 1)
+    } else {
+        say("      liftoff")
+    }
+}
+
+fun sum_to(int n) -> int {
+    if (n <= 1) {
+        return 1
+    }
+    return n + sum_to(n - 1)
+}
+
+fun checksum(string s) -> int {
+    var sum = 0
+    for (var i = 0; i < strings.length(s); i = i + 1) {
+        sum = sum + strings.char_code(s, i)
+    }
+    return sum
+}
+
+fun classify(int n) -> string {
+    match (n) {
+        case 0 => return "zero"
+        case 1 if n == 1 => return "one"
+        case 2 => return "two"
+        default => return "many"
+    }
+}

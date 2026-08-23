@@ -1,0 +1,55 @@
+// bank — object-oriented example: classes, constructors, methods, arrays and
+// the `for (var x in xs)` iterator protocol.
+//
+// Build and run with:
+//   ntsc build
+//   ./build/debug/bank
+
+class Account {
+    var string owner
+    var float balance
+
+    fun init(string owner, float opening) {
+        this.owner = owner;
+        this.balance = opening;
+    }
+
+    fun deposit(float amount) {
+        this.balance = this.balance + amount;
+    }
+
+    fun withdraw(float amount) {
+        this.balance = this.balance - amount;
+    }
+}
+
+class Bank {
+    var string name
+
+    fun init(string name) {
+        this.name = name;
+    }
+
+    fun welcome(string customer) -> string {
+        return "hello " + customer + " at " + this.name;
+    }
+}
+
+fun main() {
+    var bank = Bank("First National");
+    var items = [Account("alice", 100.0), Account("bob", 250.5), Account("carol", 40.25)];
+    var alice = items[0];
+    alice.deposit(50.0);
+    alice.withdraw(20.0);
+
+    var total = 0.0;
+    for (var account in items) {
+        total = total + account.balance;
+    }
+
+    say(bank.welcome("alice"));
+    say("accounts: " + arrays.length(items));
+    say("alice:   " + alice.balance);
+    say("total:   " + total);
+    say("done")
+}

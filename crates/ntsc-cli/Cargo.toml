@@ -1,0 +1,20 @@
+[package]
+name = "ntsc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for the NTSC (Neutron Type-Safe Compiler)"
+
+[[bin]]
+name = "ntsc"
+path = "src/main.rs"
+
+[dependencies]
+ntsc-ast = { path = "../ntsc-ast" }
+ntsc-lexer = { path = "../ntsc-lexer" }
+ntsc-parser = { path = "../ntsc-parser" }
+ntsc-build = { path = "../ntsc-build" }
+ntsc-codegen = { path = "../ntsc-codegen" }
+ntsc-typeck = { path = "../ntsc-typeck" }
+ntsc-diag = { path = "../ntsc-diag" }
+inkwell = { version = "0.9.0", default-features = false, features = ["target-x86", "target-aarch64"] }

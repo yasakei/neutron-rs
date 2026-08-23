@@ -1,0 +1,14 @@
+// Fibonacci benchmark in NTSC
+fun main() -> int {
+    var int n = 35;
+    var int a = 0;
+    var int b = 1;
+    var int i = 2;
+    while (i < n + 1) {
+        var int temp = a + b;
+        a = b;
+        b = temp;
+        i = i + 1;
+    }
+    return b;
+}

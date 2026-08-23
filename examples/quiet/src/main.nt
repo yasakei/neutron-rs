@@ -1,0 +1,50 @@
+// quiet — suppress `unused_variable` lint warnings locally.
+//
+// The `unused_variable` lint (NTSC-W0001) reports a `var` that is never read
+// or written. The `quiet` statement silences it. Suppression is lexical:
+// it applies only to declarations made inside the `quiet` statement and never
+// leaks into nested functions — a nested function must quiet its own locals.
+//
+// Run `ntsc build` here: this file produces no warnings.
+
+fun report(string name) {
+    say("  " + name + " is ready")
+}
+
+fun main() {
+    // 1. Blanket form: `quiet <statement>` silences every warning for the
+    //    single statement that follows.
+    quiet var temp = "computed but intentionally dropped"
+    say("1. blanket quiet suppresses `temp`")
+
+    // 2. Named form: `quiet [lint] <statement>` silences only the listed
+    //    warning names.
+    quiet [unused_variable] var scratch = 42
+    say("2. named quiet suppresses `scratch`")
+
+    // 3. Block form: `quiet { ... }` silences every declaration in the block.
+    quiet {
+        var a = 1
+        var b = 2
+        var c = a + b
+        report("c")
+    }
+    say("3. block quiet suppresses `a`, `b` and `c`")
+
+    // 4. Quiet does not cross function boundaries: a nested function must
+    //    quiet its own locals. Without the `quiet` below, `inner` would be
+    //    reported even though the enclosing block is quiet.
+    quiet {
+        fun nested() {
+            quiet var inner = "quieted inside the nested function"
+            report("nested")
+        }
+    }
+    say("4. quiet inside a nested function suppresses `inner`")
+
+    // 5. A variable that is read is never reported as unused.
+    var name = "demo"
+    say("5. variable `name` is read below, so it is not reported: " + name)
+
+    report("done")
+}

@@ -1,0 +1,63 @@
+// telemetry — the downlink pipeline.
+//
+// Stability notes:
+//   - Views borrow: `view array[T]` reads without consuming, `view mut`
+//     writes through the borrow, and neither frees anything.
+//   - `shared` aliases one value by reference count; writes through a helper
+//     function are visible to the original handle and the box is released on
+//     exit.
+//   - `copy()` deep-copies an owned array so the clone is fully independent.
+//   - Moves: `build_sequence` hands its array to the caller, which owns it.
+//   - A spawned thread sends frames through a bounded channel; every handle is
+//     closed and the worker is joined before the function returns.
+
+fun total_mass(view array[float] xs) -> float {
+    var t = 0.0
+    for (var m in xs) {
+        t = t + m
+    }
+    return t
+}
+
+fun apply_rate(view mut array[float] xs, float rate) {
+    for (var i = 0; i < arrays.length(xs); i = i + 1) {
+        xs[i] = xs[i] * rate
+    }
+}
+
+fun sum_ints(view array[int] xs) -> int {
+    var t = 0
+    for (var x in xs) {
+        t = t + x
+    }
+    return t
+}
+
+fun record_mark(shared array[int] marks, int v) {
+    arrays.push(marks, v)
+}
+
+fun build_sequence() -> array[int] {
+    var s = [1, 2, 3]
+    return s
+}
+
+fun run_link() {
+    var rx = collections.channel(4)
+    var tx = collections.channel_sender(rx)
+    var producer = process.spawn_thread(fun(int tx) {
+        collections.channel_send(tx, "frame 0: T+0 AOK")
+        collections.channel_send(tx, "frame 1: T+1 AOK")
+        collections.channel_send(tx, "frame 2: T+2 AOK")
+        collections.channel_close(tx)
+    }, tx)
+    var frames = 0
+    while (frames < 3) {
+        var line = collections.channel_recv(rx)
+        say("      " + line)
+        frames = frames + 1
+    }
+    process.thread_join(producer)
+    collections.channel_close(rx)
+    say("      producer joined; link closed (" + frames + " frames)")
+}

@@ -1,0 +1,5 @@
+// greet — a small module imported by `main.nt`.
+
+fun greet(string name) -> string {
+    return "hello, " + name + "!";
+}

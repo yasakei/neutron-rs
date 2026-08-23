@@ -1,0 +1,943 @@
+//! Minimal runtime + standard library support for NTSC-compiled binaries.
+//!
+//! All functions here use `extern "C"` ABI so they can be called from
+//! LLVM-generated code. No raw pointers cross the boundary: every owned heap
+//! value (string, array, shared box, future, opaque module value) lives in the
+//! handle registry under an `i64` key, and generated code passes only those
+//! keys. The whole crate is safe Rust — there is no `unsafe` anywhere.
+//!
+//! ## Ownership rules
+//!
+//! * A handle is registered exactly once and removed exactly once. Copying a
+//!   handle in generated code is a *borrow* and performs no registry
+//!   operation; deep copies (`copy(...)`, string clone, array deep clone)
+//!   register a fresh entry.
+//! * Handle `0` is the null handle: every API treats it as "no value" and is
+//!   a no-op for it.
+//! * Reader functions (`ntsc_say`, `ntsc_string_equals`, `ntsc_array_get`,
+//!   ...) borrow their arguments. Functions named `*_drop` remove their
+//!   argument unconditionally. `ntsc_throw`, `ntsc_panic`, `ntsc_assert`, and
+//!   `ntsc_string_from_words` *consume* their message/word-array argument.
+//!
+//! ## Exceptions
+//!
+//! Exceptions use a return-check model. `ntsc_throw` stores the message in a
+//! thread-local pending slot and returns `0`; generated code checks
+//! `ntsc_exception_pending()` after every call and branches to its
+//! exception-return path when it is set. `ntsc_exception_take_message`
+//! transfers the message to a catch binding and clears the pending slot;
+//! `ntsc_rethrow` re-arms it (used after a `finally` that ran with a clean
+//! flag).
+
+pub mod modules;
+mod registry;
+
+use std::io::{self, Write};
+
+use crate::registry::NULL;
+
+// ══════════════════════════════════════════════════════════════════════════
+// Entry / exit
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Entry point stub — linked against generated `main` symbol.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_runtime_init() {}
+
+/// Exit point — called after `main` returns. Reports leaked registry
+/// entries to stderr (only when `report != 0`, i.e. debug builds) and
+/// aborts on an uncaught pending exception.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_runtime_shutdown(report: i8) {
+    if ntsc_exception_pending() != 0 {
+        ntsc_uncaught_exception();
+    }
+    let leaks = registry::live_count();
+    if report != 0 && leaks > 0 {
+        let entries = registry::live_entries();
+        let stderr = io::stderr();
+        let mut handle = stderr.lock();
+        let _ = writeln!(
+            handle,
+            "warning[NTSC-W0002]: memory leak detected: {} registry object(s) leaked",
+            leaks
+        );
+        for entry in entries {
+            let detail = entry
+                .detail
+                .as_deref()
+                .map(|value| format!(" containing \"{value}\""))
+                .unwrap_or_default();
+            if let Some((line, column)) = entry.site {
+                let _ = writeln!(handle, "  --> <source>:{line}:{column}");
+                let _ = writeln!(
+                    handle,
+                    "   = note: {} handle {}{} was allocated here",
+                    entry.kind, entry.id, detail
+                );
+            } else {
+                let _ = writeln!(
+                    handle,
+                    "   = note: leaked {} handle {}{} (runtime allocation)",
+                    entry.kind, entry.id, detail
+                );
+            }
+        }
+        let _ = handle.flush();
+    }
+}
+
+/// Attach an NTSC source location to a registry allocation for debug leak
+/// diagnostics. Values created entirely inside the runtime remain unmarked.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_leak_mark(id: i64, line: i64, column: i64) {
+    registry::mark_leak_site(id, line, column);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Strings
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Print the string behind `msg` to stdout, followed by a newline. Borrows
+/// the string; the null handle is a no-op.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_say(msg: i64) {
+    let Some(text) = registry::with_string(msg, str::to_string) else {
+        return;
+    };
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    let _ = handle.write_all(text.as_bytes());
+    let _ = handle.write_all(b"\n");
+    let _ = handle.flush();
+}
+
+/// Print a 64-bit signed integer to stdout as a string, followed by
+/// newline.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_print_i64(val: i64) {
+    println!("{val}");
+}
+
+/// Print a 64-bit float to stdout as a string, followed by newline.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_print_f64(val: f64) {
+    println!("{val}");
+}
+
+/// Convert an integer (0/1) to the string "true" or "false". The returned
+/// handle is owned by the caller.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_bool_to_string(val: i8) -> i64 {
+    let s = if val != 0 { "true" } else { "false" };
+    registry::put_string(s.to_string())
+}
+
+/// Convert an i64 to a string. The returned handle is owned by the caller.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_i64_to_string(val: i64) -> i64 {
+    registry::put_string(format!("{val}"))
+}
+
+/// Convert an f64 to a string. The returned handle is owned by the caller.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_f64_to_string(val: f64) -> i64 {
+    registry::put_string(format!("{val}"))
+}
+
+/// Concatenate two strings. Both arguments are borrowed; the returned
+/// handle is a fresh owned string. The null handle reads as an empty
+/// string.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_string_concat(a: i64, b: i64) -> i64 {
+    registry::string_concat(a, b).unwrap_or(NULL)
+}
+
+/// Duplicate a string, registering a fresh owned copy. This is the runtime
+/// support for the `copy("...")` expression. The null handle copies to
+/// null.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_string_clone(s: i64) -> i64 {
+    registry::clone_string(s).unwrap_or(NULL)
+}
+
+/// Compare two strings for equality; returns 1 when equal, 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_string_equals(a: i64, b: i64) -> i8 {
+    i8::from(registry::string_equals(a, b))
+}
+
+/// Drop an owned string (removes it from the registry). The null handle is
+/// a no-op, so moved-from or never-initialized slots can be dropped
+/// unconditionally.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_string_drop(id: i64) {
+    let _ = registry::take_string(id);
+}
+
+/// Upper bound for `ntsc_string_from_words` output, in bytes: keeps word
+/// loops and `Vec` growth bounded even for hostile byte counts.
+const MAX_BUILTIN_OUTPUT: usize = 1 << 24;
+
+fn string_from_words_impl(words: i64, byte_count: i64, permanent: bool) -> i64 {
+    let mut bytes = Vec::new();
+    if words != NULL {
+        // Clamp the byte count: a hostile count could otherwise force an
+        // effectively unbounded word loop (or a `Vec` capacity panic).
+        let byte_count = (byte_count.max(0) as usize).min(MAX_BUILTIN_OUTPUT);
+        let word_count = byte_count / 8 + usize::from(byte_count > 0);
+        for i in 0..word_count {
+            let word = registry::array_get(words, i as i64).unwrap_or(0) as u64;
+            bytes.extend_from_slice(&word.to_ne_bytes());
+        }
+        bytes.truncate(byte_count);
+        // The word array is consumed, not leaked.
+        registry::array_drop(words);
+    }
+    if permanent {
+        registry::put_string_permanent(String::from_utf8_lossy(&bytes).into_owned())
+    } else {
+        registry::put_string(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// Reassemble a UTF-8 string from the `i64` words of `words`, consuming
+/// the word array. The returned handle is an owned string.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_string_from_words(words: i64, byte_count: i64) -> i64 {
+    string_from_words_impl(words, byte_count, false)
+}
+
+/// Like `ntsc_string_from_words`, but registers the string as permanent:
+/// it is a compile-time constant (string literal), owned for the program
+/// lifetime, never removed, and excluded from leak reporting.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_string_from_words_permanent(words: i64, byte_count: i64) -> i64 {
+    string_from_words_impl(words, byte_count, true)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Panic / error handling
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Panic with a message — prints an error and aborts. Consumes the message
+/// handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_panic(msg: i64) {
+    let text = registry::get_string(msg).unwrap_or_else(|| "panic".to_string());
+    let _ = registry::take_string(msg);
+    let stderr = io::stderr();
+    let mut handle = stderr.lock();
+    let _ = writeln!(handle, "NTSC PANIC: {text}");
+    let _ = handle.flush();
+    std::process::abort();
+}
+
+/// Assert — if `condition` is 0, panic with the given message. Consumes
+/// the message handle either way so the generated caller never leaks it.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_assert(condition: i8, msg: i64) {
+    if condition == 0 {
+        ntsc_panic(msg);
+    } else {
+        let _ = registry::take_string(msg);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Dynamic arrays
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Create a new dynamic array of raw scalar elements.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_new(elem_size: i64, initial_capacity: i64) -> i64 {
+    ntsc_array_new_typed(elem_size, initial_capacity, 0)
+}
+
+/// Create a new dynamic array. `string_elements != 0` marks an array whose
+/// elements are owned strings: the runtime deep-copies strings on insert,
+/// deep-copies them in every array-producing operation, and reclaims them
+/// when the container is dropped. All other arrays store raw `i64` slots.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_new_typed(
+    elem_size: i64,
+    initial_capacity: i64,
+    string_elements: i8,
+) -> i64 {
+    registry::array_new(elem_size, initial_capacity, string_elements)
+}
+
+/// Set the string-elements flag of an existing array. Empty array literals
+/// do not know their element representation at creation time, so codegen
+/// calls this once the destination type is known. Only meaningful before
+/// any element has been inserted.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_set_string_elements(id: i64, string_elements: i8) {
+    registry::array_set_string_elements(id, string_elements);
+}
+
+/// Get the length of a dynamic array (0 for the null handle).
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_len(id: i64) -> i64 {
+    registry::array_len(id)
+}
+
+/// Read the element at `index`. Returns the raw element value for scalar
+/// arrays and the stored handle for string/nested-array elements (a
+/// *borrow*: the array keeps ownership). An out-of-bounds index throws
+/// instead of reading garbage.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_get(id: i64, index: i64) -> i64 {
+    match registry::array_get(id, index) {
+        Some(value) => value,
+        None => throw_string("array index out of bounds"),
+    }
+}
+
+/// Push an element into a dynamic array. String elements are deep-copied
+/// into a fresh handle owned by the array; all other elements are stored
+/// by value. Returns the array handle on success, 0 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_push(id: i64, elem: i64) -> i64 {
+    if registry::array_push(id, elem) {
+        id
+    } else {
+        NULL
+    }
+}
+
+/// Replace the element at `index`. String elements are deep-copied into a
+/// fresh handle owned by the array and the old element is reclaimed; all
+/// other elements are replaced by value. A negative or out-of-bounds index
+/// throws (mirroring `ntsc_array_get`); an unknown or non-array handle is
+/// a safe failure returning 0. Returns the array handle on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_set(id: i64, index: i64, elem: i64) -> i64 {
+    if !registry::is_array(id) {
+        return NULL;
+    }
+    if index < 0 || index >= registry::array_len(id) {
+        return throw_string("array index out of bounds");
+    }
+    if registry::array_set(id, index, elem) {
+        id
+    } else {
+        NULL
+    }
+}
+
+/// Remove and return the last element of an owned array. For a string
+/// array the returned handle is *transferred* to the caller; for scalar
+/// arrays the raw value is returned. Returns 0 for an empty array.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_pop(id: i64) -> i64 {
+    registry::array_pop(id).unwrap_or(NULL)
+}
+
+/// Drop an owned array, reclaiming any owned string elements. The null
+/// handle is a no-op, so moved-from slots can be dropped unconditionally.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_drop(id: i64) {
+    registry::array_drop(id);
+}
+
+/// Return a new array with the element at `index` removed (negative = from
+/// the end). The input array is never mutated. The result is a copy even
+/// when the index is out of bounds (a no-op), so every returned handle is
+/// fresh.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_remove_at(id: i64, index: i64) -> i64 {
+    registry::array_remove_at(id, index)
+}
+
+/// Return a new array that is a copy of the given array. String elements
+/// are deep-copied so the two arrays never share ownership; all other
+/// elements are copied by value.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_clone(id: i64) -> i64 {
+    registry::array_clone(id, 0)
+}
+
+/// Return a new array that is a deep copy of the given array. Elements
+/// that are themselves arrays (at `elem_array_levels` nested depths) are
+/// recursively deep-cloned; string elements are deep-copied as well, so no
+/// subtree or string is shared with the source.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_deep_clone(id: i64, elem_array_levels: i64) -> i64 {
+    registry::array_clone(id, elem_array_levels)
+}
+
+/// Return a new array containing a sub-range of the given array. `end < 0`
+/// means "to the end". Out-of-range indices are clamped.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_slice(id: i64, start: i64, end: i64) -> i64 {
+    registry::array_slice(id, start, end)
+}
+
+/// Return a new array with the elements in reverse order.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_reverse(id: i64) -> i64 {
+    registry::array_reverse(id)
+}
+
+/// Return a new array containing `count` copies of `val`. When
+/// `string_elements != 0`, `val` is a string handle and every element is
+/// an independent deep copy of it; otherwise `val` is the raw element
+/// value.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_fill(
+    val: i64,
+    count: i64,
+    elem_size: i64,
+    string_elements: i8,
+) -> i64 {
+    registry::array_fill(val, count, elem_size, string_elements)
+}
+
+/// Return a new array of `i64` elements `start..end` (empty when `end <=
+/// start`).
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_range(start: i64, end: i64) -> i64 {
+    registry::array_range(start, end)
+}
+
+/// Return a new empty array with the same element representation as the
+/// given array. The input array is never mutated.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_clear(id: i64) -> i64 {
+    registry::array_clear(id)
+}
+
+/// Return a new array with the elements shuffled (Fisher-Yates using OS
+/// randomness). The input array is never mutated.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_shuffle(id: i64) -> i64 {
+    registry::array_shuffle(id)
+}
+
+/// Return a new array with the elements sorted. `mode` selects the
+/// comparison: 0 = `i64` values, 1 = `f64` values (via raw bits), 2 =
+/// strings. The input array is never mutated.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_array_sort(id: i64, mode: i8) -> i64 {
+    registry::array_sort(id, mode)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Shared boxes
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Register a shared box adopting a single owned reference to `inner`.
+/// Returns the box handle; `inner` (the wrapped value's handle) is now
+/// owned by the box and reclaimed when the last reference is released.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_shared_new(inner: i64) -> i64 {
+    registry::shared_new(inner)
+}
+
+/// Record another live copy of the shared box. Returns the box handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_shared_retain(id: i64) -> i64 {
+    registry::shared_retain(id)
+}
+
+/// Release one copy of the shared box. When the last copy is released the
+/// box is removed and ownership of the wrapped value's handle is returned
+/// to the caller (0 is returned while copies remain). Generated code must
+/// drop the returned handle like any owned value.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_shared_release(id: i64) -> i64 {
+    registry::shared_release(id)
+}
+
+/// Borrow the handle of the value wrapped by a shared box (used by `view
+/// of shared`). Returns 0 for an unknown box.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_shared_inner(id: i64) -> i64 {
+    registry::shared_inner(id)
+}
+
+use std::cell::RefCell;
+
+// ══════════════════════════════════════════════════════════════════════════
+// Exception state (return-check model)
+// ══════════════════════════════════════════════════════════════════════════
+
+thread_local! {
+    /// The handle of the pending exception message, or `None` when no
+    /// exception is active. The message stays registered for the whole
+    /// propagation; it is removed by `ntsc_exception_take_message` (catch
+    /// binding) or `ntsc_exception_clear`.
+    static PENDING_EXCEPTION: RefCell<Option<i64>> = const { RefCell::new(None) };
+}
+
+/// Throw an exception with the given message. *Consumes* the message
+/// handle and returns 0; the pending flag is observed via
+/// `ntsc_exception_pending`. The caller must not use `msg` afterwards.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_throw(msg: i64) -> i64 {
+    let message = if msg == NULL {
+        registry::put_string(String::new())
+    } else {
+        msg
+    };
+    PENDING_EXCEPTION.with(|pending| {
+        *pending.borrow_mut() = Some(message);
+    });
+    NULL
+}
+
+/// Re-arm a previously taken exception so it keeps propagating. Identical
+/// to `ntsc_throw`; used after a `finally` block that ran with a clean
+/// pending flag. Consumes the message handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_rethrow(msg: i64) -> i64 {
+    ntsc_throw(msg)
+}
+
+/// Return 1 when an exception is pending, 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_exception_pending() -> i8 {
+    PENDING_EXCEPTION.with(|pending| i8::from(pending.borrow().is_some()))
+}
+
+/// Alias of [`ntsc_exception_pending`].
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_exception_is_active() -> i8 {
+    ntsc_exception_pending()
+}
+
+/// Borrow the message of the pending exception. The handle stays valid
+/// until the exception is taken or cleared; returns 0 when none is
+/// pending.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_exception_get_message() -> i64 {
+    PENDING_EXCEPTION.with(|pending| pending.borrow().unwrap_or(NULL))
+}
+
+/// Transfer ownership of the pending exception message to the caller and
+/// clear the pending slot. Returns 0 when none is pending. The caller must
+/// drop the returned string like any owned value.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_exception_take_message() -> i64 {
+    PENDING_EXCEPTION.with(|pending| pending.borrow_mut().take().unwrap_or(NULL))
+}
+
+/// Clear the pending exception, reclaiming its message.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_exception_clear() {
+    let message = ntsc_exception_take_message();
+    let _ = registry::take_string(message);
+}
+
+/// Report an uncaught exception (print the message to stderr) and abort.
+/// The pending slot is left empty afterwards (the process is ending
+/// anyway).
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_uncaught_exception() -> ! {
+    let message = ntsc_exception_take_message();
+    let text = registry::get_string(message).unwrap_or_else(|| "exception".to_string());
+    let _ = registry::take_string(message);
+    let text = if text.is_empty() {
+        "uncaught exception".to_string()
+    } else {
+        text
+    };
+    let stderr = io::stderr();
+    let mut handle = stderr.lock();
+    let _ = writeln!(handle, "uncaught exception: {text}");
+    let _ = handle.flush();
+    std::process::abort();
+}
+
+/// Internal helper: throw a string literal owned by the runtime itself.
+fn throw_string(message: &str) -> i64 {
+    ntsc_throw(registry::put_string(message.to_string()))
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Async executor (see docs/async-rfc.md §8.3)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// A poll function for one async future. Returns `1` when the future has
+/// completed (its result is stored wherever the generated poll logic puts
+/// it), `0` when it is still pending. The future is referenced by its
+/// registry handle.
+pub type AsyncPollFn = extern "C" fn(i64) -> i8;
+
+thread_local! {
+    /// Cooperative task stack: each entry is the poll function and future
+    /// handle of an in-progress async function. Suspending on a
+    /// sub-future pushes the sub-future; completing pops the current entry
+    /// so the parent (now on top) is re-polled.
+    static ASYNC_TASKS: RefCell<Vec<(AsyncPollFn, i64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Register a new `async.sleep(ms)` future and return its handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_sleep_new(ms: i64) -> i64 {
+    registry::async_sleep_new(ms)
+}
+
+/// Drop an `async.sleep` future handle. A handle of any other kind, an
+/// already dropped one, and the null handle are all no-ops.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_sleep_drop(id: i64) {
+    registry::async_sleep_drop(id);
+}
+
+/// Poll an `async.sleep(ms)` future: arm it on the first poll, then return
+/// `1` once the deadline has passed and `0` otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_sleep_poll(id: i64) -> i8 {
+    registry::async_sleep_poll(id)
+}
+
+/// Drive the root future to completion.
+///
+/// The root's poll function and handle are pushed onto the thread-local
+/// task stack; the driver repeatedly polls the topmost task. A task that
+/// returns `0` without pushing a sub-future is waiting on time alone
+/// (e.g. `sleep`); the driver waits a 1 ms quantum before re-polling it.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_run(poll_fn: AsyncPollFn, root: i64) {
+    if root == NULL {
+        return;
+    }
+    ASYNC_TASKS.with(|tasks| {
+        tasks.borrow_mut().push((poll_fn, root));
+        loop {
+            // Peek the top task without holding the TLS borrow across the
+            // poll: the poll may call `ntsc_async_push`, which re-borrows.
+            let (poll, future, depth_before) = {
+                let tasks = tasks.borrow();
+                let Some(&(poll, future)) = tasks.last() else {
+                    return;
+                };
+                (poll, future, tasks.len())
+            };
+            let done = poll(future) == 1;
+            let pushed_child = {
+                let mut tasks = tasks.borrow_mut();
+                let pushed_child = tasks.len() > depth_before;
+                if done {
+                    tasks.pop();
+                }
+                pushed_child
+            };
+            if done {
+                continue;
+            }
+            if !pushed_child {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    });
+}
+
+/// Schedule a sub-future: push `(poll_fn, future)` onto the task stack.
+/// Called by a poll function right before it returns `0` at a suspension
+/// point, so the driver polls the sub-future next.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_push(poll_fn: AsyncPollFn, future: i64) {
+    if future == NULL {
+        return;
+    }
+    ASYNC_TASKS.with(|tasks| {
+        tasks.borrow_mut().push((poll_fn, future));
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_handles_balance_and_null_is_a_noop() {
+        let s = ntsc_i64_to_string(42);
+        assert_ne!(s, NULL);
+        assert_eq!(
+            registry::with_string(s, str::to_string),
+            Some("42".to_string())
+        );
+        let cloned = ntsc_string_clone(s);
+        assert_eq!(
+            registry::with_string(cloned, str::to_string),
+            Some("42".to_string())
+        );
+        ntsc_string_drop(cloned);
+        ntsc_string_drop(NULL);
+        ntsc_say(NULL);
+        ntsc_string_clone(NULL);
+        ntsc_string_drop(s);
+        assert_eq!(registry::with_string(s, str::to_string), None);
+        assert!(registry::clone_string(s).is_none());
+    }
+
+    #[test]
+    fn string_from_words_reassembles_bytes_and_consumes_words() {
+        let words = ntsc_array_new(8, 2);
+        ntsc_array_push(words, u64::from_ne_bytes(*b"Hello\0\0\0") as i64);
+        ntsc_array_push(words, 0);
+        let s = ntsc_string_from_words(words, 5);
+        assert_eq!(
+            registry::with_string(s, str::to_string),
+            Some("Hello".to_string())
+        );
+
+        assert_eq!(registry::with_array(words, |_| true), None);
+        ntsc_string_drop(s);
+    }
+
+    #[test]
+    fn concat_equals_join_results() {
+        let a = ntsc_i64_to_string(1);
+        let b = ntsc_i64_to_string(23);
+        let joined = ntsc_string_concat(a, b);
+        let expected = ntsc_string_concat(ntsc_i64_to_string(12), ntsc_i64_to_string(3));
+        assert!(registry::string_equals(joined, expected));
+        assert_eq!(ntsc_string_equals(joined, expected), 1);
+        ntsc_string_drop(a);
+        ntsc_string_drop(b);
+        ntsc_string_drop(joined);
+        ntsc_string_drop(expected);
+    }
+
+    #[test]
+    fn array_ops_round_trip_scalars_and_strings() {
+        let arr = ntsc_array_new(8, 0);
+        assert_eq!(ntsc_array_len(arr), 0);
+        ntsc_array_push(arr, 10);
+        ntsc_array_push(arr, 20);
+        assert_eq!(ntsc_array_len(arr), 2);
+        assert_eq!(ntsc_array_get(arr, 0), 10);
+        assert_eq!(ntsc_array_get(arr, 1), 20);
+        assert_eq!(ntsc_array_pop(arr), 20);
+        assert_eq!(ntsc_array_len(arr), 1);
+
+        let strings = ntsc_array_new_typed(8, 0, 1);
+        let s1 = ntsc_i64_to_string(7);
+        let s2 = ntsc_i64_to_string(8);
+        ntsc_array_push(strings, s1);
+        ntsc_array_push(strings, s2);
+
+        assert_eq!(
+            registry::with_string(s1, str::to_string),
+            Some("7".to_string())
+        );
+        let taken = ntsc_array_pop(strings);
+        assert_eq!(
+            registry::with_string(taken, str::to_string),
+            Some("8".to_string())
+        );
+        ntsc_string_drop(taken);
+        ntsc_array_drop(strings);
+
+        assert_eq!(ntsc_array_len(strings), 0);
+        ntsc_array_drop(arr);
+        ntsc_string_drop(s1);
+        ntsc_string_drop(s2);
+    }
+
+    #[test]
+    fn array_get_out_of_bounds_throws() {
+        let arr = ntsc_array_new(8, 0);
+        ntsc_array_push(arr, 1);
+        let value = ntsc_array_get(arr, 99);
+        assert_eq!(value, NULL);
+        assert_eq!(ntsc_exception_pending(), 1);
+        let message = ntsc_exception_take_message();
+        assert_eq!(
+            registry::with_string(message, str::to_string),
+            Some("array index out of bounds".to_string())
+        );
+        ntsc_string_drop(message);
+        assert_eq!(ntsc_exception_pending(), 0);
+        ntsc_array_drop(arr);
+    }
+
+    #[test]
+    fn shared_box_retains_and_releases() {
+        let s = ntsc_i64_to_string(5);
+        let boxed = ntsc_shared_new(s);
+        assert_ne!(boxed, NULL);
+
+        assert_eq!(ntsc_shared_retain(boxed), boxed);
+        assert_eq!(ntsc_shared_release(boxed), NULL);
+        let inner = ntsc_shared_release(boxed);
+        assert_ne!(inner, NULL);
+        assert_eq!(
+            registry::with_string(inner, str::to_string),
+            Some("5".to_string())
+        );
+        ntsc_string_drop(inner);
+    }
+
+    #[test]
+    fn shared_inner_borrows_the_wrapped_value() {
+        let s = ntsc_i64_to_string(9);
+        let boxed = ntsc_shared_new(s);
+        let inner = ntsc_shared_inner(boxed);
+        assert_eq!(
+            registry::with_string(inner, str::to_string),
+            Some("9".to_string())
+        );
+
+        let released = ntsc_shared_release(boxed);
+        assert_eq!(released, inner);
+        ntsc_string_drop(released);
+    }
+
+    #[test]
+    fn throw_then_take_round_trips() {
+        assert_eq!(ntsc_exception_pending(), 0);
+        let msg = ntsc_i64_to_string(123);
+        ntsc_throw(msg);
+        assert_eq!(ntsc_exception_pending(), 1);
+        assert_eq!(ntsc_exception_is_active(), 1);
+        let borrowed = ntsc_exception_get_message();
+        assert_eq!(
+            registry::with_string(borrowed, str::to_string),
+            Some("123".to_string())
+        );
+        let taken = ntsc_exception_take_message();
+        assert_eq!(taken, borrowed);
+        assert_eq!(ntsc_exception_pending(), 0);
+        ntsc_string_drop(taken);
+    }
+
+    #[test]
+    fn rethrow_and_clear_keep_balance() {
+        ntsc_throw(ntsc_i64_to_string(1));
+        let taken = ntsc_exception_take_message();
+        ntsc_rethrow(taken);
+        assert_eq!(ntsc_exception_pending(), 1);
+        ntsc_exception_clear();
+        assert_eq!(ntsc_exception_pending(), 0);
+    }
+
+    #[test]
+    /// The executor drives a parent future that awaits a 20 ms sleep
+    /// child: first poll arms the child and pushes it; once the child
+    /// completes the parent is re-polled and finishes. All state lives in
+    /// the registry.
+    fn executor_drives_a_sleeping_parent_to_completion() {
+        struct Parent {
+            state: i32,
+            child: i64,
+            result: i32,
+        }
+        extern "C" fn parent_poll(id: i64) -> i8 {
+            let state = registry::with_opaque(id, |parent: &Parent| parent.state).unwrap_or(2);
+            match state {
+                0 => {
+                    let child = ntsc_async_sleep_new(20);
+                    ntsc_async_push(ntsc_async_sleep_poll, child);
+
+                    // Registry calls must not run inside an opaque closure,
+                    // so the child handle is stored only after the lock is
+                    // free.
+                    registry::with_opaque_mut(id, |parent: &mut Parent| {
+                        parent.state = 1;
+                        parent.child = child;
+                    });
+                    0
+                }
+                1 => {
+                    let child =
+                        registry::with_opaque(id, |parent: &Parent| parent.child).unwrap_or(NULL);
+                    ntsc_async_sleep_drop(child);
+                    registry::with_opaque_mut(id, |parent: &mut Parent| {
+                        parent.result = 42;
+                    });
+                    1
+                }
+                _ => 1,
+            }
+        }
+        let started = std::time::Instant::now();
+        let root = registry::put_opaque(Parent {
+            state: 0,
+            child: NULL,
+            result: 0,
+        });
+        ntsc_async_run(parent_poll, root);
+        assert!(started.elapsed().as_millis() >= 15);
+        let parent = registry::take_opaque::<Parent>(root).expect("parent future");
+        assert_eq!(parent.state, 1);
+        assert_eq!(parent.result, 42);
+    }
+
+    #[test]
+    fn executor_runs_an_immediately_completing_future() {
+        extern "C" fn done_poll(id: i64) -> i8 {
+            registry::with_opaque_mut(id, |state: &mut i32| {
+                *state = 7;
+                1
+            })
+            .unwrap_or(1)
+        }
+        let root = registry::put_opaque(0i32);
+        ntsc_async_run(done_poll, root);
+        let state = registry::take_opaque::<i32>(root).expect("state");
+        assert_eq!(state, 7);
+    }
+
+    #[test]
+    fn sleep_future_transitions_through_its_states() {
+        let sleep = ntsc_async_sleep_new(5);
+        assert_eq!(ntsc_async_sleep_poll(sleep), 0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(ntsc_async_sleep_poll(sleep), 1);
+        assert_eq!(ntsc_async_sleep_poll(sleep), 1);
+        ntsc_async_sleep_drop(sleep);
+    }
+
+    #[test]
+    fn array_set_replaces_elements_and_reclaims_strings() {
+        // Scalar arrays replace raw values; the caller's value is
+        // untouched. Out-of-bounds index is a no-op.
+        let ints = ntsc_array_new(8, 3);
+        ntsc_array_push(ints, 1);
+        ntsc_array_push(ints, 2);
+        ntsc_array_push(ints, 3);
+        assert_eq!(ntsc_array_set(ints, 1, 9), ints);
+        assert_eq!(registry::with_array(ints, |a| a.elements[1]), Some(9));
+
+        assert_eq!(ntsc_array_set(ints, 7, 0), NULL);
+        assert_eq!(ntsc_array_set(ints, -1, 0), NULL);
+        ntsc_array_drop(ints);
+
+        // String arrays deep-copy the new value and reclaim the old
+        // element without deadlocking or freeing the caller's handle.
+        let strs = ntsc_array_new_typed(8, 2, 1);
+        let src = ntsc_i64_to_string(5);
+        ntsc_array_push(strs, src);
+        ntsc_array_push(strs, ntsc_i64_to_string(7));
+        let fresh = ntsc_i64_to_string(9);
+        assert_eq!(ntsc_array_set(strs, 0, fresh), strs);
+
+        assert_eq!(
+            registry::with_string(src, str::to_string),
+            Some("5".to_string())
+        );
+        assert_eq!(
+            registry::with_string(fresh, str::to_string),
+            Some("9".to_string())
+        );
+        // The source handles remain owned by the caller.
+        let elements = registry::with_array(strs, |a| a.elements.clone()).unwrap();
+        assert_ne!(elements[0], fresh);
+        assert_eq!(
+            registry::with_string(elements[0], str::to_string),
+            Some("9".to_string())
+        );
+        assert_eq!(
+            registry::with_string(elements[1], str::to_string),
+            Some("7".to_string())
+        );
+        ntsc_string_drop(src);
+        ntsc_string_drop(fresh);
+        ntsc_array_drop(strs);
+    }
+}

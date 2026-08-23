@@ -1,0 +1,439 @@
+//! Emitter entry points: `emit_module`, test-block compilation, and top-level emission.
+
+use super::*;
+
+/// Emit LLVM IR for a parsed program and write it to an object file.
+///
+/// `optimize` runs the IR optimization pipeline (mem2reg, instcombine, ...)
+/// before codegen; debug builds pass `false` so the emitted IR stays
+/// predictable and the leak detector stays accurate.
+pub fn emit_module(
+    context: &Context,
+    target_machine: &crate::context::TargetMachine,
+    program: &Program,
+    obj_path: &std::path::Path,
+    test_mode: bool,
+    report_leaks: bool,
+    optimize: bool,
+) -> Result<(), crate::CodegenError> {
+    let _guard = crate::context::CodegenLockGuard::acquire();
+
+    // Trait-object vtables are built from the tables the type checker
+    // recorded while erasing trait declarations.
+    super::dyn_obj::load_trait_tables(ntsc_typeck::take_trait_object_tables());
+
+    let module = context.create_module("ntsc_main");
+
+    // Anchor the module to the target machine's ABI. The optimization pass
+    // pipeline resolves `getelementptr` byte offsets and struct sizes against
+    // the module's data layout; without an explicit one it falls back to a
+    // default where `i64` is 4-byte aligned, which corrupts every struct that
+    // embeds `i64`/`double` fields (e.g. the async sleep future) on x86-64.
+    module.set_data_layout(&target_machine.get_target_data().get_data_layout());
+
+    CLASS_FIELDS.with(|map| {
+        let mut m = map.borrow_mut();
+        m.clear();
+        for stmt in &program.statements {
+            if let ntsc_ast::stmt::Stmt::Class { name, body, .. } = stmt {
+                let mut fields = Vec::new();
+                for item in body {
+                    if let ntsc_ast::stmt::Stmt::Var {
+                        name: field_name, ..
+                    } = item
+                    {
+                        fields.push(field_name.lexeme().to_string());
+                    }
+                }
+                m.insert(name.lexeme().to_string(), fields);
+            }
+        }
+    });
+
+    CLASS_FIELD_TYPES.with(|map| {
+        let mut m = map.borrow_mut();
+        m.clear();
+        for stmt in &program.statements {
+            if let ntsc_ast::stmt::Stmt::Class { name, body, .. } = stmt {
+                let mut field_tys = Vec::new();
+                for item in body {
+                    if let ntsc_ast::stmt::Stmt::Var {
+                        type_annotation,
+                        initializer,
+                        ..
+                    } = item
+                    {
+                        let ty = if let Some(ann) = type_annotation {
+                            type_annotation_to_ty(&Some(ann.clone()))
+                        } else if let Some(init) = initializer {
+                            expr_to_literal_ty(init).unwrap_or(Ty::Any)
+                        } else {
+                            Ty::Any
+                        };
+                        field_tys.push(ty);
+                    }
+                }
+                m.insert(name.lexeme().to_string(), field_tys);
+            }
+        }
+    });
+
+    CLASS_FIELD_INITS.with(|map| {
+        let mut m = map.borrow_mut();
+        m.clear();
+        for stmt in &program.statements {
+            if let ntsc_ast::stmt::Stmt::Class { name, body, .. } = stmt {
+                let mut inits = Vec::new();
+                for item in body {
+                    if let ntsc_ast::stmt::Stmt::Var { initializer, .. } = item {
+                        inits.push(initializer.clone());
+                    }
+                }
+                m.insert(name.lexeme().to_string(), inits);
+            }
+        }
+    });
+
+    CLASS_PARENTS.with(|map| {
+        let mut m = map.borrow_mut();
+        m.clear();
+        for stmt in &program.statements {
+            if let ntsc_ast::stmt::Stmt::Class { name, parent, .. } = stmt
+                && let Some(parent) = parent
+            {
+                m.insert(name.lexeme().to_string(), parent.lexeme().to_string());
+            }
+        }
+    });
+
+    ENUM_VALUES.with(|map| {
+        let mut enums = map.borrow_mut();
+        enums.clear();
+        ENUM_MEMBER_VALUES.with(|globals| {
+            let mut global_members = globals.borrow_mut();
+            global_members.clear();
+            for stmt in &program.statements {
+                if let ntsc_ast::stmt::Stmt::Enum { name, members, .. } = stmt {
+                    let mut next = 0_i32;
+                    let mut members_map = HashMap::new();
+                    for member in members {
+                        // Explicit `= value` must be a constant int literal;
+                        // anything else falls back to the running counter.
+                        let value = member
+                            .value
+                            .as_ref()
+                            .and_then(const_int_expr_value)
+                            .unwrap_or(next);
+                        members_map.insert(member.name.lexeme().to_string(), value);
+                        global_members.insert(member.name.lexeme().to_string(), value);
+                        next = value.wrapping_add(1);
+                    }
+                    enums.insert(name.lexeme().to_string(), members_map);
+                }
+            }
+        });
+    });
+
+    STATIC_CONST_TYPES.with(|map| map.borrow_mut().clear());
+    STATIC_CONST_INITS.with(|map| map.borrow_mut().clear());
+
+    CLASS_METHOD_TYPES.with(|map| {
+        let mut m = map.borrow_mut();
+        m.clear();
+        for stmt in &program.statements {
+            if let ntsc_ast::stmt::Stmt::Class { name, body, .. } = stmt {
+                let mut methods = HashMap::new();
+                for item in body {
+                    if let ntsc_ast::stmt::Stmt::Function {
+                        name: method_name,
+                        return_type,
+                        ..
+                    } = item
+                    {
+                        methods.insert(
+                            method_name.lexeme().to_string(),
+                            function_return_ty(return_type),
+                        );
+                    }
+                }
+                m.insert(name.lexeme().to_string(), methods);
+            }
+        }
+    });
+
+    CLASS_METHOD_PARAM_TYPES.with(|map| {
+        let mut m = map.borrow_mut();
+        m.clear();
+        for stmt in &program.statements {
+            if let ntsc_ast::stmt::Stmt::Class { name, body, .. } = stmt {
+                let mut methods = HashMap::new();
+                for item in body {
+                    if let ntsc_ast::stmt::Stmt::Function {
+                        name: method_name,
+                        params,
+                        ..
+                    } = item
+                    {
+                        let param_tys = params
+                            .iter()
+                            .map(|p| type_annotation_to_ty(&p.type_annotation))
+                            .collect();
+                        methods.insert(method_name.lexeme().to_string(), param_tys);
+                    }
+                }
+                m.insert(name.lexeme().to_string(), methods);
+            }
+        }
+    });
+
+    FUNCTION_RETURN_TYPES.with(|map| {
+        let mut m = map.borrow_mut();
+        m.clear();
+        for stmt in &program.statements {
+            if let Stmt::Function {
+                name, return_type, ..
+            } = stmt
+                && return_type.is_some()
+            {
+                m.insert(name.lexeme().to_string(), function_return_ty(return_type));
+            }
+        }
+    });
+
+    FUNCTION_PARAM_TYPES.with(|map| {
+        let mut m = map.borrow_mut();
+        m.clear();
+        for stmt in &program.statements {
+            if let Stmt::Function { name, params, .. } = stmt {
+                let param_tys = params
+                    .iter()
+                    .map(|p| type_annotation_to_ty(&p.type_annotation))
+                    .collect();
+                m.insert(name.lexeme().to_string(), param_tys);
+            }
+        }
+    });
+
+    // Declare runtime functions.
+    declare_runtime_functions(&module);
+
+    // Declare every top-level function up front so call sites resolve
+    // regardless of definition order (required once `use` imports merge
+    // multiple modules into one program). The user `main` becomes
+    // `__ntsc_user_main`; in test mode it is skipped entirely because the
+    // harness main replaces the entry point.
+    for stmt in &program.statements {
+        if let Stmt::Function {
+            name,
+            params,
+            return_type,
+            ..
+        } = stmt
+        {
+            let fn_name = if name.lexeme() == "main" {
+                "__ntsc_user_main"
+            } else {
+                name.lexeme()
+            };
+            if test_mode && name.lexeme() == "main" {
+                continue;
+            }
+            if module.get_function(fn_name).is_some() {
+                continue;
+            }
+            let (fn_ty, _param_tys) = fn_type_from_params(context, params, return_type);
+            module.add_function(fn_name, fn_ty, Some(inkwell::module::Linkage::External));
+        }
+    }
+
+    let mut test_names: Vec<String> = Vec::new();
+    let mut async_done: HashSet<String> = HashSet::new();
+    let mut async_in_progress: HashSet<String> = HashSet::new();
+    for stmt in &program.statements {
+        match stmt {
+            Stmt::Test { name, body } => {
+                emit_test_function(context, &module, name, body)?;
+                test_names.push(name.lexeme().to_string());
+            }
+            Stmt::Function { name, .. } if test_mode && name.lexeme() == "main" => {}
+            Stmt::AsyncFunction { name, .. } if test_mode && name.lexeme() == "main" => {}
+            Stmt::AsyncFunction { .. } => {
+                emit_async_function(
+                    context,
+                    &module,
+                    program,
+                    stmt,
+                    &mut async_done,
+                    &mut async_in_progress,
+                )?;
+            }
+            _ => emit_top_level(context, &module, program, stmt)?,
+        }
+    }
+
+    if test_mode {
+        emit_test_harness(context, &module, &test_names)?;
+    }
+
+    emit_c_main_wrapper(&module, report_leaks)?;
+
+    // Vtable slots reference functions defined anywhere in the module, so
+    // they can only be filled once every body exists.
+    super::dyn_obj::finalize_trait_vtables(context, &module)?;
+
+    // Validate before optimizing so mistakes surface with full IR context.
+    if let Err(msg) = module.verify() {
+        if std::env::var("NTSC_DUMP_IR").is_ok() {
+            eprintln!("===== DUMP (verify failed) =====");
+            eprintln!("{}", module.print_to_string().to_string());
+        }
+        return Err(crate::CodegenError::LLVMError(format!(
+            "LLVM module verification failed: {msg}"
+        )));
+    }
+
+    if std::env::var("NTSC_DUMP_IR").is_ok() {
+        eprintln!("===== DUMP =====");
+        eprintln!("{}", module.print_to_string().to_string());
+    }
+
+    if optimize {
+        // Where the alloca-based variable slots become SSA registers;
+        // skipping it leaves every loop induction variable on the stack
+        // (~3% vs ~70% speedup).
+        crate::context::run_optimization_passes(&module, target_machine)?;
+    }
+
+    crate::context::write_object_file(&module, target_machine, obj_path)
+}
+
+/// Emit a `test name { body }` block as a no-argument void function
+/// named `test_<name>`.
+pub(crate) fn emit_test_function<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    name: &ntsc_ast::token::Token,
+    body: &[Stmt],
+) -> Result<(), crate::CodegenError> {
+    let fn_name = format!("test_{}", name.lexeme());
+    let (fn_ty, _param_tys) = fn_type_from_params(context, &[], &None);
+    let function = module.add_function(&fn_name, fn_ty, Some(inkwell::module::Linkage::External));
+
+    if body.is_empty() {
+        // An empty `test` block passes; it still needs a body so the
+        // generated harness has something to call.
+        let entry = context.append_basic_block(function, "entry");
+        let builder = context.create_builder();
+        builder.position_at_end(entry);
+        builder.build_return(None)?;
+        return Ok(());
+    }
+
+    let builder = context.create_builder();
+    let entry_bb = context.append_basic_block(function, "entry");
+    builder.position_at_end(entry_bb);
+
+    let entry_builder = context.create_builder();
+    entry_builder.position_at_end(entry_bb);
+
+    let mut fn_ctx = FunctionContext::new(
+        function,
+        &builder,
+        &entry_builder,
+        entry_bb,
+        module,
+        Ty::Void,
+        context,
+    );
+    fn_ctx.stack_allocated = analyze_stack_allocatable(body, module);
+    fn_ctx.class_drops = analyze_class_drops(body, module);
+
+    for stmt in body {
+        emit_statement_in_function(&mut fn_ctx, stmt)?;
+    }
+
+    emit_exception_return(&mut fn_ctx, &Ty::Void, context)?;
+    let current_block = fn_ctx.builder.get_insert_block().unwrap();
+    if current_block.get_terminator().is_none() {
+        emit_drop_all_owned(&mut fn_ctx)?;
+        fn_ctx.builder.build_return(None)?;
+    }
+    Ok(())
+}
+
+/// Generate the test harness `main` from an NTSC source template, parse it,
+/// and emit it: each `test_<name>` runs inside a `try`/`catch`, prints
+/// `PASS <name>` / `FAIL <name>: <msg>`, prints a summary, and returns a
+/// non-zero exit code when any test failed. Reusing the language's own
+/// parser keeps the harness IR consistent with normal codegen.
+pub(crate) fn emit_test_harness<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    test_names: &[String],
+) -> Result<(), crate::CodegenError> {
+    let mut source =
+        String::from("fun main() -> int {\n    var __pass = 0;\n    var __fail = 0;\n");
+    for name in test_names {
+        source.push_str(&format!(
+            "    try {{\n        test_{name}();\n        say(\"PASS {name}\");\n        __pass = __pass + 1;\n    }} catch (err) {{\n        say(\"FAIL {name}: \" + err);\n        __fail = __fail + 1;\n    }}\n"
+        ));
+    }
+    source.push_str(&format!(
+        "    say(\"{} \" + __pass + \" passed, \" + __fail + \" failed\");\n",
+        crate::SUMMARY_MARKER
+    ));
+    source.push_str("    if (__fail > 0) {\n        return 1;\n    }\n    return 0;\n}\n");
+
+    let tokens = ntsc_lexer::tokenize(&source);
+    let harness = ntsc_parser::parse(&tokens).map_err(crate::CodegenError::Parse)?;
+
+    for stmt in &harness.statements {
+        emit_top_level(context, module, &harness, stmt)?;
+    }
+    Ok(())
+}
+
+// ── Top-level emission ──────────────────────────────────────────────────
+
+pub(crate) fn emit_top_level<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    _program: &Program,
+    stmt: &Stmt,
+) -> Result<(), crate::CodegenError> {
+    match stmt {
+        Stmt::Function {
+            name,
+            params,
+            return_type,
+            body,
+            ..
+        } => {
+            emit_function(context, module, name, params, return_type, body)?;
+        }
+        Stmt::AsyncFunction { .. } => {}
+        Stmt::Class {
+            name, parent, body, ..
+        } => {
+            emit_class(context, module, name, parent, body)?;
+        }
+        Stmt::Expression { expression } => {
+            emit_implicit_init(context, module, expression)?;
+        }
+        Stmt::Var {
+            name,
+            type_annotation,
+            initializer,
+            is_const,
+            ..
+        } => {
+            if *is_const {
+                emit_static_const(context, module, name, type_annotation, initializer)?;
+            } else {
+                emit_top_level_var(context, module, name, type_annotation, initializer)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}

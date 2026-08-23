@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Main WiX source for the ntsc MSI installer.
+
+  Build with the wix CLI (WiX v4/v5):
+
+      wix build ntsc.wxs dlls.wxs \
+        -ext WixToolset.UI.wixext \
+        -d SourceDir=<staging> -d MsiVersion=<26.0.0> \
+        -d UpgradeCode=<guid> -o ntsc-<version>.msi
+
+  The LLVM DLLs that ntsc.exe links against are discovered at build time by
+  build-msi.ps1 (dumpbin /DEPENDENTS) and emitted into dlls.wxs. (ntsc.exe
+  links LLVM statically, so that closure is usually empty.)
+
+  LLVM needs no separate installation: the DLLs ntsc.exe links against are
+  bundled into this MSI. The only optional choice the installer offers is
+  whether the `bin` directory is added to the system PATH, toggled from the
+  feature-selection dialog ("Add ntsc to PATH", checked by default) or later
+  via Programs & Features -> Change.
+
+  Authored for the WiX v4/v5 schema: <Product> is merged into <Package>, the
+  summary-stream fields live in <SummaryInformation>, and the standard WixUI
+  dialog set is referenced through the ui: namespace + WixToolset.UI.wixext.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+    Name="ntsc"
+    Manufacturer="ntsc"
+    Version="$(var.MsiVersion)"
+    UpgradeCode="$(var.UpgradeCode)"
+    Scope="perMachine"
+    Language="1033">
+
+    <SummaryInformation Description="NTSC - Neutron Type-Safe Compiler" />
+
+    <!-- The license shown in the license-agreement dialog; generated from
+         LICENSE by build-msi.ps1 into the staging directory. -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.SourceDir)\license.rtf" />
+
+    <!-- License -> feature selection (with the optional-feature checkboxes) ->
+         ready -> progress. Provided by WixToolset.UI.wixext (-ext). -->
+    <ui:WixUI Id="WixUI_FeatureTree" />
+
+    <!-- Schedules RemoveExistingProducts for us; do not also hand-author it. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of ntsc is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="ntsc">
+        <Directory Id="INSTALLBIN" Name="bin">
+          <Directory Id="INSTALLMINGW" Name="mingw" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="ntsc compiler"
+             Description="The ntsc compiler binary and the LLVM libraries it needs."
+             Level="1">
+      <ComponentGroupRef Id="NtscFiles" />
+    </Feature>
+
+    <Feature Id="AddToPath" Title="Add ntsc to PATH"
+             Description="Adds the ntsc bin directory to the system PATH so `ntsc` is available from any terminal."
+             Level="1" AllowAbsent="yes">
+      <ComponentRef Id="PathEnvironment" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="NtscFiles" Directory="INSTALLBIN">
+      <Component Id="ntsc.exe" Guid="*">
+        <File Id="ntsc.exe" Source="$(var.SourceDir)\ntsc.exe" KeyPath="yes" />
+      </Component>
+      <ComponentGroupRef Id="Libraries" />
+      <ComponentGroupRef Id="Tools" />
+      <ComponentGroupRef Id="MingwLibs" />
+    </ComponentGroup>
+
+    <!-- Kept in its own component and feature so unchecking
+         "Add ntsc to PATH" skips the environment change entirely.
+         The registry value is the component key path. -->
+    <Component Id="PathEnvironment" Guid="*" Directory="INSTALLBIN">
+      <Environment Id="PATH" Name="PATH" Value="[INSTALLBIN]" Permanent="no"
+                   Part="last" Action="set" System="yes" />
+      <RegistryValue Root="HKLM" Key="Software\ntsc" Name="PathEnvironment"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Fragment>
+</Wix>

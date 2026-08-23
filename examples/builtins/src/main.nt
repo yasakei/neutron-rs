@@ -1,0 +1,39 @@
+// builtins — standard library modules available without `use`.
+//
+// The stdlib modules (`strings`, `math`, `arrays`, `encoding`, `hash`,
+// `os`, ...) are predeclared in every program.
+
+fun main() {
+    // strings
+    say("upper:  " + strings.upper("hello"))
+    say("lower:  " + strings.lower("Hello"))
+    say("trim:   [" + strings.trim("  pad  ") + "]")
+    say("join:   " + strings.join("a", "b", "-"))
+
+    // math
+    var a = 9
+    say("sqrt:   " + math.sqrt(a))
+    say("pow:    " + math.pow(2, 10))
+    say("floor:  " + math.floor(3.7))
+
+    // arrays
+    var nums = [5, 1, 4, 2, 3]
+    var sorted = sort.stable_sort(nums)
+    say("sort:   " + sorted[0] + sorted[1] + sorted[2] + sorted[3] + sorted[4])
+    say("length: " + arrays.length(sorted))
+
+    // encoding / hash
+    say("b64:    " + encoding.base64_encode("ntsc"))
+    say("hex:    " + encoding.hex_encode("AB"))
+    say("sha256: " + strings.substring(hash.sha256("hello"), 0, 16) + "...")
+
+    // os
+    var dir = os.path_dirname("/a/b/c.txt")
+    say("dir:    " + dir)
+    var joined = os.path_join("a", "b")
+    say("joinp:  " + joined)
+    var isabs = os.is_abs("/tmp")
+    say("isabs:  " + isabs)
+
+    say("done")
+}

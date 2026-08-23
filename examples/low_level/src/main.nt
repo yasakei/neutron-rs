@@ -1,0 +1,177 @@
+// low_level — systems-style programming with explicit integer representations.
+//
+// Neutron does not expose raw pointers. The low-level building blocks are
+// explicit integer arithmetic, fixed-width byte values, and arrays with clear
+// ownership. This example implements:
+//   - bit packing and unpacking for a compact status word
+//   - a bounded ring buffer with head/tail/count invariants
+//   - a framed packet checksum over byte-sized integer values
+//   - bounds-checked pointer capabilities over a byte region
+//   - typed pointers: `own` allocations, `&`/`&mut` references, and raw
+//     pointers reached only inside `unsafe`
+//   - slices: bounds-checked windows over an array
+
+class Register {
+    var int value
+
+    fun init(int value) {
+        this.value = value
+    }
+}
+
+fun mask_bits(int value, int mask) -> int {
+    return value & mask
+}
+
+// Layout: [ flags: 4 bits ][ kind: 4 bits ][ sequence: 8 bits ]
+fun pack_status(int flags, int kind, int sequence) -> int {
+    var int word = 0
+    word = word | (mask_bits(flags, 15) << 12)
+    word = word | (mask_bits(kind, 15) << 8)
+    word = word | mask_bits(sequence, 255)
+    return word
+}
+
+fun unpack_flags(int word) -> int {
+    return (word >> 12) & 15
+}
+
+fun unpack_kind(int word) -> int {
+    return (word >> 8) & 15
+}
+
+fun unpack_sequence(int word) -> int {
+    return word & 255
+}
+
+class RingBuffer {
+    var array[int] slots
+    var int head
+    var int tail
+    var int count
+    var int capacity
+
+    fun init(int capacity) {
+        this.slots = []
+        this.capacity = capacity
+        for (var i = 0; i < capacity; i = i + 1) {
+            arrays.push(this.slots, 0)
+        }
+        this.head = 0
+        this.tail = 0
+        this.count = 0
+    }
+
+    fun is_empty() -> bool {
+        return this.count == 0
+    }
+
+    fun is_full() -> bool {
+        return this.count == this.capacity
+    }
+
+    fun push(int value) -> bool {
+        if (this.is_full()) {
+            return false
+        }
+        this.slots[this.tail] = value
+        this.tail = (this.tail + 1) % this.capacity
+        this.count = this.count + 1
+        return true
+    }
+
+    fun pop() -> int {
+        if (this.is_empty()) {
+            return -1
+        }
+        var int value = this.slots[this.head]
+        this.head = (this.head + 1) % this.capacity
+        this.count = this.count - 1
+        return value
+    }
+}
+
+// Sum bytes modulo 256. The packet includes a two-byte length prefix followed
+// by payload bytes, matching the sort of framing used by embedded protocols.
+fun checksum(view array[int] packet) -> int {
+    var int total = 0
+    for (var byte in packet) {
+        total = (total + (byte & 255)) & 255
+    }
+    return total
+}
+
+fun make_packet(view array[int] payload) -> array[int] {
+    var array[int] packet = []
+    arrays.push(packet, (arrays.length(payload) >> 8) & 255)
+    arrays.push(packet, arrays.length(payload) & 255)
+    for (var byte in payload) {
+        arrays.push(packet, byte & 255)
+    }
+    arrays.push(packet, checksum(packet))
+    return packet
+}
+
+fun verify_packet(view array[int] packet) -> bool {
+    var int last = arrays.length(packet) - 1
+    if (last < 2) {
+        return false
+    }
+    var int total = 0
+    for (var i = 0; i < last; i = i + 1) {
+        total = (total + (packet[i] & 255)) & 255
+    }
+    return total == packet[last]
+}
+
+fun main() {
+    var int status = pack_status(9, 3, 197)
+    say("status word: " + status)
+    say("flags=" + unpack_flags(status) + " kind=" + unpack_kind(status) + " sequence=" + unpack_sequence(status))
+
+    var queue = RingBuffer(3)
+    say("push 10: " + queue.push(10))
+    say("push 20: " + queue.push(20))
+    say("push 30: " + queue.push(30))
+    say("push full: " + queue.push(40))
+    say("pop: " + queue.pop())
+    say("push after pop: " + queue.push(40))
+    say("drain: " + queue.pop() + "," + queue.pop() + "," + queue.pop())
+
+    var payload = [72, 101, 108, 108, 111]
+    var packet = make_packet(payload)
+    say("packet length: " + arrays.length(packet))
+    say("packet checksum: " + packet[arrays.length(packet) - 1])
+    say("packet verified: " + verify_packet(packet))
+
+    // A slice is a bounds-checked window. Indexing and subslicing are checked
+    // against the window, so they cannot reach the rest of the array.
+    var slice[int] payload_window = slices.of(packet, 2, arrays.length(packet) - 1)
+    say("payload len: " + slices.length(payload_window))
+    say("payload bytes: " + payload_window[0] + "," + payload_window[1])
+    var array[int] payload_copy = copy(payload_window)
+    say("payload copy: " + arrays.length(payload_copy))
+
+    // `pointer` is an opaque capability, not a numeric address. Derived
+    // pointers retain the allocation and every access is bounds-checked.
+    var pointer region = memory.alloc(16)
+    memory.store64(region, status)
+    var pointer byte_8 = memory.offset(region, 8)
+    memory.store8(byte_8, 42)
+    say("memory word: " + memory.load64(region))
+    say("memory byte 8: " + memory.load8(byte_8))
+
+    // Typed pointers. `own` owns the allocation and frees it at scope exit,
+    // `&`/`&mut` are checked references, and a raw pointer is only reachable
+    // from a reference inside `unsafe`.
+    var own Register reg = alloc(Register(1))
+    var &Register reg_read = &reg
+    say("register: " + reg_read.value)
+
+    unsafe {
+        var *mut int cell = memory.raw_address(&mut reg.value)
+        *cell = unpack_sequence(status)
+    }
+    say("register after raw write: " + reg.value)
+    say("done")
+}

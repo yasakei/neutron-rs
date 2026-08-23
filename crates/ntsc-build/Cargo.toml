@@ -1,0 +1,11 @@
+[package]
+name = "ntsc-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ntsc-ast = { path = "../ntsc-ast" }
+ntsc-lexer = { path = "../ntsc-lexer" }
+ntsc-parser = { path = "../ntsc-parser" }
+ntsc-diag = { path = "../ntsc-diag" }

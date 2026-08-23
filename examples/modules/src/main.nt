@@ -1,0 +1,21 @@
+// modules — multi-file project: `use "file.nt"` imports are merged into a
+// single program at build time. Paths are relative to the importing file.
+//
+// Build and run with:
+//   ntsc build
+//   ./build/debug/modules
+
+use "greet.nt"
+use "math_utils.nt"
+
+fun main() {
+    say(greet("world"));
+    say("double(21): " + double(21));
+    say("triple(14): " + triple(14));
+
+    var counter = Counter(5);
+    counter.bump();
+    counter.bump();
+    say("count: " + counter.count());
+    say("done")
+}

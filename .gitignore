@@ -1,0 +1,33 @@
+# Rust build output
+/target
+**/target
+
+# Packaging output (installers and portable tarballs)
+/dist
+.github/packaging/.build
+
+# Rust backup files
+**/*.rs.bk
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# ntsc-compiled example binaries
+examples/**/build/
+benchmarks/_build/
+
+# Coverage / profiling artifacts
+*.profraw
+*.profdata

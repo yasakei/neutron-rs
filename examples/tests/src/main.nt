@@ -1,0 +1,39 @@
+// tests — unit-test example using `test` blocks and the `testing` builtin.
+//
+// Run with:
+//   ntsc test
+//
+// The harness runs every `test` block, replacing `main` with the test runner.
+
+use testing
+
+fun add(int a, int b) -> int {
+    return a + b;
+}
+
+fun factorial(int n) -> int {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+test add_works {
+    testing.assert_eq(add(2, 3), 5);
+    testing.assert_ne(add(2, 3), 6);
+}
+
+test factorial_small {
+    testing.assert_eq(factorial(0), 1);
+    testing.assert_eq(factorial(1), 1);
+    testing.assert_eq(factorial(5), 120);
+}
+
+test string_helpers {
+    testing.assert_eq(strings.upper("hi"), "HI");
+    testing.assert_eq(strings.trim("  x  "), "x");
+}
+
+fun main() {
+    say("user main is not run in test mode");
+}

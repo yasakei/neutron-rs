@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ntsc-ast",
+    "crates/ntsc-lexer",
+    "crates/ntsc-parser",
+    "crates/ntsc-build",
+    "crates/ntsc-codegen",
+    "crates/ntsc-diag",
+    "crates/ntsc-runtime",
+    "crates/ntsc-typeck",
+    "crates/ntsc-cli",
+]
+
+[workspace.package]
+# Cargo requires semver-valid versions, so the stage letter of the 26.0
+# scheme (26.0.0b) lives only in the CLI's NTSC_VERSION constant.
+version = "26.0.0"
+edition = "2024"
+license = "NPL-1.1"

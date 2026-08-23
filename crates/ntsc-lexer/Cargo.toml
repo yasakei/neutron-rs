@@ -1,0 +1,10 @@
+[package]
+name = "ntsc-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Logos-based lexer for the NTSC language"
+
+[dependencies]
+ntsc-ast = { path = "../ntsc-ast" }
+logos = "0.15"

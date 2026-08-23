@@ -1,0 +1,19 @@
+// Matrix multiplication benchmark in NTSC
+fun main() -> int {
+    var int size = 20;
+    var int total = 0;
+    var int i = 0;
+    while (i < size) {
+        var int j = 0;
+        while (j < size) {
+            var int k = 0;
+            while (k < size) {
+                total = total + (i * size + k + 1) * (k * size + j + 1);
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+}

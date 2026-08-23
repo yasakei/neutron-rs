@@ -1,0 +1,26 @@
+[package]
+name = "ntsc-fuzz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ntsc-lexer = { path = "../crates/ntsc-lexer" }
+ntsc-parser = { path = "../crates/ntsc-parser" }
+ntsc-typeck = { path = "../crates/ntsc-typeck" }
+
+[[bin]]
+name = "fuzz_parser"
+path = "fuzz_targets/fuzz_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_typeck"
+path = "fuzz_targets/fuzz_typeck.rs"
+test = false
+doc = false

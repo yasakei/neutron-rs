@@ -1,0 +1,19 @@
+[package]
+name = "ntsc-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LLVM code generation for the NTSC compiler"
+
+[dependencies]
+# inkwell's default features enable *all* LLVM targets, but the official
+# LLVM Windows binaries only ship a subset, so linking fails with unresolved
+# LLVMInitialize*Target symbols for the rest. Enable only the targets this
+# compiler actually emits for (x86_64 / aarch64), like ntsc-cli does.
+inkwell = { version = "0.9.0", default-features = false, features = ["llvm22-1", "target-x86", "target-aarch64"] }
+ntsc-ast = { path = "../ntsc-ast" }
+ntsc-parser = { path = "../ntsc-parser" }
+ntsc-lexer = { path = "../ntsc-lexer" }
+ntsc-typeck = { path = "../ntsc-typeck" }
+ntsc-build = { path = "../ntsc-build" }
+ntsc-diag = { path = "../ntsc-diag" }

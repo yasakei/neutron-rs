@@ -1,0 +1,9 @@
+[package]
+name = "ntsc-diag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Beautiful, span-accurate error diagnostics for the NTSC compiler"
+
+[dependencies]
+ntsc-ast = { path = "../ntsc-ast" }

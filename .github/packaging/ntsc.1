@@ -1,0 +1,87 @@
+.TH NTSC 1 "August 2026" "ntsc" "NTSC Manual"
+.SH NAME
+ntsc \- the Neutron Type-Safe Compiler
+.SH SYNOPSIS
+.B ntsc
+.RI <command> " [" options ]
+.SH DESCRIPTION
+.B ntsc
+is a statically typed, memory-safe systems language compiler that produces
+native binaries through LLVM. It pairs a compact, readable syntax with
+compiler-enforced ownership: values move by default, borrows are declared
+with
+.BR view ,
+and memory is released deterministically when ownership ends.
+.SH COMMANDS
+.TP
+.B init " [name]"
+Scaffold a new project with a
+.I build.ntbl
+manifest and a
+.I src/main.nt
+entry point.
+.TP
+.B build " [--release]"
+Compile the project to
+.I build/debug/
+or
+.I build/release/.
+.TP
+.B test " [--release]"
+Discover and run
+.I test
+blocks.
+.TP
+.B run " [--release]"
+Build and execute the project.
+.TP
+.B clean
+Remove the
+.I build/
+directory.
+.TP
+.B watch " [--release]"
+Rebuild whenever sources change.
+.TP
+.B graph
+Print the module dependency graph in DOT format.
+.TP
+.B version
+Print detailed version information and exit.
+.SH OPTIONS
+.TP
+.B \-\-release
+Build in release mode with the LLVM optimization pipeline.
+.TP
+.B \-\-debug
+Build in debug mode (the default).
+.TP
+.B \-\-json
+Emit diagnostics as JSON on standard output.
+.TP
+.B \-\-help , \-h
+Print usage information and exit.
+.TP
+.B \-\-version , \-V
+Print the compiler version, LLVM revision, host triple, build profile, and
+git commit, then exit.
+.SH VERSION
+The package version identifies the release this binary was built from.
+.SH FILES
+.TP
+.I <prefix>/lib/ntsc/libntsc_runtime.a
+The runtime static library that
+.B ntsc build
+links every NTSC program against.
+.B ntsc
+locates it relative to its own executable: beside the binary, or in the sibling
+.I lib/ntsc
+(Debian, Arch, tarball) or
+.I lib64/ntsc
+(Fedora) directory. The portable
+.I .tar.gz
+archives keep it in
+.IR lib/ntsc .
+.SH SEE ALSO
+The user guide and language reference are available in the repository under
+.IR docs/ .

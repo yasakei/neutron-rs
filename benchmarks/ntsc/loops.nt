@@ -1,0 +1,24 @@
+// Loop operations benchmark in NTSC - all in main()
+fun main() -> int {
+    var int s1 = 0;
+    var int i1 = 0;
+    while (i1 < 100000) { s1 = s1 + i1; i1 = i1 + 1; }
+
+    var int s2 = 0;
+    var int i2 = 0;
+    while (i2 < 100000) { s2 = s2 + i2; i2 = i2 + 1; }
+
+    var int count = 0;
+    var int di = 0;
+    while (di < 10) {
+        var int dj = 0;
+        while (dj < 50) {
+            var int dk = 0;
+            while (dk < 50) { count = count + 1; dk = dk + 1; }
+            dj = dj + 1;
+        }
+        di = di + 1;
+    }
+    say("loops");
+    return s1 + s2 + count;
+}

@@ -1,0 +1,11 @@
+[package]
+name = "ntsc-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pratt + recursive-descent parser for the NTSC language"
+
+[dependencies]
+ntsc-ast = { path = "../ntsc-ast" }
+ntsc-lexer = { path = "../ntsc-lexer" }
+ntsc-diag = { path = "../ntsc-diag" }

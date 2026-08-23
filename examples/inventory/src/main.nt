@@ -1,0 +1,154 @@
+// inventory — a complex ownership example.
+//
+// Demonstrates the Own-Move-View model:
+//   - classes with string fields and constructors
+//   - moves: an owned array is built in `make_catalog` and moved to the caller
+//   - views: functions read through `view array[Product]` params without
+//     consuming the array; `view mut` writes are visible to the caller
+//   - shared: a `shared array[string]` log is pushed to in place through
+//     function calls, exercising reference-counted aliasing
+//   - copy(): an owned deep copy of an `array[int]` stays independent
+//   - exceptions: try / catch around a failing `fmt.to_int`
+//   - test blocks
+//
+// Build and run with:
+//   ntsc build
+//   ./build/debug/inventory
+//
+// Run the unit tests with:
+//   ntsc test
+
+use testing
+
+class Product {
+    var string sku
+    var string name
+    var float price
+    var float quantity
+
+    fun init(string sku, string name, float price, float quantity) {
+        this.sku = sku
+        this.name = name
+        this.price = price
+        this.quantity = quantity
+    }
+
+    fun value() -> float {
+        return this.price * this.quantity
+    }
+}
+
+class Ledger {
+    var array[int] amounts
+
+    fun init() {
+        this.amounts = []
+    }
+
+    fun add(int v) {
+        arrays.push(this.amounts, v)
+    }
+
+    fun total() -> int {
+        var t = 0
+        for (var i = 0; i < arrays.length(this.amounts); i = i + 1) {
+            t = t + this.amounts[i]
+        }
+        return t
+    }
+}
+
+// Builds a catalog and moves it out of the function: the caller owns it.
+fun make_catalog() -> array[Product] {
+    var ps = [Product("A1", "apple", 1.5, 20.0), Product("B2", "bread", 2.25, 12.0), Product("C3", "cheese", 5.0, 5.0)]
+    return ps
+}
+
+// A view parameter borrows the caller's array; nothing is moved or freed.
+fun describe(view array[Product] ps) {
+    var value = 0.0
+    for (var p in ps) {
+        say("  " + p.sku + " " + p.name + " x" + p.quantity + " at " + p.price + " = " + p.value())
+        value = value + p.value()
+    }
+    say("  total value: " + value)
+}
+
+// Reads through a view and matches a string field by value.
+fun stock_of(view array[Product] ps, string sku) -> float {
+    for (var p in ps) {
+        if (p.sku == sku) {
+            return p.quantity
+        }
+    }
+    return 0.0
+}
+
+// A `view mut` writes through the borrow; the caller sees the changes.
+fun apply_discount(view mut array[Product] ps, float rate) {
+    for (var i = 0; i < arrays.length(ps); i = i + 1) {
+        ps[i].price = ps[i].price * rate
+    }
+}
+
+// A shared parameter aliases the caller's handle: pushes are visible to it.
+fun record(shared array[string] audit, string msg) {
+    arrays.push(audit, msg)
+}
+
+// Pure helpers exercised by the test blocks.
+fun units_value(float price, float quantity) -> float {
+    return price * quantity
+}
+
+fun same_sku(string a, string b) -> bool {
+    return a == b
+}
+
+test units_value_math {
+    testing.assert_eq(units_value(1.5, 4.0), 6.0)
+    testing.assert_ne(units_value(1.5, 4.0), 5.0)
+}
+
+test sku_compare {
+    testing.assert_true(same_sku("A1", "A1"))
+    testing.assert_false(same_sku("A1", "B2"))
+}
+
+fun main() {
+    var catalog = make_catalog()       // move into `catalog`
+    say("catalog:")
+    describe(catalog)                  // borrow; catalog still owned
+
+    say("stock of B2: " + stock_of(catalog, "B2"))
+
+    apply_discount(catalog, 0.5)       // exclusive borrow, writes visible
+    say("after 50% discount:")
+    describe(catalog)
+
+    var ledger = Ledger()              // class holding an owned array field
+    ledger.add(3)
+    ledger.add(7)
+    say("ledger total: " + ledger.total())
+
+    // copy() deep-copies an array[int]; the copy is fully independent.
+    var original = [10, 20, 30]
+    var cloned = copy(original)
+    cloned[0] = 99
+    say("copy: original " + original[0] + " cloned " + cloned[0])
+
+    // shared handles alias one value; pushes through a parameter are visible.
+    shared array[string] audit = []
+    record(audit, "made catalog")
+    record(audit, "discounted")
+    say("audit has " + arrays.length(audit) + " entries")
+
+    try {
+        var n = fmt.to_int("oops")
+        say("unreached " + n)
+    } catch (err) {
+        say("caught: " + err)
+    }
+
+    say("done")
+}

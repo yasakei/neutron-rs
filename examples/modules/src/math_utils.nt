@@ -1,0 +1,26 @@
+// math_utils — another module imported by `main.nt`. This module also
+// demonstrates a class defined in a separate file.
+
+fun double(int x) -> int {
+    return x * 2;
+}
+
+fun triple(int x) -> int {
+    return x * 3;
+}
+
+class Counter {
+    var int n
+
+    fun init(int start) {
+        this.n = start;
+    }
+
+    fun bump() {
+        this.n = this.n + 1;
+    }
+
+    fun count() -> int {
+        return this.n;
+    }
+}

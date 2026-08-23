@@ -1,0 +1,144 @@
+// flight — the mission manifest types.
+//
+// Stability notes:
+//   - Classes own their heap fields. A string field is reclaimed when the
+//     instance goes out of scope, and an `init`-less class (like `Mission`)
+//     default-initializes its array fields so they are usable immediately and
+//     reclaimed when the enclosing function returns.
+//   - Classes use reference semantics: `var b = a` aliases `a`, so the
+//     compiler never reclaims an instance it cannot prove unaliased.
+//   - Class elements are stored in arrays by constructing them inline; the
+//     array owns the instance and the loop variables read back its fields.
+
+class Astronaut {
+    var string name
+    var float mass
+
+    fun init(string name, float mass) {
+        this.name = name
+        this.mass = mass
+    }
+
+    fun badge() -> string {
+        return "cdr." + strings.lower(this.name)
+    }
+
+    fun report() {
+        say("      " + this.badge() + "  " + this.mass + " kg")
+    }
+}
+
+class Payload {
+    var string id
+    var float mass
+
+    fun init(string id, float mass) {
+        this.id = id
+        this.mass = mass
+    }
+
+    fun report() {
+        say("      payload " + this.id + "  " + this.mass + " kg")
+    }
+}
+
+class Subsystem {
+    var string name
+    var int health
+
+    fun init(string name, int health) {
+        this.name = name
+        this.health = health
+    }
+
+    fun report() {
+        say("      " + this.name + ": health " + this.health)
+    }
+}
+
+// `Mission` has no `init`; its owned array fields are default-initialized to
+// empty heap arrays by the compiler, so every method can push and read them
+// without any explicit construction, and they are reclaimed on return.
+class Mission {
+    var array[Astronaut] crew
+    var array[Payload] payloads
+    var array[Subsystem] subsystems
+
+    fun add_astronaut(string name, float mass) {
+        arrays.push(this.crew, Astronaut(name, mass))
+    }
+
+    fun add_payload(string id, float mass) {
+        arrays.push(this.payloads, Payload(id, mass))
+    }
+
+    fun add_subsystem(string name, int health) {
+        arrays.push(this.subsystems, Subsystem(name, health))
+    }
+
+    fun total_crew_mass() -> float {
+        var t = 0.0
+        for (var a in this.crew) {
+            t = t + a.mass
+        }
+        return t
+    }
+
+    fun total_payload_mass() -> float {
+        var t = 0.0
+        for (var p in this.payloads) {
+            t = t + p.mass
+        }
+        return t
+    }
+
+    fun average_health() -> int {
+        if (arrays.length(this.subsystems) == 0) {
+            return 0
+        }
+        var t = 0
+        for (var s in this.subsystems) {
+            t = t + s.health
+        }
+        return t / arrays.length(this.subsystems)
+    }
+
+    fun manifest() {
+        say("    crew:")
+        for (var a in this.crew) {
+            a.report()
+        }
+        say("    payloads:")
+        for (var p in this.payloads) {
+            p.report()
+        }
+        say("    subsystems:")
+        for (var s in this.subsystems) {
+            s.report()
+        }
+    }
+}
+
+// The iterator protocol: a class with `length() -> int` and `get(int) -> T`
+// can be the iterable of a `for (var x in obj)` loop. `Orbit` only stores
+// scalars, so iterating it never allocates.
+class Orbit {
+    var float start
+    var float step
+    var int count
+
+    fun init(float start, float step, int count) {
+        this.start = start
+        this.step = step
+        this.count = count
+    }
+
+    fun length() -> int {
+        return this.count
+    }
+
+    fun get(int i) -> float {
+        var float fi = i
+        return this.start + this.step * fi
+    }
+}
