@@ -1,14 +1,8 @@
-name: ci
-
-# Builds, lints, and tests the workspace on every push and pull request.
-# The compiler links LLVM 22 dynamically, so each runner installs it first;
-# Windows additionally needs the MSVC toolchain for the e2e tests that link
-# the runtime static library with link.exe.
+name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main, master]
   pull_request:
   # Allow other workflows (e.g. release) to invoke this suite as a gate,
   # so tagged builds run the exact same build/lint/test as normal CI.
@@ -16,63 +10,51 @@ on:
 
 env:
   LLVM_VERSION: 22.1.6
-  # The e2e test binaries link LLVM and are large. Together with the LLVM
-  # trimming and free-disk-space steps below, dropping debug info and
+  # The e2e test binaries each statically link LLVM. Dropping debug info and
   # incremental state keeps the Linux runner (14 GB disk) from filling up.
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  check:
-    name: check-${{ matrix.name }}
+  build-test:
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux-x86_64
-            os: ubuntu-latest
-          - name: macos-aarch64
-            os: macos-latest
-          - name: windows-x86_64
-            os: windows-latest
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
 
-      # ubuntu-latest has a 14 GB disk and the ~20 e2e test binaries each
-      # statically link LLVM, so reclaim the preinstalled toolchains (Android
-      # SDK, .NET, Haskell, CodeQL, Docker images) that nothing in this
-      # workflow needs before downloading LLVM.
-      - name: Disk usage before cleanup (Linux)
-        if: runner.os == 'Linux'
-        run: df -h
-
-      - name: node-cleanup (Linux)
+      # ubuntu-latest has a 14 GB disk and every e2e test binary statically
+      # links LLVM, so reclaim the preinstalled SDKs (Android, .NET, Haskell,
+      # CodeQL, Docker images) before downloading it.
+      - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          sudo docker builder prune -a
-
-      - name: Disk usage after cleanup (Linux)
-        if: runner.os == 'Linux'
-        run: df -h
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo docker builder prune -af >/dev/null 2>&1 || true
+          df -h /
 
       # ── LLVM 22 ──────────────────────────────────────────────────────────
+      # The codegen crate links against LLVM 22 via llvm-sys 221. Each host
+      # needs an LLVM 22 with bin/llvm-config available at LLVM_SYS_221_PREFIX.
       - name: Install LLVM 22 (Linux)
         if: runner.os == 'Linux'
         run: |
           curl -fsSL -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-Linux-X64.tar.xz"
-          tar -xf llvm.tar.xz
-          mv LLVM-*-Linux-X64 "$HOME/llvm"
+          mkdir -p "$HOME/llvm"
+          tar -xf llvm.tar.xz -C "$HOME/llvm" --strip-components=1
           rm -f llvm.tar.xz
           # Only llvm-config (llvm-sys), the static libs, the headers, and the
           # shared libLLVM are needed to build and link: the e2e tests drive
           # LLVM in-process and link with cc, never the CLI tools. Drop the
           # ~3.5 GB of tools/docs nothing here invokes so `cargo test` does
-          # not fill the 14 GB runner disk.
+          # not fill the runner disk.
           rm -rf "$HOME/llvm/libexec" "$HOME/llvm/share"
           rm -rf "$HOME/llvm/lib/clang" "$HOME/llvm/lib/cmake"
           find "$HOME/llvm/bin" -mindepth 1 -maxdepth 1 ! -name 'llvm-config*' -exec rm -rf {} +
@@ -89,9 +71,10 @@ jobs:
           echo "$(brew --prefix llvm@22)/bin" >> "$GITHUB_PATH"
 
       # The win64 .exe installer is an NSIS stub whose child process can
-      # outlive Start-Process -Wait, so llvm-sys sometimes found no LLVM. Use
-      # the clang+llvm archive instead, which is the package for projects
-      # that link against LLVM and contains include/, lib/, and the DLLs.
+      # outlive Start-Process -Wait, and it ships neither llvm-config.exe nor
+      # the development libraries. Use the clang+llvm archive instead, which
+      # is the package for projects that link against LLVM and contains
+      # include/, lib/, bin/llvm-config.exe, and the DLLs.
       - name: Install LLVM 22 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -170,27 +153,59 @@ jobs:
           Copy-Item $lib.FullName (Join-Path $llvmLib "xml2s.lib") -Force
           Copy-Item $lib.FullName (Join-Path $llvmLib "libxml2s.lib") -Force
 
-      # ── Rust ─────────────────────────────────────────────────────────────
+      # ── Rust toolchain ───────────────────────────────────────────────────
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt, clippy
+
       - uses: Swatinem/rust-cache@v2
         with:
           # Invalidate the cache whenever the Windows linker/CRT settings
           # change, so stale link.exe-linked artifacts are never reused.
           key: toolchain-${{ hashFiles('.cargo/config.toml') }}
 
-      # Node 24 for any JS tooling a future job invokes (the runner's default
-      # node version drifts, so pin it explicitly).
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
+      # ── Gate ─────────────────────────────────────────────────────────────
       - name: Format
         run: cargo fmt --check
 
-      - name: Lint
+      - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test
         run: cargo test --workspace
+
+      # ── Smoke test: scaffold + build + run a project ─────────────────────
+      # Runs under pwsh like every other step: a bash shell prepends the Git
+      # /usr/bin dir to PATH, and its coreutils link.exe would shadow the
+      # MSVC linker for the child ntsc process.
+      - name: Smoke test init
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build -p ntsc-cli --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Exact path: a name glob could pick up the ntsc.d depfile.
+          $exe = if ($IsWindows) { "ntsc.exe" } else { "ntsc" }
+          $cli = Join-Path $pwd "target/release/$exe"
+          if (-not (Test-Path $cli)) {
+            Get-ChildItem "target/release" | Out-String | Write-Host
+            throw "ntsc binary not found in target/release"
+          }
+          $tmp = Join-Path ([IO.Path]::GetTempPath()) "ntsc-smoke-$([Guid]::NewGuid().ToString('N'))"
+          New-Item -ItemType Directory $tmp | Out-Null
+          Push-Location $tmp
+          try {
+            & $cli init hello
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Push-Location hello
+            try {
+              & $cli --version
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              $out = (& $cli run --release 2>&1) | ForEach-Object { "$_" }
+              $out | Write-Host
+              if ($LASTEXITCODE -ne 0) { throw "::error::ntsc run --release exited with $LASTEXITCODE" }
+              if (-not (($out | Out-String) -match "Hello, World!")) {
+                throw "unexpected output from hello world"
+              }
+            } finally { Pop-Location }
+          } finally { Pop-Location }

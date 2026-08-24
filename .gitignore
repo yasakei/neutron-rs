@@ -31,3 +31,11 @@ benchmarks/_build/
 # Coverage / profiling artifacts
 *.profraw
 *.profdata
+
+# Local working notes and scratch files, never published
+/AGENTS.md
+/TODO.md
+
+# Agents
+.claude/
+.codex/
