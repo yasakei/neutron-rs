@@ -32,6 +32,7 @@ impl ReachabilityChecker {
                         code: None,
                         message: "unreachable code after terminal statement".to_string(),
                         span,
+                    help: None,
                     });
                 }
                 break;

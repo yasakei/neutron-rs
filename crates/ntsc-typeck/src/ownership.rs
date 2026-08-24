@@ -738,6 +738,23 @@ impl OwnershipChecker {
             code: Some(ntsc_diag::codes::OWNERSHIP),
             message,
             span,
+            help: None,
+        });
+    }
+
+    /// Same as [`Self::error`], with a one-sentence fix-it rendered as a
+    /// `help:` line under the error.
+    fn error_with_help(&mut self, message: impl Into<String>, span: Span, help: impl Into<String>) {
+        let message = message.into();
+
+        if !self.reported.insert((message.clone(), span)) {
+            return;
+        }
+        self.errors.push(TypeError {
+            code: Some(ntsc_diag::codes::OWNERSHIP),
+            message,
+            span,
+            help: Some(help.into()),
         });
     }
 
@@ -779,22 +796,31 @@ impl OwnershipChecker {
                 }
 
                 if init_kind == Some(ValueKind::View) && !matches!(declared, ValueKind::View) {
-                    self.error(
-                        match initializer {
-
-
-
-                            Some(Expr::IndexGet { .. } | Expr::Member { .. } | Expr::OptionalMember { .. }) => format!(
-                                "cannot store a borrowed element in `{}`; the container owns it — use `copy(...)` for an independent value, or `view var` to borrow it",
-                                name.lexeme()
-                            ),
-                            _ => format!(
-                                "cannot store a view in `{}`; a view may not be kept beyond the current block",
-                                name.lexeme()
-                            ),
-                        },
-                        name.span,
-                    );
+                    let message = match initializer {
+                        Some(
+                            Expr::IndexGet { .. }
+                            | Expr::Member { .. }
+                            | Expr::OptionalMember { .. },
+                        ) => format!(
+                            "cannot store a borrowed element in `{}`; the container owns it",
+                            name.lexeme()
+                        ),
+                        _ => format!(
+                            "cannot store a view in `{}`; a view may not be kept beyond the current block",
+                            name.lexeme()
+                        ),
+                    };
+                    let help = match initializer {
+                        Some(
+                            Expr::IndexGet { .. }
+                            | Expr::Member { .. }
+                            | Expr::OptionalMember { .. },
+                        ) => {
+                            "store an independent value: `var T name = copy(source)`, or borrow with `view var name`"
+                        }
+                        _ => "declare the variable as `view var name = source` to keep the borrow",
+                    };
+                    self.error_with_help(message, name.span, help);
                 }
 
                 if declares_borrow {

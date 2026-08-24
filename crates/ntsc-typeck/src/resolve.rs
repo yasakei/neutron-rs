@@ -20,6 +20,11 @@ pub struct TypeError {
 
     /// Diagnostic error-code family. `None` means the default type-check code.
     pub code: Option<&'static str>,
+
+    /// A one-sentence remedy rendered as a `help:` line under the error
+    /// (e.g. where to add `copy(...)`). Absent when there is nothing
+    /// actionable to suggest.
+    pub help: Option<String>,
 }
 
 impl std::fmt::Display for TypeError {
@@ -59,6 +64,7 @@ pub(crate) fn check_prepared_program(program: &Program) -> Result<(), Vec<TypeEr
             .into_iter()
             .map(|error| TypeError {
                 code: None,
+                help: None,
                 message: error.message,
                 span: error.span,
             })
@@ -218,6 +224,7 @@ impl TypeChecker {
             reported.extend(chain.iter().copied());
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: format!(
                     "class `{start}` cannot inherit from itself (cycle: {})",
                     chain.join(" -> ")
@@ -246,6 +253,7 @@ impl TypeChecker {
             if let Err(message) = self.symbols.define(name.lexeme(), ty) {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message,
                     span: name.span,
                 });
@@ -298,6 +306,7 @@ impl TypeChecker {
             if let Err(msg) = self.symbols.define(name.lexeme(), fn_ty) {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: msg,
                     span: name.span,
                 });
@@ -390,6 +399,26 @@ impl TypeChecker {
             current = info.parent.as_deref();
         }
         false
+    }
+
+    /// Every declared field and method name of `class_name` (including
+    /// inherited ones), for "did you mean" suggestions.
+    fn class_member_names(&self, class_name: &str) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut current = Some(class_name);
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name) {
+                break;
+            }
+            let Some(info) = self.classes.get(name) else {
+                break;
+            };
+            names.extend(info.fields.keys().cloned());
+            names.extend(info.methods.iter().cloned());
+            current = info.parent.as_deref();
+        }
+        names
     }
 
     /// The declared type of `property` read off an instance of `class_name`,
@@ -503,6 +532,7 @@ impl TypeChecker {
         {
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: "try/throw/retry is not supported inside async functions".into(),
                 span: self.stmt_span(stmt),
             });
@@ -605,6 +635,7 @@ impl TypeChecker {
                 if let Err(msg) = self.symbols.define(variable.lexeme(), elem_ty) {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: msg,
                         span: variable.span,
                     });
@@ -618,7 +649,8 @@ impl TypeChecker {
                     if matches!(&expr_ty, Some(ty) if is_borrow_ty(ty)) {
                         self.errors.push(TypeError {
                             code: None,
-                            message: "cannot return a borrow; it is scoped to this function and dies with it (use `copy(...)` for an owned value)".into(),
+                            message: "cannot return a borrow; it is scoped to this function and dies with it".into(),
+                            help: Some("wrap the value: `return copy(value)` hands back an owned copy".into()),
                             span: expr.span(),
                         });
                     } else if let Some(expected) = &self.current_return_type
@@ -627,6 +659,7 @@ impl TypeChecker {
                     {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "return type mismatch: expected `{expected}`, got `{actual}`"
                             ),
@@ -638,6 +671,7 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!("return type mismatch: expected `{expected}`, got `void`"),
                         span: Span::dummy(),
                     });
@@ -653,6 +687,7 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!("`say` expects a string, got `{ty}`"),
                         span: expression.span(),
                     });
@@ -686,6 +721,7 @@ impl TypeChecker {
                     if let Err(msg) = self.symbols.define(var.lexeme(), Ty::String) {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: msg,
                             span: var.span,
                         });
@@ -714,6 +750,7 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!("`retry` count must be `int`, got `{ty}`"),
                         span: count.span(),
                     });
@@ -725,6 +762,7 @@ impl TypeChecker {
                     if let Err(msg) = self.symbols.define(var.lexeme(), Ty::String) {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: msg,
                             span: var.span,
                         });
@@ -744,6 +782,7 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!("parent class `{}` is not defined", parent_token.lexeme()),
                         span: parent_token.span,
                     });
@@ -781,6 +820,7 @@ impl TypeChecker {
                 if matches!(&init_ty, Some(ty) if is_borrow_ty(ty)) {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: "cannot destructure a view; destructuring moves values out of their source".into(),
                         span: initializer.span(),
                     });
@@ -798,6 +838,7 @@ impl TypeChecker {
                     if let Err(msg) = self.symbols.define(name.lexeme(), bound_ty.clone()) {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: msg,
                             span: name.span,
                         });
@@ -823,6 +864,7 @@ impl TypeChecker {
                 if is_borrow_ty(&resolved) {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "functions cannot return a borrow (`{resolved}`); a borrow cannot outlive the value it points at — return an owned value instead"
                         ),
@@ -855,6 +897,7 @@ impl TypeChecker {
             if let Err(msg) = self.symbols.define(param.name.lexeme(), param_ty) {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: msg,
                     span: param.name.span,
                 });
@@ -895,6 +938,7 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: "await must be a statement-level call".into(),
                         span,
                     });
@@ -909,6 +953,7 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: "await must be a statement-level call".into(),
                         span,
                     });
@@ -922,6 +967,7 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: "await must be a statement-level call".into(),
                         span,
                     });
@@ -931,6 +977,7 @@ impl TypeChecker {
                 if let Some(span) = find_await_in_stmt(other) {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: "await is not allowed inside control flow in async functions"
                             .into(),
                         span,
@@ -957,6 +1004,7 @@ impl TypeChecker {
             } if !at_top_level => {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: "return must be at statement level in async functions".into(),
                     span: value.span(),
                 });
@@ -964,6 +1012,7 @@ impl TypeChecker {
             Stmt::Return { .. } if !at_top_level => {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: "return must be at statement level in async functions".into(),
                     span: self.stmt_span(stmt),
                 });
@@ -990,6 +1039,7 @@ impl TypeChecker {
             if param.type_annotation.is_none() {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!(
                         "parameter `{}` requires an explicit type annotation",
                         param.name.lexeme()
@@ -1026,6 +1076,7 @@ impl TypeChecker {
                 if !resolved.viewable() {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "cannot share a value of type `{resolved}`; `shared` requires a heap type (string, array, object, class, any)"
                         ),
@@ -1075,6 +1126,7 @@ impl TypeChecker {
                     };
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "cannot store a view inside `{container}[{inner_ty}]`; views cannot live inside arrays or options",
                         ),
@@ -1089,6 +1141,7 @@ impl TypeChecker {
                     if matches!(inner_ty, Ty::View(..)) {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: "cannot store a view inside `result[.., ..]`; views cannot live inside results".to_string(),
                             span,
                         });
@@ -1101,6 +1154,7 @@ impl TypeChecker {
                 if matches!(inner_ty, Ty::View(..)) {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "cannot store a view inside `shared {inner_ty}`; shared values cannot hold views",
                         ),
@@ -1117,6 +1171,7 @@ impl TypeChecker {
         if matches!(annotation, Some(TypeAnnotation::Any)) {
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: "`any` is not supported in statically typed NTSC".into(),
                 span,
             });
@@ -1140,6 +1195,7 @@ impl TypeChecker {
             {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!("unknown type `{}`", name.lexeme()),
                     span,
                 });
@@ -1173,6 +1229,7 @@ impl TypeChecker {
             if !matches!(initializer, Some(init) if is_constant_expr(init)) {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!(
                         "`static const` variable `{}` requires a constant literal initializer",
                         name.lexeme()
@@ -1193,6 +1250,7 @@ impl TypeChecker {
             if !inferable {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!(
                         "variable `{}` in an async function requires an explicit type annotation",
                         name.lexeme()
@@ -1214,9 +1272,10 @@ impl TypeChecker {
             self.errors.push(TypeError {
                 code: None,
                 message: format!(
-                    "cannot store a view in variable `{}`; views are block-scoped and cannot outlive their source (use `copy(...)` for an owned copy)",
+                    "cannot store a view in variable `{}`; views are block-scoped and cannot outlive their source",
                     name.lexeme()
                 ),
+                help: Some("store an owned value instead: `var T name = copy(source)`".into()),
                 span: name.span,
             });
         }
@@ -1225,6 +1284,7 @@ impl TypeChecker {
         if view.is_some() && initializer.is_none() {
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: format!(
                     "view variable `{}` must be initialized with a value to borrow",
                     name.lexeme()
@@ -1250,6 +1310,7 @@ impl TypeChecker {
                 if !inner.viewable() && !matches!(inner, Ty::Any) {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "cannot take a view of type `{inner}`; views require a heap type (string, array, object, class, shared value)"
                         ),
@@ -1271,6 +1332,7 @@ impl TypeChecker {
                     if !inner.is_assignable_from(borrowed) {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "type mismatch: expected a view of `{inner}`, got `{init_ty}`"
                             ),
@@ -1288,6 +1350,7 @@ impl TypeChecker {
                 if !self.assignable(&declared_ty, init_ty) {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "type mismatch: expected `{declared_ty}`, got `{init_ty}`"
                         ),
@@ -1305,6 +1368,7 @@ impl TypeChecker {
                     if view.is_none() {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!("variable `{}` must be initialized", name.lexeme()),
                             span: name.span,
                         });
@@ -1317,6 +1381,7 @@ impl TypeChecker {
                 if view.is_none() {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!("variable `{}` must be initialized", name.lexeme()),
                         span: name.span,
                     });
@@ -1328,6 +1393,7 @@ impl TypeChecker {
         if let Err(msg) = self.symbols.define(name.lexeme(), final_ty) {
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: msg,
                 span: name.span,
             });
@@ -1341,6 +1407,7 @@ impl TypeChecker {
         {
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: format!("condition must be `bool`, got `{ty}`"),
                 span: expr.span(),
             });
@@ -1375,6 +1442,7 @@ impl TypeChecker {
                     if self.is_captured(name.lexeme(), depth) {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "lambda cannot capture outer variable `{}`; pass it as a parameter or use a global value",
                                 name.lexeme()
@@ -1393,6 +1461,7 @@ impl TypeChecker {
                     }
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!("undefined variable `{}`", name.lexeme()),
                         span: name.span,
                     });
@@ -1412,6 +1481,7 @@ impl TypeChecker {
                 if self.consts.contains(name.lexeme()) {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "cannot assign to `static const` variable `{}`; constants are immutable",
                             name.lexeme()
@@ -1433,9 +1503,10 @@ impl TypeChecker {
                     self.errors.push(TypeError {
                         code: None,
                         message: format!(
-                            "cannot assign a view to variable `{}`; views are block-scoped and cannot outlive their source (use `copy(...)` for an owned copy)",
+                            "cannot assign a view to variable `{}`; views are block-scoped and cannot outlive their source",
                             name.lexeme()
                         ),
+                        help: Some("assign an owned value instead: `name = copy(source)`".into()),
                         span: name.span,
                     });
                 }
@@ -1443,6 +1514,7 @@ impl TypeChecker {
                     if self.is_captured(name.lexeme(), depth) {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "lambda cannot capture outer variable `{}`; pass it as a parameter or use a global value",
                                 name.lexeme()
@@ -1455,6 +1527,7 @@ impl TypeChecker {
                     {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "cannot assign `{vt}` to variable of type `{declared}`"
                             ),
@@ -1468,6 +1541,7 @@ impl TypeChecker {
                     }
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!("undefined variable `{}`", name.lexeme()),
                         span: name.span,
                     });
@@ -1510,6 +1584,7 @@ impl TypeChecker {
                             if !err_compatible {
                                 self.errors.push(TypeError {
                                     code: None,
+                                    help: None,
                                     message: format!(
                                         "cannot propagate error of type `{err}` from a function returning `{}`",
                                         Ty::Result {
@@ -1528,6 +1603,7 @@ impl TypeChecker {
                         Some(other) => {
                             self.errors.push(TypeError {
                                 code: None,
+                                help: None,
                                 message: format!(
                                     "`?` can only be used in a function returning a `result`, got `{other}`"
                                 ),
@@ -1538,6 +1614,7 @@ impl TypeChecker {
                         None => {
                             self.errors.push(TypeError {
                                 code: None,
+                                help: None,
                                 message: "`?` can only be used inside a function".into(),
                                 span: *question_span,
                             });
@@ -1548,6 +1625,7 @@ impl TypeChecker {
                     Some(other) => {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!("`?` requires a `result` value, got `{other}`"),
                             span: *question_span,
                         });
@@ -1618,6 +1696,7 @@ impl TypeChecker {
                             // borrow stored there can dangle.
                             self.errors.push(TypeError {
                                 code: None,
+                                help: None,
                                 message:
                                     "cannot store a view in an array; arrays own their elements"
                                         .into(),
@@ -1630,6 +1709,7 @@ impl TypeChecker {
                         {
                             self.errors.push(TypeError {
                                 code: None,
+                                help: None,
                                 message: format!(
                                     "array element type mismatch: expected `{expected}`, got `{actual}`"
                                 ),
@@ -1652,6 +1732,7 @@ impl TypeChecker {
                         // view may not be stored there.
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "cannot store a view in object property `{}`; objects own their properties",
                                 property.key
@@ -1685,8 +1766,9 @@ impl TypeChecker {
                     self.errors.push(TypeError {
                         code: None,
                         message:
-                            "cannot store a view in an array element; arrays own their elements (use `copy(...)` for an owned copy)"
+                            "cannot store a view in an array element; arrays own their elements"
                                 .into(),
+                        help: Some("store an owned value instead: `arr[i] = copy(source)`".into()),
                         span: value.span(),
                     });
                 }
@@ -1699,6 +1781,7 @@ impl TypeChecker {
                     // element lie.
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!("array element type is `{inner}`, got `{vt}`"),
                         span: value.span(),
                     });
@@ -1717,8 +1800,11 @@ impl TypeChecker {
                     self.errors.push(TypeError {
                         code: None,
                         message: format!(
-                            "cannot store a view in field `{}`; the instance owns its fields (use `copy(...)` for an owned copy)",
+                            "cannot store a view in field `{}`; the instance owns its fields",
                             property.lexeme()
+                        ),
+                        help: Some(
+                            "store an owned value instead: `obj.field = copy(source)`".into(),
                         ),
                         span: property.span,
                     });
@@ -1736,6 +1822,7 @@ impl TypeChecker {
                     // field lie.
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "field `{}` has type `{declared}`, got `{vt}`",
                             property.lexeme()
@@ -1766,6 +1853,7 @@ impl TypeChecker {
                         // cannot be borrowed.
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "cannot view a value of type `{inner}`; views require a heap type (string, array, object, class)"
                             ),
@@ -1815,6 +1903,7 @@ impl TypeChecker {
                 if self.unsafe_depth == 0 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: "raw pointer dereference requires an `unsafe` block".into(),
                         span: *star,
                     });
@@ -1826,6 +1915,7 @@ impl TypeChecker {
                     other => {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!("cannot dereference `{other}` as a raw pointer"),
                             span: *star,
                         });
@@ -1841,6 +1931,7 @@ impl TypeChecker {
                 if self.unsafe_depth == 0 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: "raw pointer dereference requires an `unsafe` block".into(),
                         span: *star,
                     });
@@ -1854,6 +1945,7 @@ impl TypeChecker {
                     Ty::RawPointer(_, false) => {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: "cannot write through `*const` pointer".into(),
                             span: *star,
                         });
@@ -1862,6 +1954,7 @@ impl TypeChecker {
                     other => {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!("cannot write through `{other}`"),
                             span: *star,
                         });
@@ -1893,28 +1986,42 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "`{}` is not a class; struct literals require a class name",
                             class_name_str
                         ),
                         span: class_name.span,
                     });
-                } else if let Some(_info) = self.classes.get(&class_name_str) {
+                } else if self.classes.contains_key(&class_name_str) {
+                    // Collected up front so no borrow of the class table
+                    // spans the rest of the arm.
+                    let member_names = self.class_member_names(&class_name_str);
                     let mut seen = HashSet::new();
                     for field in fields {
                         if !self.class_declares_field(&class_name_str, &field.key) {
+                            // Offer the closest declared field or method when
+                            // the key looks like a typo.
+                            let suggestion = crate::names::closest_match(
+                                &field.key,
+                                member_names.iter().map(String::as_str),
+                            );
+                            let help =
+                                suggestion.map(|candidate| format!("did you mean `{candidate}`?"));
                             self.errors.push(TypeError {
                                 code: None,
                                 message: format!(
                                     "struct literal for `{class_name_str}` has no field `{}`",
                                     field.key
                                 ),
+                                help,
                                 span: field.key_span,
                             });
                         }
                         if !seen.insert(field.key.clone()) {
                             self.errors.push(TypeError {
                                 code: None,
+                                help: None,
                                 message: format!(
                                     "struct literal for `{class_name_str}` sets field `{}` twice",
                                     field.key
@@ -1931,6 +2038,7 @@ impl TypeChecker {
                             Ty::Class(name) => {
                                 self.errors.push(TypeError {
                                     code: None,
+                                    help: None,
                                     message: format!(
                                         "struct update `..` requires an instance of `{class_name_str}`, \
                                          but `{name}` was given",
@@ -1941,6 +2049,7 @@ impl TypeChecker {
                             _ => {
                                 self.errors.push(TypeError {
                                     code: None,
+                                    help: None,
                                     message: format!(
                                         "struct update `..` requires a class instance, not `{}`",
                                         update_ty
@@ -1965,6 +2074,7 @@ impl TypeChecker {
         if self.async_depth == 0 {
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: "await is only allowed inside an async function".into(),
                 span,
             });
@@ -1980,6 +2090,7 @@ impl TypeChecker {
                 if arguments.len() != 1 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "async.sleep expects 1 argument(s), got {}",
                             arguments.len()
@@ -1991,6 +2102,7 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!("async.sleep expects an `int` duration, got `{ty}`"),
                         span: arguments[0].span(),
                     });
@@ -2002,6 +2114,7 @@ impl TypeChecker {
                 if !self.async_fns.contains(callee_name) {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: "await requires a call to an async function".to_string(),
                         span,
                     });
@@ -2018,6 +2131,7 @@ impl TypeChecker {
                 let _ = self.check_expression(other);
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: "await requires a call to an async function".into(),
                     span,
                 });
@@ -2034,6 +2148,7 @@ impl TypeChecker {
         if params.len() != arguments.len() {
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: format!(
                     "`{callee_name}` expects {} argument(s), got {}",
                     params.len(),
@@ -2050,6 +2165,7 @@ impl TypeChecker {
             {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!(
                         "argument type mismatch: expected `{param_ty}`, got `{arg_ty}`"
                     ),
@@ -2173,6 +2289,7 @@ impl TypeChecker {
             (op_tok, Some(l), Some(r)) if is_arithmetic(op_tok) || is_logical(op_tok) => {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!(
                         "binary operator `{}` cannot apply to `{l}` and `{r}`",
                         op_lexeme(op_tok)
@@ -2195,6 +2312,7 @@ impl TypeChecker {
             (TokenKind::Minus, Some(ty)) => {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!("cannot negate `{ty}`"),
                     span: op.span,
                 });
@@ -2213,6 +2331,7 @@ impl TypeChecker {
             (TokenKind::PlusPlus | TokenKind::MinusMinus, Some(ty)) => {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!("cannot apply `{}` to `{ty}`", op.lexeme()),
                     span: op.span,
                 });
@@ -2236,6 +2355,7 @@ impl TypeChecker {
         let arity_error = |expected: usize| -> TypeError {
             TypeError {
                 code: None,
+                help: None,
                 message: format!(
                     "{} expects {expected} argument(s), got {}",
                     property.lexeme(),
@@ -2256,6 +2376,7 @@ impl TypeChecker {
         let mismatch = |expected: &str, actual: &Ty| -> TypeError {
             TypeError {
                 code: None,
+                help: None,
                 message: format!("argument type mismatch: expected `{expected}`, got `{actual}`"),
                 span: arguments.first().map(|a| a.span()).unwrap_or(property.span),
             }
@@ -2306,6 +2427,7 @@ impl TypeChecker {
                     _ => {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "{} expects a one-parameter function, got `{}`",
                                 property.lexeme(),
@@ -2346,6 +2468,7 @@ impl TypeChecker {
                     _ => {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "{} expects a one-parameter function returning a `result`, got `{}`",
                                 property.lexeme(),
@@ -2382,6 +2505,7 @@ impl TypeChecker {
                     _ => {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "ok_or_else expects a zero-parameter function, got `{}`",
                                 argument_ty.map(|t| t.label()).unwrap_or_else(|| "?".into())
@@ -2404,6 +2528,7 @@ impl TypeChecker {
         {
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: format!("async function `{}` must be awaited", name.lexeme()),
                 span: callee.span(),
             });
@@ -2432,9 +2557,22 @@ impl TypeChecker {
                 "fill" => (2, Ty::Bool),
                 "copy_from" | "equal" => (2, Ty::Bool),
                 other => {
+                    const SLICES_FUNCTIONS: [&str; 9] = [
+                        "of",
+                        "sub",
+                        "length",
+                        "get",
+                        "set",
+                        "to_array",
+                        "fill",
+                        "copy_from",
+                        "equal",
+                    ];
+                    let suggestion = crate::names::closest_match(other, SLICES_FUNCTIONS);
                     self.errors.push(TypeError {
                         code: None,
                         message: format!("unknown function `slices.{other}`"),
+                        help: suggestion.map(|candidate| format!("did you mean `{candidate}`?")),
                         span: callee.span(),
                     });
                     return Some(Ty::Any);
@@ -2443,6 +2581,7 @@ impl TypeChecker {
             if arity != arguments.len() {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!(
                         "slices.{} expects {arity} argument(s), got {}",
                         property.lexeme(),
@@ -2462,6 +2601,7 @@ impl TypeChecker {
                 if self.unsafe_depth == 0 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: "`memory.raw_address` requires an `unsafe` block".into(),
                         span: callee.span(),
                     });
@@ -2469,6 +2609,7 @@ impl TypeChecker {
                 if arguments.len() != 1 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "memory.raw_address expects 1 argument(s), got {}",
                             arguments.len()
@@ -2483,6 +2624,7 @@ impl TypeChecker {
                     other => {
                         self.errors.push(TypeError {
                             code: None,
+                            help: None,
                             message: format!(
                                 "cannot take the raw address of `{other}`; expected a reference"
                             ),
@@ -2504,6 +2646,7 @@ impl TypeChecker {
             if params.len() != arguments.len() {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!(
                         "memory.{} expects {} argument(s), got {}",
                         property.lexeme(),
@@ -2519,6 +2662,7 @@ impl TypeChecker {
                 {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "argument type mismatch: expected `{parameter}`, got `{argument_ty}`"
                         ),
@@ -2535,6 +2679,7 @@ impl TypeChecker {
             if arguments.len() != 1 {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!("alloc expects 1 argument(s), got {}", arguments.len()),
                     span: callee.span(),
                 });
@@ -2549,6 +2694,7 @@ impl TypeChecker {
             if arguments.len() != 1 {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!(
                         "{} expects 1 argument(s), got {}",
                         name.lexeme(),
@@ -2599,6 +2745,7 @@ impl TypeChecker {
                 if params.len() != arguments.len() && !has_spread {
                     self.errors.push(TypeError {
                         code: None,
+                        help: None,
                         message: format!(
                             "function expects {} argument(s), got {}",
                             params.len(),
@@ -2620,13 +2767,17 @@ impl TypeChecker {
                             self.errors.push(TypeError {
                                 code: None,
                                 message: format!(
-                                    "cannot pass a view where an owned `{parameter}` is expected; use `copy(...)` for an owned copy"
+                                    "cannot pass a view where an owned `{parameter}` is expected"
+                                ),
+                                help: Some(
+                                    "pass `copy(argument)` to hand the call its own value".into(),
                                 ),
                                 span: argument.span(),
                             });
                         } else if !self.assignable(parameter, &argument_ty) {
                             self.errors.push(TypeError {
                                 code: None,
+                                help: None,
                                 message: format!(
                                     "argument type mismatch: expected `{parameter}`, got `{argument_ty}`"
                                 ),
@@ -2651,6 +2802,7 @@ impl TypeChecker {
             Some(other) => {
                 self.errors.push(TypeError {
                     code: None,
+                    help: None,
                     message: format!("`{other}` is not callable"),
                     span: callee.span(),
                 });
@@ -2681,6 +2833,7 @@ impl TypeChecker {
         {
             self.errors.push(TypeError {
                 code: None,
+                help: None,
                 message: format!("index must be `int`, got `{index_ty}`"),
                 span: index.span(),
             });
@@ -3038,6 +3191,7 @@ mod tests {
             errs.into_iter()
                 .map(|e| TypeError {
                     code: None,
+                    help: None,
                     message: e.message,
                     span: e.span,
                 })

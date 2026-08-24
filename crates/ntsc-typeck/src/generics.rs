@@ -260,6 +260,7 @@ pub fn prepare_program(program: &Program) -> Result<Program, Vec<TypeError>> {
                         message: format!("unknown trait `{}` in generic bound", bound.lexeme()),
                         span: bound.span,
                         code: None,
+                        help: None,
                     });
                 }
             }
@@ -273,6 +274,7 @@ pub fn prepare_program(program: &Program) -> Result<Program, Vec<TypeError>> {
                         message: format!("unknown trait `{}` in generic bound", bound.lexeme()),
                         span: bound.span,
                         code: None,
+                        help: None,
                     });
                 }
             }
@@ -286,6 +288,7 @@ pub fn prepare_program(program: &Program) -> Result<Program, Vec<TypeError>> {
                         message: format!("unknown trait `{}` in generic bound", bound.lexeme()),
                         span: bound.span,
                         code: None,
+                        help: None,
                     });
                 }
             }
@@ -299,6 +302,7 @@ pub fn prepare_program(program: &Program) -> Result<Program, Vec<TypeError>> {
                         message: format!("unknown trait `{}` in generic bound", bound.lexeme()),
                         span: bound.span,
                         code: None,
+                        help: None,
                     });
                 }
             }
@@ -644,6 +648,7 @@ impl Context {
             message,
             span,
             code: None,
+            help: None,
         });
     }
 

@@ -19,11 +19,13 @@ use ntsc_ast::span::Span;
 use ntsc_ast::stmt::{Program, Stmt};
 
 /// The single lint implemented so far.
-const LINT_UNUSED_VARIABLE: &str = "unused_variable";
+pub(crate) const LINT_UNUSED_VARIABLE: &str = "unused_variable";
 
-/// A lint warning with source location.
+/// A lint warning with source location and the suppressible lint name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {
+    /// The `quiet [name]` list entry that silences this warning.
+    pub lint: &'static str,
     pub message: String,
     pub span: Span,
 }
@@ -114,6 +116,7 @@ impl Linter {
             for (name, decl) in scope {
                 if !decl.used && !decl.suppressed {
                     self.warnings.push(Warning {
+                        lint: LINT_UNUSED_VARIABLE,
                         message: format!("unused variable `{name}`"),
                         span: decl.span,
                     });

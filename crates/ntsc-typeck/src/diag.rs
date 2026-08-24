@@ -11,8 +11,12 @@ impl From<&Warning> for Diagnostic {
     fn from(warning: &Warning) -> Self {
         Diagnostic::warning(&warning.message)
             .with_code(codes::WARNING)
+            .with_lint(warning.lint)
             .with_label(Label::primary(warning.span, warning.message.clone()))
-            .with_help("prefix the declaration with `quiet` to silence this warning")
+            .with_help(format!(
+                "silence locally with `quiet [{lint}] {{ ... }}`",
+                lint = warning.lint
+            ))
     }
 }
 
@@ -24,9 +28,13 @@ impl From<Warning> for Diagnostic {
 
 impl From<&TypeError> for Diagnostic {
     fn from(error: &TypeError) -> Self {
-        Diagnostic::error(&error.message)
+        let mut diag = Diagnostic::error(&error.message)
             .with_code(error.code.unwrap_or(codes::TYPE))
-            .with_label(Label::primary(error.span, error.message.clone()))
+            .with_label(Label::primary(error.span, error.message.clone()));
+        if let Some(help) = &error.help {
+            diag = diag.with_help(help.clone());
+        }
+        diag
     }
 }
 
@@ -65,11 +73,13 @@ mod tests {
             code: None,
             message: "type mismatch".to_string(),
             span: Span::new(1, 5, 1, 2),
+            help: Some("use `copy(...)` to pass an owned value".to_string()),
         };
         let diag = Diagnostic::from(error);
         assert_eq!(diag.code.as_deref(), Some(codes::TYPE));
         assert_eq!(diag.labels[0].span.start, 1);
         assert!(diag.labels[0].is_primary);
+        assert!(diag.help.as_deref().unwrap().contains("copy(...)"));
     }
 
     #[test]
@@ -99,6 +109,7 @@ mod tests {
     #[test]
     fn warning_converts_to_diagnostic() {
         let warning = crate::warnings::Warning {
+            lint: crate::warnings::LINT_UNUSED_VARIABLE,
             message: "unused variable `x`".to_string(),
             span: Span::new(1, 5, 1, 2),
         };
@@ -106,5 +117,9 @@ mod tests {
         assert_eq!(diag.severity, ntsc_diag::Severity::Warning);
         assert_eq!(diag.code.as_deref(), Some(codes::WARNING));
         assert_eq!(diag.labels[0].span.start, 1);
+        assert_eq!(
+            diag.help.as_deref(),
+            Some("silence locally with `quiet [unused_variable] { ... }`")
+        );
     }
 }

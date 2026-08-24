@@ -40,6 +40,7 @@ impl ExhaustivenessChecker {
                         code: None,
                         message: "match expression is not exhaustive (missing default branch or wildcard pattern)".to_string(),
                         span: expression.span(),
+                    help: None,
                     });
                 }
 

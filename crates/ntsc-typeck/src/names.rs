@@ -452,8 +452,8 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 /// Return the closest candidate to `target`, if it is close enough to be a
-/// typo.
-fn closest_match<'a>(
+/// typo. Shared by every diagnostic that can offer a "did you mean" hint.
+pub(crate) fn closest_match<'a>(
     target: &str,
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {

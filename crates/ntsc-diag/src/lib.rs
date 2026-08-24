@@ -96,6 +96,10 @@ pub struct Diagnostic {
     /// Source file path, shown in the `-->` line (absent when there is no
     /// source location).
     pub file_path: Option<String>,
+
+    /// For warnings: the `quiet [name]` list entry that suppresses this
+    /// warning locally.
+    pub lint: Option<String>,
 }
 
 impl Diagnostic {
@@ -108,6 +112,7 @@ impl Diagnostic {
             notes: Vec::new(),
             help: None,
             file_path: None,
+            lint: None,
         }
     }
 
@@ -120,6 +125,7 @@ impl Diagnostic {
             notes: Vec::new(),
             help: None,
             file_path: None,
+            lint: None,
         }
     }
 
@@ -156,6 +162,13 @@ impl Diagnostic {
 
     pub fn with_file(mut self, path: impl Into<String>) -> Self {
         self.file_path = Some(path.into());
+        self
+    }
+
+    /// Attach the suppressible lint name to a warning (rendered by the JSON
+    /// emitter; the text renderer points at `quiet [name]` instead).
+    pub fn with_lint(mut self, lint: impl Into<String>) -> Self {
+        self.lint = Some(lint.into());
         self
     }
 

@@ -53,6 +53,9 @@ fn diagnostic_to_json(diag: &Diagnostic) -> String {
     if let Some(help) = &diag.help {
         fields.push(format!("\"help\":{}", quote(help)));
     }
+    if let Some(lint) = &diag.lint {
+        fields.push(format!("\"lint\":{}", quote(lint)));
+    }
 
     format!("{{{}}}", fields.join(","))
 }
@@ -143,5 +146,16 @@ mod tests {
     fn no_span_yields_minimal_object() {
         let doc = diagnostics_to_json(&[Diagnostic::error("plain")]);
         assert!(!doc.contains("\"line\":"));
+    }
+
+    #[test]
+    fn warning_includes_lint_name() {
+        let diag = Diagnostic::warning("unused variable `x`")
+            .with_lint("unused_variable")
+            .with_help("silence locally with `quiet [unused_variable] { ... }`");
+        let doc = diagnostics_to_json(&[diag]);
+        assert!(doc.contains("\"lint\":\"unused_variable\""));
+        assert!(doc.contains("quiet [unused_variable]"));
+        assert!(doc.contains("\"error_count\":0"));
     }
 }

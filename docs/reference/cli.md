@@ -86,7 +86,19 @@ controlled by the environment:
 
 The error limit defaults to 20 and can be changed with `NTSC_MAX_ERRORS`
 (`0` means unlimited). With `--json`, diagnostics are emitted as structured
-JSON on stdout instead.
+JSON on stdout instead; each object carries `severity`, `code`, `message`,
+span fields, optional `help`, and — for warnings — the `lint` name that
+silences it locally.
+
+Errors aim to point at the fix, not just the problem:
+
+- The offending source line is shown with a caret under the exact span.
+- Typos get `did you mean ...?` suggestions automatically when a close
+  candidate exists (variable names, struct literal fields, module functions).
+- Common ownership mistakes carry fix-it hints showing where `copy(...)`
+  or a `view var` declaration belongs.
+- Warnings name their lint (e.g. `unused_variable`) and the help line shows
+  the exact `quiet [lint] { ... }` form that suppresses it locally.
 
 ## Environment variables
 

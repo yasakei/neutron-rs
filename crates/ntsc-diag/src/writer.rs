@@ -74,12 +74,19 @@ impl Writer {
         Self { config }
     }
 
+    /// Render one diagnostic into a string (no trailing newline), resolving
+    /// its source snippet from `sources` by `diag.file_path`. Snapshot tests
+    /// assert on this exact output.
+    pub fn render(&self, diag: &Diagnostic, sources: Option<&SourceMap>) -> String {
+        let mut buf = String::new();
+        emit_diag(&mut buf, diag, sources, &self.config);
+        buf
+    }
+
     /// Pretty-print one diagnostic, resolving its source snippet from
     /// `sources` by `diag.file_path`.
     pub fn emit(&self, diag: &Diagnostic, sources: Option<&SourceMap>) {
-        let mut buf = String::new();
-        emit_diag(&mut buf, diag, sources, &self.config);
-        eprintln!("{buf}");
+        eprintln!("{}", self.render(diag, sources));
     }
 
     /// Print all diagnostics, stopping once `max_errors` error diagnostics
@@ -398,5 +405,67 @@ mod tests {
 
         writer.emit_all(&diags, None);
         assert_eq!(diags.len(), 5);
+    }
+
+    #[test]
+    fn render_produces_exact_plain_output_with_snippet_and_help() {
+        let source = SourceBuffer::new("var int x = \"hello\"\n", "test.nt");
+        let diag = Diagnostic::error("type mismatch: expected `int`, got `string`")
+            .with_code("E0308")
+            .with_file("test.nt")
+            .with_label(Label::primary(
+                Span::new(8, 15, 1, 9),
+                "expected `int`, got `string`",
+            ))
+            .with_help("store an owned value instead: `var int x = copy(source)`");
+        let mut map = SourceMap::new();
+        map.add(source);
+
+        let rendered = plain_writer().render(&diag, Some(&map));
+        assert_eq!(
+            rendered,
+            "error[E0308]: type mismatch: expected `int`, got `string`\n\
+             \x20 --> test.nt:1:9\n\
+             \x20 |\n\
+             \x201 │ var int x = \"hello\"\n\
+             \x20              ^^^^^^^ expected `int`, got `string`\n\
+             \x20 |\n\
+             \x20  = help: store an owned value instead: `var int x = copy(source)`"
+        );
+    }
+
+    #[test]
+    fn render_did_you_mean_suggestion() {
+        let diag =
+            Diagnostic::error("undefined variable `lenght`").with_help("did you mean `length`?");
+
+        assert_eq!(
+            plain_writer().render(&diag, None),
+            "error: undefined variable `lenght`\n   = help: did you mean `length`?"
+        );
+    }
+
+    #[test]
+    fn render_warning_points_at_quiet_suppression() {
+        let source = SourceBuffer::new("var int x = 1\n", "test.nt");
+        let diag = Diagnostic::warning("unused variable `x`")
+            .with_code("NTSC-W0001")
+            .with_file("test.nt")
+            .with_label(Label::primary(Span::new(8, 9, 1, 9), "unused variable `x`"))
+            .with_help("silence locally with `quiet [unused_variable] { ... }`");
+        let mut map = SourceMap::new();
+        map.add(source);
+
+        let rendered = plain_writer().render(&diag, Some(&map));
+        assert_eq!(
+            rendered,
+            "warning[NTSC-W0001]: unused variable `x`\n\
+             \x20 --> test.nt:1:9\n\
+             \x20 |\n\
+             \x201 │ var int x = 1\n\
+             \x20              ^ unused variable `x`\n\
+             \x20 |\n\
+             \x20  = help: silence locally with `quiet [unused_variable] { ... }`"
+        );
     }
 }
