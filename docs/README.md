@@ -25,7 +25,7 @@ examples. Read it in order if you are new to NTSC.
 | [Ownership](guide/ownership.md) | The Own - Move - View model: moves, views, `view mut`, `copy`, and escape analysis. |
 | [Shared values](guide/shared-values.md) | The `shared T` escape hatch for explicit aliasing. |
 | [Arrays and iterators](guide/arrays-and-iterators.md) | Arrays, indexing, `for-in`, the iterator protocol, and the `arrays` module. |
-| [Error handling](guide/error-handling.md) | Exceptions, `try`/`catch`/`finally`, `retry`, and the standard library error convention. |
+| [Error handling](guide/error-handling.md) | Exceptions, `try`/`catch`/`finally`, `retry`, results with `?` propagation, and the standard library error convention. |
 | [Modules and imports](guide/modules.md) | Multi-file projects and the file-import system. |
 | [Concurrency](guide/concurrency.md) | Threads, channels, and `async`/`await`. |
 | [Testing](guide/testing.md) | `test` blocks and the `ntsc test` runner. |

@@ -29,6 +29,13 @@ pub enum Ty {
     /// Explicitly nullable value.
     Option(Box<Ty>),
 
+    /// A value that is either an `Ok` payload or an `Err` payload
+    /// (`result[Ok, Err]`).
+    Result {
+        ok: Box<Ty>,
+        err: Box<Ty>,
+    },
+
     /// Object / record type.
     Object,
 
@@ -83,6 +90,7 @@ impl Ty {
             Self::Nil => "nil".into(),
             Self::Array(inner) => format!("array<{inner}>"),
             Self::Option(inner) => format!("option<{inner}>"),
+            Self::Result { ok, err } => format!("result<{ok}, {err}>"),
             Self::Object => "object".into(),
             Self::Function {
                 params,
@@ -172,6 +180,16 @@ impl Ty {
             // A plain value auto-wraps into an `option[T]` slot:
             // assigning `5` to `var option[int] o` boxes the value.
             (Self::Option(a), b) if a.is_assignable_from(b) => true,
+            (
+                Self::Result {
+                    ok: a_ok,
+                    err: a_err,
+                },
+                Self::Result {
+                    ok: b_ok,
+                    err: b_err,
+                },
+            ) => a_ok.is_assignable_from(b_ok) && a_err.is_assignable_from(b_err),
             (Self::Object, Self::Object) => true,
             (
                 Self::Function {

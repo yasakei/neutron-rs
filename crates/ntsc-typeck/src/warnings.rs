@@ -409,6 +409,7 @@ impl Linter {
                 self.check_expr(value);
             }
             Expr::Copy { expression, .. } => self.check_expr(expression),
+            Expr::Propagate { value, .. } => self.check_expr(value),
             Expr::StructLiteral {
                 class_name,
                 fields,

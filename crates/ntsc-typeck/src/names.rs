@@ -66,6 +66,10 @@ impl Resolver {
         global.insert("say".into());
         global.insert("alloc".into());
 
+        // Result constructors are builtins, like `say` and `alloc`.
+        global.insert("Ok".into());
+        global.insert("Err".into());
+
         // The wildcard pattern `_` is always in scope in match cases.
         global.insert("_".into());
 
@@ -354,6 +358,7 @@ impl Resolver {
                 self.resolve_expression(value);
             }
             Expr::Copy { expression, .. } => self.resolve_expression(expression),
+            Expr::Propagate { value, .. } => self.resolve_expression(value),
             Expr::IndexSet {
                 object,
                 index,
@@ -405,11 +410,17 @@ impl Resolver {
         if let Some(scope) = self.scopes.last_mut()
             && !scope.insert(name.to_owned())
         {
-            self.errors.push(ResolveError {
-                message: format!("`{name}` is already defined in this scope"),
-                span,
-                suggestion: None,
-            });
+            // The result constructors start as globals; a user definition of
+            // the same name (e.g. an `Ok` enum variant) shadows the builtin
+            // instead of conflicting with it.
+            let shadows_builtin = matches!(name, "Ok" | "Err") && self.scopes.len() == 1;
+            if !shadows_builtin {
+                self.errors.push(ResolveError {
+                    message: format!("`{name}` is already defined in this scope"),
+                    span,
+                    suggestion: None,
+                });
+            }
         }
     }
 

@@ -24,8 +24,8 @@ fun fibonacci(int number) -> int {
 }
 
 fun main() -> int {
-    var int result = fibonacci(8)
-    return result
+    var int total = fibonacci(8)
+    return total
 }
 "#;
     assert!(check(source).is_ok());

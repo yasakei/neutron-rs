@@ -218,6 +218,7 @@ impl<'src> Lexer<'src> {
             RawToken::TypeArray => Token::new(TokenKind::TypeArray, span),
             RawToken::TypeObject => Token::new(TokenKind::TypeObject, span),
             RawToken::TypeOption => Token::new(TokenKind::TypeOption, span),
+            RawToken::TypeResult => Token::new(TokenKind::TypeResult, span),
             RawToken::TypeAny => Token::new(TokenKind::TypeAny, span),
             RawToken::TypePointer => Token::new(TokenKind::TypePointer, span),
             RawToken::TypeSlice => Token::new(TokenKind::TypeSlice, span),

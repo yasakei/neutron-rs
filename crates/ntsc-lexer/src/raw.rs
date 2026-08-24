@@ -233,6 +233,8 @@ pub(crate) enum RawToken {
     TypeObject,
     #[token("option")]
     TypeOption,
+    #[token("result")]
+    TypeResult,
     #[token("any")]
     TypeAny,
     #[token("pointer")]

@@ -1592,6 +1592,11 @@ impl OwnershipChecker {
                 self.check_function(params, body);
                 Some(ValueKind::Function)
             }
+            Expr::Propagate { value, .. } => {
+                let _ = self.check_expr(value);
+                // A result is a heap cell, like an option box.
+                Some(ValueKind::Heap)
+            }
             Expr::StructLiteral {
                 class_name: _,
                 fields,
@@ -1944,6 +1949,8 @@ fn kind_of_annotation(annotation: &TypeAnnotation) -> ValueKind {
         TypeAnnotation::Object => ValueKind::Heap,
         TypeAnnotation::Named(_) => ValueKind::Heap,
         TypeAnnotation::Option(inner) => kind_of_annotation(inner),
+        // A result is always a heap cell, whatever it carries.
+        TypeAnnotation::Result { .. } => ValueKind::Heap,
         TypeAnnotation::View(..) => ValueKind::View,
         TypeAnnotation::Shared(_) => ValueKind::Shared,
         TypeAnnotation::Any => ValueKind::Unknown,
@@ -2265,6 +2272,7 @@ fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
                 collect_expr_uses(update, uses);
             }
         }
+        Expr::Propagate { value, .. } => collect_expr_uses(value, uses),
     }
 }
 

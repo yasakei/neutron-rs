@@ -21,6 +21,10 @@ pub(crate) fn type_annotation_to_ty(ann: &Option<ntsc_ast::types::TypeAnnotation
         Some(TypeAnnotation::Option(inner)) => {
             Ty::Option(Box::new(type_annotation_to_ty(&Some(*inner.clone()))))
         }
+        Some(TypeAnnotation::Result { ok, err }) => Ty::Result {
+            ok: Box::new(type_annotation_to_ty(&Some(*ok.clone()))),
+            err: Box::new(type_annotation_to_ty(&Some(*err.clone()))),
+        },
         Some(TypeAnnotation::View(inner, mutable)) => Ty::View(
             Box::new(type_annotation_to_ty(&Some(*inner.clone()))),
             *mutable,

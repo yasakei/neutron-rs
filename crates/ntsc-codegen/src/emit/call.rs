@@ -331,6 +331,37 @@ pub(crate) fn emit_call<'ctx>(
             return emit_box_value(fn_ctx, value);
         }
 
+        // `Ok(v)` / `Err(e)` build a fresh result cell owning their payload;
+        // a bare-variable payload moves in and its slot is nulled. A user
+        // definition of the same name (e.g. an enum variant's constructor)
+        // shadows the builtin and keeps the ordinary call flow.
+        if matches!(name_str, "Ok" | "Err") && fn_ctx.module.get_function(name_str).is_none() {
+            if arguments.len() != 1 {
+                return Err(crate::CodegenError::LLVMError(format!(
+                    "{name_str} expects 1 argument"
+                )));
+            }
+            let want_ok = name_str == "Ok";
+            let payload_ty = arg_values[0].ntsc_type.clone();
+            let ok_ty = if want_ok { payload_ty.clone() } else { Ty::Any };
+            let err_ty = if want_ok { Ty::String } else { payload_ty };
+            let boxed = box_result_value(
+                fn_ctx,
+                &ok_ty,
+                &err_ty,
+                &arguments[0],
+                &arg_values[0],
+                want_ok,
+            )?;
+            if let Expr::Variable { name } = &arguments[0]
+                && ty_is_owned_handle(&arg_values[0].ntsc_type)
+            {
+                fn_ctx.null_var_slot(name.lexeme());
+            }
+            emit_drop_borrowed_fresh_args(fn_ctx, &arguments, &arg_values, &[])?;
+            return Ok(boxed);
+        }
+
         if name_str == "say" {
             let converted = if arguments.is_empty() {
                 return Err(crate::CodegenError::LLVMError(
@@ -547,6 +578,20 @@ pub(crate) fn emit_call<'ctx>(
         let obj_val = deref_shared(fn_ctx, obj_val)?;
 
         let arg_values = emit_call_arguments(fn_ctx, &arguments)?;
+
+        // Result/option combinators (`r.map(f)`, `opt.ok_or(e)`, ...) are
+        // builtins on those types; a class method with the same name wins
+        // for class receivers because typeck only routes here otherwise.
+        if let Some(result) = super::result_cell::emit_result_combinator(
+            fn_ctx,
+            object,
+            &obj_val,
+            prop_name,
+            &arguments,
+            &arg_values,
+        )? {
+            return Ok(result);
+        }
 
         let dispatch_label = match &obj_val.ntsc_type {
             Ty::View(inner, _) => inner.label(),

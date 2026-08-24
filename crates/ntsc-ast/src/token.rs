@@ -124,6 +124,7 @@ pub enum TokenKind {
     TypeObject,
 
     TypeOption,
+    TypeResult,
     TypeAny,
 
     TypePointer,
@@ -144,6 +145,7 @@ impl TokenKind {
                 | TokenKind::TypeArray
                 | TokenKind::TypeObject
                 | TokenKind::TypeOption
+                | TokenKind::TypeResult
                 | TokenKind::TypeAny
                 | TokenKind::TypePointer
                 | TokenKind::TypeSlice
@@ -209,6 +211,7 @@ impl TokenKind {
             TokenKind::TypeArray => Some("array"),
             TokenKind::TypeObject => Some("object"),
             TokenKind::TypeOption => Some("option"),
+            TokenKind::TypeResult => Some("result"),
             TokenKind::TypeAny => Some("any"),
             TokenKind::TypePointer => Some("pointer"),
             TokenKind::TypeSlice => Some("slice"),

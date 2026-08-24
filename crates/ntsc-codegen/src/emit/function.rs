@@ -44,6 +44,35 @@ pub(crate) fn emit_exception_return<'ctx>(
             Ty::Void => {
                 fn_ctx.builder.build_return(None)?;
             }
+
+            // A result-returning function reports the unwinding exception as
+            // its Err value: the pending message is taken over (stringified
+            // when the error type is not a string) and boxed into an Err
+            // cell, so the caller's own pending-exception check sees a
+            // normal return.
+            Ty::Result { ok, err } => {
+                let take_msg_fn = fn_ctx
+                    .module
+                    .get_function("ntsc_exception_take_message")
+                    .ok_or_else(|| {
+                        crate::CodegenError::LLVMError(
+                            "ntsc_exception_take_message not declared".into(),
+                        )
+                    })?;
+                let msg = fn_ctx
+                    .builder
+                    .build_call(take_msg_fn, &[], "exception_msg")?
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let msg_val = TypedValue::new(msg, (**err).clone());
+                let msg_val = if **err == Ty::String {
+                    msg_val
+                } else {
+                    convert_to_string(fn_ctx, &msg_val)?
+                };
+                let boxed = super::result_cell::rebox_payload(fn_ctx, ok, err, false, msg_val)?;
+                fn_ctx.builder.build_return(Some(&boxed.value))?;
+            }
             _ => {
                 let default_val = default_llvm_value(ret_ty, context);
                 fn_ctx.builder.build_return(Some(&default_val))?;

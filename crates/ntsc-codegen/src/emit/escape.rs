@@ -109,6 +109,7 @@ pub(crate) fn expr_mentions_var(expr: &Expr, var: &str) -> bool {
         Expr::ArrayLiteral { elements, .. } => elements.iter().any(|e| expr_mentions_var(e, var)),
         Expr::View { target, .. } => expr_mentions_var(target, var),
         Expr::Copy { expression, .. } => expr_mentions_var(expression, var),
+        Expr::Propagate { value, .. } => expr_mentions_var(value, var),
         Expr::Borrow { target, .. } | Expr::RawDeref { target, .. } => {
             expr_mentions_var(target, var)
         }
@@ -348,6 +349,7 @@ pub(crate) fn expr_uses_var_safely(expr: &Expr, var: &str, ctx: ExprCtx, kind: E
             EscapeKind::FieldDrop => view_borrows_place(target, var, kind),
         },
         Expr::Copy { expression, .. } => expr_uses_var_safely(expression, var, ExprCtx::Base, kind),
+        Expr::Propagate { value, .. } => expr_uses_var_safely(value, var, ExprCtx::Data, kind),
         Expr::Borrow { target, .. } | Expr::RawDeref { target, .. } => {
             expr_uses_var_safely(target, var, ExprCtx::Base, kind)
         }

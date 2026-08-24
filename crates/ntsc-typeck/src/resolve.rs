@@ -1036,6 +1036,10 @@ impl TypeChecker {
             TypeAnnotation::Array(Some(element)) | TypeAnnotation::Option(element) => {
                 self.validate_shared_annotation(Some(element), span);
             }
+            TypeAnnotation::Result { ok, err } => {
+                self.validate_shared_annotation(Some(ok), span);
+                self.validate_shared_annotation(Some(err), span);
+            }
             _ => {}
         }
     }
@@ -1079,6 +1083,19 @@ impl TypeChecker {
                 }
                 self.validate_no_view_storage_annotation(Some(inner), span);
             }
+            TypeAnnotation::Result { ok, err } => {
+                for inner in [ok, err] {
+                    let inner_ty = self.resolve_annotation(Some(inner));
+                    if matches!(inner_ty, Ty::View(..)) {
+                        self.errors.push(TypeError {
+                            code: None,
+                            message: "cannot store a view inside `result[.., ..]`; views cannot live inside results".to_string(),
+                            span,
+                        });
+                    }
+                    self.validate_no_view_storage_annotation(Some(inner), span);
+                }
+            }
             TypeAnnotation::Shared(inner) => {
                 let inner_ty = self.resolve_annotation(Some(inner));
                 if matches!(inner_ty, Ty::View(..)) {
@@ -1108,6 +1125,10 @@ impl TypeChecker {
             Some(TypeAnnotation::Array(Some(element))) | Some(TypeAnnotation::Option(element)) => {
                 self.reject_dynamic_annotation(Some(element), span);
             }
+            Some(TypeAnnotation::Result { ok, err }) => {
+                self.reject_dynamic_annotation(Some(ok), span);
+                self.reject_dynamic_annotation(Some(err), span);
+            }
             _ => {}
         }
     }
@@ -1125,6 +1146,10 @@ impl TypeChecker {
             }
             Some(TypeAnnotation::Array(Some(element))) | Some(TypeAnnotation::Option(element)) => {
                 self.require_known_annotation(Some(element), span);
+            }
+            Some(TypeAnnotation::Result { ok, err }) => {
+                self.require_known_annotation(Some(ok), span);
+                self.require_known_annotation(Some(err), span);
             }
             _ => {}
         }
@@ -1467,6 +1492,68 @@ impl TypeChecker {
                     }
                     (Some(ty), None) | (None, Some(ty)) => Some(ty),
                     _ => None,
+                }
+            }
+            Expr::Propagate {
+                value,
+                question_span,
+            } => {
+                let value_ty = self.check_expression(value);
+                match value_ty {
+                    Some(Ty::Result { ok, err }) => match self.current_return_type.clone() {
+                        Some(Ty::Result {
+                            ok: fn_ok,
+                            err: fn_err,
+                        }) => {
+                            let err_compatible =
+                                self.assignable(&fn_err, &err) || matches!(*fn_err, Ty::String);
+                            if !err_compatible {
+                                self.errors.push(TypeError {
+                                    code: None,
+                                    message: format!(
+                                        "cannot propagate error of type `{err}` from a function returning `{}`",
+                                        Ty::Result {
+                                            ok: fn_ok.clone(),
+                                            err: fn_err.clone(),
+                                        }
+                                    ),
+                                    span: *question_span,
+                                });
+                            }
+                            // The propagated expression yields the Ok
+                            // payload; only an early Err return carries the
+                            // function's result shape.
+                            Some(*fn_ok)
+                        }
+                        Some(other) => {
+                            self.errors.push(TypeError {
+                                code: None,
+                                message: format!(
+                                    "`?` can only be used in a function returning a `result`, got `{other}`"
+                                ),
+                                span: *question_span,
+                            });
+                            Some(*ok)
+                        }
+                        None => {
+                            self.errors.push(TypeError {
+                                code: None,
+                                message: "`?` can only be used inside a function".into(),
+                                span: *question_span,
+                            });
+                            Some(*ok)
+                        }
+                    },
+                    Some(Ty::Any) => Some(Ty::Any),
+                    Some(other) => {
+                        self.errors.push(TypeError {
+                            code: None,
+                            message: format!("`?` requires a `result` value, got `{other}`"),
+                            span: *question_span,
+                        });
+                        Some(Ty::Any)
+                    }
+                    None => None,
                 }
             }
             Expr::Lambda {
@@ -2135,6 +2222,180 @@ impl TypeChecker {
         }
     }
 
+    /// Type-check the builtin combinators dispatched as methods on
+    /// `result[.., ..]` and `option[T]` receivers: error handling helpers
+    /// (`unwrap_or`, `and_then`, ...) and the Option→Result bridge
+    /// (`ok_or`, `ok_or_else`). `object_ty` is the already-checked receiver
+    /// type; the caller guarantees it is a result or option.
+    fn check_builtin_combinator(
+        &mut self,
+        property: &Token,
+        arguments: &[Expr],
+        object_ty: Option<Ty>,
+    ) -> Option<Ty> {
+        let arity_error = |expected: usize| -> TypeError {
+            TypeError {
+                code: None,
+                message: format!(
+                    "{} expects {expected} argument(s), got {}",
+                    property.lexeme(),
+                    arguments.len()
+                ),
+                span: property.span,
+            }
+        };
+        let function_ty = |ty: &Option<Ty>| -> Option<(Vec<Ty>, Box<Ty>)> {
+            match ty {
+                Some(Ty::Function {
+                    params,
+                    return_type,
+                }) => Some((params.clone(), return_type.clone())),
+                _ => None,
+            }
+        };
+        let mismatch = |expected: &str, actual: &Ty| -> TypeError {
+            TypeError {
+                code: None,
+                message: format!("argument type mismatch: expected `{expected}`, got `{actual}`"),
+                span: arguments.first().map(|a| a.span()).unwrap_or(property.span),
+            }
+        };
+        match (&object_ty, property.lexeme()) {
+            (
+                Some(Ty::Result {
+                    ok: recv_ok,
+                    err: _recv_err,
+                }),
+                "unwrap_or",
+            ) => {
+                if arguments.len() != 1 {
+                    self.errors.push(arity_error(1));
+                }
+                if let Some(default_ty) = self.check_expression(arguments.first()?)
+                    && !self.assignable(recv_ok, &default_ty)
+                {
+                    let recv_ok = (**recv_ok).clone();
+                    self.errors
+                        .push(mismatch(&format!("{recv_ok}"), &default_ty));
+                }
+                Some((**recv_ok).clone())
+            }
+            (
+                Some(Ty::Result {
+                    ok: recv_ok,
+                    err: recv_err,
+                }),
+                "map",
+            ) => {
+                if arguments.len() != 1 {
+                    self.errors.push(arity_error(1));
+                }
+                let argument_ty = self.check_expression(arguments.first()?);
+                match function_ty(&argument_ty) {
+                    Some((params, return_type)) if params.len() == 1 => {
+                        if !self.assignable(&params[0], recv_ok) {
+                            let params0 = params[0].clone();
+                            self.errors
+                                .push(mismatch(&format!("{}", **recv_ok), &params0));
+                        }
+                        Some(Ty::Result {
+                            ok: return_type,
+                            err: recv_err.clone(),
+                        })
+                    }
+                    _ => {
+                        self.errors.push(TypeError {
+                            code: None,
+                            message: format!(
+                                "{} expects a one-parameter function, got `{}`",
+                                property.lexeme(),
+                                argument_ty.map(|t| t.label()).unwrap_or_else(|| "?".into())
+                            ),
+                            span: property.span,
+                        });
+                        Some(Ty::Any)
+                    }
+                }
+            }
+            (
+                Some(Ty::Result {
+                    ok: recv_ok,
+                    err: recv_err,
+                }),
+                "and_then" | "or_else",
+            ) => {
+                if arguments.len() != 1 {
+                    self.errors.push(arity_error(1));
+                }
+                let argument_ty = self.check_expression(arguments.first()?);
+                // `and_then` receives the Ok payload; `or_else` receives the
+                // Err payload. Both must return a result.
+                let parameter = if property.lexeme() == "and_then" {
+                    (**recv_ok).clone()
+                } else {
+                    (**recv_err).clone()
+                };
+                match function_ty(&argument_ty) {
+                    Some((params, return_type)) if params.len() == 1 => {
+                        if !self.assignable(&params[0], &parameter) {
+                            self.errors
+                                .push(mismatch(&format!("{parameter}"), &params[0]));
+                        }
+                        Some(return_type.as_ref().clone())
+                    }
+                    _ => {
+                        self.errors.push(TypeError {
+                            code: None,
+                            message: format!(
+                                "{} expects a one-parameter function returning a `result`, got `{}`",
+                                property.lexeme(),
+                                argument_ty.map(|t| t.label()).unwrap_or_else(|| "?".into())
+                            ),
+                            span: property.span,
+                        });
+                        Some(Ty::Any)
+                    }
+                }
+            }
+            (Some(Ty::Option(inner)), "ok_or") => {
+                if arguments.len() != 1 {
+                    self.errors.push(arity_error(1));
+                }
+                let err_ty = self
+                    .check_expression(arguments.first()?)
+                    .unwrap_or(Ty::String);
+                Some(Ty::Result {
+                    ok: inner.clone(),
+                    err: Box::new(err_ty),
+                })
+            }
+            (Some(Ty::Option(inner)), "ok_or_else") => {
+                if arguments.len() != 1 {
+                    self.errors.push(arity_error(1));
+                }
+                let argument_ty = self.check_expression(arguments.first()?);
+                match function_ty(&argument_ty) {
+                    Some((params, return_type)) if params.is_empty() => Some(Ty::Result {
+                        ok: inner.clone(),
+                        err: return_type,
+                    }),
+                    _ => {
+                        self.errors.push(TypeError {
+                            code: None,
+                            message: format!(
+                                "ok_or_else expects a zero-parameter function, got `{}`",
+                                argument_ty.map(|t| t.label()).unwrap_or_else(|| "?".into())
+                            ),
+                            span: property.span,
+                        });
+                        Some(Ty::Any)
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn check_call(&mut self, callee: &Expr, arguments: &[Expr]) -> Option<Ty> {
         // An async function call without `await` would start the future
         // but never poll it to completion, so it is rejected here.
@@ -2282,6 +2543,52 @@ impl TypeChecker {
             let value_ty = self.check_expression(&arguments[0]).unwrap_or(Ty::Any);
             return Some(Ty::Own(Box::new(value_ty)));
         }
+        if let Expr::Variable { name } = callee
+            && (name.lexeme() == "Ok" || name.lexeme() == "Err")
+        {
+            if arguments.len() != 1 {
+                self.errors.push(TypeError {
+                    code: None,
+                    message: format!(
+                        "{} expects 1 argument(s), got {}",
+                        name.lexeme(),
+                        arguments.len()
+                    ),
+                    span: callee.span(),
+                });
+                return Some(Ty::Any);
+            }
+            let value_ty = self.check_expression(&arguments[0]).unwrap_or(Ty::Any);
+            // The unspecified side defaults so standalone construction stays
+            // concrete; `any` keeps it assignable to any matching slot.
+            return Some(if name.lexeme() == "Ok" {
+                Ty::Result {
+                    ok: Box::new(value_ty),
+                    err: Box::new(Ty::Any),
+                }
+            } else {
+                Ty::Result {
+                    ok: Box::new(Ty::Any),
+                    err: Box::new(value_ty),
+                }
+            });
+        }
+
+        if let Expr::Member { object, property } = callee
+            && matches!(
+                property.lexeme(),
+                "unwrap_or" | "map" | "and_then" | "or_else" | "ok_or" | "ok_or_else"
+            )
+        {
+            // Only result/option receivers take the builtin dispatch;
+            // anything else keeps the ordinary member-call flow so class
+            // methods may reuse these names.
+            let object_ty = self.check_expression(object);
+            if matches!(object_ty, Some(Ty::Result { .. } | Ty::Option(_))) {
+                return self.check_builtin_combinator(property, arguments, object_ty);
+            }
+        }
+
         let callee_ty = self.check_expression(callee);
         match callee_ty {
             Some(Ty::Function {
@@ -2394,6 +2701,10 @@ impl TypeChecker {
             Some(TypeAnnotation::Option(inner)) => {
                 Ty::Option(Box::new(self.resolve_annotation(Some(inner))))
             }
+            Some(TypeAnnotation::Result { ok, err }) => Ty::Result {
+                ok: Box::new(self.resolve_annotation(Some(ok))),
+                err: Box::new(self.resolve_annotation(Some(err))),
+            },
             Some(TypeAnnotation::View(inner, mutable)) => {
                 Ty::View(Box::new(self.resolve_annotation(Some(inner))), *mutable)
             }
@@ -2552,6 +2863,7 @@ fn find_await(expr: &Expr) -> Option<Span> {
             .iter()
             .find_map(|field| find_await(&field.value))
             .or_else(|| update.as_ref().and_then(|u| find_await(u))),
+        Expr::Propagate { value, .. } => find_await(value),
     }
 }
 

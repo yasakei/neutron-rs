@@ -244,6 +244,11 @@ pub(crate) fn emit_drop_value<'ctx>(
         return emit_drop_option_value(fn_ctx, inner, cell);
     }
 
+    // Result cells: drop the active payload's heap data, then free the cell.
+    if let Ty::Result { ok, err } = &val.ntsc_type {
+        return super::result_cell::emit_drop_result_value(fn_ctx, ok, err, val);
+    }
+
     // A string and an `object` are both registry-backed string handles (an
     // object is its JSON text), so both are reclaimed by the same drop.
     if matches!(val.ntsc_type, Ty::String | Ty::Object) {
@@ -275,14 +280,15 @@ pub(crate) fn emit_drop_value<'ctx>(
     if let Ty::Array(elem_ty) = &val.ntsc_type {
         let handle = val.value.into_int_value();
 
-        // Drop nested arrays, class instances, option cells, and shared boxes
-        // stored as elements before freeing the container. Every insertion
-        // path copies option cells and retains shared boxes (the array owns
-        // its own copies), so reclaiming them here is safe. String elements
-        // are freed by the runtime itself; scalars are non-owning.
+        // Drop nested arrays, class instances, option/result cells, and
+        // shared boxes stored as elements before freeing the container.
+        // Every insertion path copies option/result cells and retains
+        // shared boxes (the array owns its own copies), so reclaiming them
+        // here is safe. String elements are freed by the runtime itself;
+        // scalars are non-owning.
         if matches!(
             **elem_ty,
-            Ty::Array(_) | Ty::Class(_) | Ty::Option(_) | Ty::Shared(_)
+            Ty::Array(_) | Ty::Class(_) | Ty::Option(_) | Ty::Result { .. } | Ty::Shared(_)
         ) && let (Some(len_fn), Some(get_fn)) = (
             fn_ctx.module.get_function("ntsc_array_len"),
             fn_ctx.module.get_function("ntsc_array_get"),
@@ -399,6 +405,7 @@ pub(crate) fn emit_drop_replaced_value<'ctx>(
             | Ty::Object
             | Ty::Shared(_)
             | Ty::Option(_)
+            | Ty::Result { .. }
             | Ty::Pointer
             | Ty::Slice(_)
             | Ty::Own(_)
@@ -472,6 +479,7 @@ pub(crate) fn ty_is_owned_handle(ty: &Ty) -> bool {
             | Ty::Shared(_)
             | Ty::Class(_)
             | Ty::Option(_)
+            | Ty::Result { .. }
             | Ty::Pointer
             | Ty::Slice(_)
             | Ty::Own(_)
@@ -576,6 +584,12 @@ pub(crate) fn expr_is_fresh<'ctx>(
             // `alloc(value)` hands the caller a fresh owning allocation.
             Expr::Variable { name } if name.lexeme() == "alloc" => {
                 matches!(tv.ntsc_type, Ty::Own(_))
+            }
+
+            // `Ok(v)` / `Err(e)` build a brand-new result cell that owns
+            // its payload.
+            Expr::Variable { name } if matches!(name.lexeme(), "Ok" | "Err") => {
+                matches!(tv.ntsc_type, Ty::Result { .. })
             }
             Expr::Variable { name } => fn_ctx
                 .module
@@ -1028,6 +1042,43 @@ pub(crate) fn store_into_owned_slot<'ctx>(
         fn_ctx.builder.build_store(ptr, cell)?;
         if let Expr::Variable { name: source } = expr
             && !matches!(val.ntsc_type, Ty::Option(_) | Ty::Nil)
+        {
+            fn_ctx.null_var_slot(source.lexeme());
+        }
+        return Ok(true);
+    }
+
+    // A result slot owns its cell: a fresh constructor result is adopted,
+    // anything else is deep-copied into a fresh cell of this slot's shape.
+    if let Ty::Result { ok, err } = ty {
+        let handle = match &val.ntsc_type {
+            Ty::Result {
+                ok: src_ok,
+                err: src_err,
+            } if **src_ok == **ok && **src_err == **err => {
+                if expr_is_fresh(fn_ctx, expr, val) {
+                    val.value
+                } else {
+                    super::result_cell::emit_copy_result_value(fn_ctx, ok, err, val)?.value
+                }
+            }
+            // A differently-shaped or non-result value cannot be adopted as
+            // is; rebuild a cell around the value on the Ok side.
+            _ => {
+                super::result_cell::box_result_value(
+                    fn_ctx,
+                    ok,
+                    err,
+                    expr,
+                    &TypedValue::new(val.value, (**ok).clone()),
+                    true,
+                )?
+                .value
+            }
+        };
+        fn_ctx.builder.build_store(ptr, handle)?;
+        if let Expr::Variable { name: source } = expr
+            && !matches!(val.ntsc_type, Ty::Result { .. })
         {
             fn_ctx.null_var_slot(source.lexeme());
         }

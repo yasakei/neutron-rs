@@ -169,6 +169,13 @@ pub enum Expr {
         update: Option<Box<Expr>>,
         span: Span,
     },
+
+    /// `expr?` — propagate an `Err` out of a result-returning function; on
+    /// `Ok` yields the payload.
+    Propagate {
+        value: Box<Expr>,
+        question_span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -242,6 +249,10 @@ impl Expr {
                 star,
             } => star.to(value.span()).to(target.span()),
             Expr::StructLiteral { span, .. } => *span,
+            Expr::Propagate {
+                value,
+                question_span,
+            } => value.span().to(*question_span),
         }
     }
 }

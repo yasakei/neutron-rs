@@ -136,8 +136,8 @@ fun read<T: Producer>(view T value) -> T::Item {
 
 fun main() {
     var User user = User()
-    var int result = read(user)
-    say("result=" + result)
+    var int total = read(user)
+    say("total=" + total)
 }
 "#;
     let rewrite_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -165,7 +165,7 @@ fun main() {
         "program failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "result=7\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "total=7\n");
 }
 
 #[test]

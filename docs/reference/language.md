@@ -72,7 +72,7 @@ mut        nil        or         option     own        retry
 return     unsafe     say        shared     slice      static
 string     super      test       this       throw      true
 try        use        var        view       while      quiet
-bool       float      array      object     any
+bool       float      array      object     any        result
 ```
 
 `&` and `*` are prefix operators that also form pointer type annotations
@@ -85,7 +85,7 @@ bool       float      array      object     any
 +   -   *   /   %    ++   --   !   ~
 <   <=  >   >=  ==   !=   &&   ||  !
 <<  >>  &   |   ^
-=   ?:  ...  ?.  ->   =>   ( ) { } [ ] , . :
+=   ?:  ?    ...  ?.  ->   =>   ( ) { } [ ] , . :
 ```
 
 ## Types
@@ -106,6 +106,7 @@ bool       float      array      object     any
 | --- | --- |
 | `array[T]` | Owned heap array with element type `T`. |
 | `option[T]` | `T` or `nil`. |
+| `result[Ok, Err]` | Success value of type `Ok` or error value of type `Err`, built with `Ok(v)` and `Err(e)`. |
 | `object` | An opaque dynamic value (used by `json.parse` results). |
 | `any` | An untyped value; the element type of an untyped array literal. |
 | `void` | The implicit return type of functions with no return; not written in annotations. |
@@ -326,6 +327,60 @@ Lambdas are first-class values stored in variables and passed to functions.
 
 `return expr` returns a value; `return` alone returns `void`. Heap values are
 moved out of the function. The return type is checked at the call site.
+
+## Results and error propagation
+
+`result[Ok, Err]` is a built-in generic enum for functions that can fail. The
+global constructors `Ok(value)` and `Err(value)` build one:
+
+```ntsc
+fun half(int x) -> result[int, string] {
+    if (x % 2 == 0) {
+        return Ok(x / 2)
+    }
+    return Err("odd input")
+}
+```
+
+### The `?` operator
+
+Postfix `?` on a result propagates an `Err` out of the enclosing function
+immediately; an `Ok` unwraps to its payload. It requires the enclosing
+function to return a result whose Ok side matches the payload:
+
+```ntsc
+fun caller() -> result[int, string] {
+    var n = parse_num(true)?
+    return Ok(n)          // runs only when parse_num succeeded
+}
+```
+
+When the function's error type is `string`, any non-string error payload is
+converted with the standard stringify rules, so `Err(7)?` in a function
+returning `result[_, string]` propagates `"7"`.
+
+A `throw` inside a result-returning function is caught at the function
+boundary and returned as `Err(message)` instead of escaping.
+
+### Result combinators
+
+Results expose `unwrap_or(default)`, `map(f)`, `and_then(f)`, and
+`or_else(f)`. Options expose `ok_or(default)` and `ok_or_else(f)` to turn an
+option into a result:
+
+```ntsc
+var n = Ok(21).map(fun(int x) -> int { return x * 2 })
+say(fmt.i64_to_str(n.unwrap_or(0)))     // 42
+
+var option[int] maybe = nil
+var r = maybe.ok_or(-1)                 // result[int, int]
+```
+
+`map` transforms an `Ok` payload; `and_then` chains a function returning
+another result; `or_else` recovers from an `Err` by calling a function that
+returns a replacement result. `unwrap_or` returns the default for an `Err`.
+Payloads passed to combinators follow ordinary move/copy rules: fresh
+constructor results are consumed, stored values are deep-copied.
 
 ## Classes
 

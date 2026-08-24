@@ -40,6 +40,7 @@ pub(crate) fn emit_expression<'ctx>(
             then_branch,
             else_branch,
         } => emit_ternary(fn_ctx, condition, then_branch, else_branch),
+        Expr::Propagate { value, .. } => emit_propagate(fn_ctx, value),
         Expr::Member { object, property } => {
             let obj_val = emit_expression(fn_ctx, object)?;
             let obj_val = deref_shared(fn_ctx, obj_val)?;
@@ -805,6 +806,106 @@ pub(crate) fn emit_expression<'ctx>(
 
 // ── Pointers and references ─────────────────────────────────────────────
 
+/// Lower `operand?`: branch on the result cell's tag. The Err path converts
+/// the payload to the enclosing function's error type, boxes it into a fresh
+/// cell of the function's return shape, drops every owned local, and returns
+/// from the enclosing function; the Ok path yields the Ok payload. A fresh
+/// cell is adopted (freed after its active payload is read out); a shared
+/// one has its payload deep-copied.
+fn emit_propagate<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    operand: &Expr,
+) -> Result<TypedValue<'ctx>, crate::CodegenError> {
+    let val = emit_expression(fn_ctx, operand)?;
+    let (operand_ok, operand_err) = match &val.ntsc_type {
+        Ty::Result { ok, err } => ((**ok).clone(), (**err).clone()),
+        _ => {
+            return Err(crate::CodegenError::LLVMError(
+                "`?` requires a `result[.., ..]` operand".into(),
+            ));
+        }
+    };
+    let (fn_ok, fn_err) = match &fn_ctx.return_type {
+        Ty::Result { ok, err } => ((**ok).clone(), (**err).clone()),
+        _ => {
+            return Err(crate::CodegenError::LLVMError(
+                "`?` requires an enclosing function returning `result[.., ..]`".into(),
+            ));
+        }
+    };
+    // An async function's early return must go through its poll state
+    // machine instead of a plain `return`; propagation there is not
+    // supported yet.
+    if fn_ctx.future_base.is_some() {
+        return Err(crate::CodegenError::LLVMError(
+            "`?` is not supported inside async functions yet".into(),
+        ));
+    }
+
+    let cell = option_cell_pointer(fn_ctx, val.value)?;
+    let fresh = expr_is_fresh(fn_ctx, operand, &val);
+
+    let current_fn = fn_ctx.function;
+    let ok_bb = fn_ctx
+        .context
+        .append_basic_block(current_fn, "propagate.ok");
+    let err_bb = fn_ctx
+        .context
+        .append_basic_block(current_fn, "propagate.err");
+    let merge_bb = fn_ctx
+        .context
+        .append_basic_block(current_fn, "propagate.merge");
+
+    let tag = result_tag(fn_ctx, cell)?;
+    let is_ok = fn_ctx.builder.build_int_compare(
+        IntPredicate::EQ,
+        tag,
+        fn_ctx.context.i64_type().const_zero(),
+        "propagate_is_ok",
+    )?;
+    fn_ctx
+        .builder
+        .build_conditional_branch(is_ok, ok_bb, err_bb)?;
+
+    // Ok path: extract the payload for the caller of this expression.
+    fn_ctx.builder.position_at_end(ok_bb);
+    let loaded = load_result_payload(fn_ctx, cell, true, &operand_ok)?;
+    let payload = TypedValue::new(loaded, operand_ok);
+    let payload = if fresh {
+        free_result_cell(fn_ctx, cell)?;
+        payload
+    } else {
+        emit_copy_value(fn_ctx, payload)?
+    };
+    let ok_payload = coerce_value(fn_ctx, payload, &fn_ok)?;
+    fn_ctx.builder.build_unconditional_branch(merge_bb)?;
+
+    // Err path: re-box the error as this function's own result and return it.
+    fn_ctx.builder.position_at_end(err_bb);
+    let loaded = load_result_payload(fn_ctx, cell, false, &operand_err)?;
+    let payload = TypedValue::new(loaded, operand_err);
+    let converted = if fn_err == Ty::String && payload.ntsc_type != Ty::String {
+        // The function reports errors as strings: stringify any error value.
+        let stringified = convert_to_string(fn_ctx, &payload)?;
+        if fresh {
+            free_result_cell(fn_ctx, cell)?;
+        }
+        stringified
+    } else if fresh {
+        free_result_cell(fn_ctx, cell)?;
+        payload
+    } else {
+        emit_copy_value(fn_ctx, payload)?
+    };
+    let converted = coerce_value(fn_ctx, converted, &fn_err)?;
+    let boxed = box_result_value(fn_ctx, &fn_ok, &fn_err, operand, &converted, false)?;
+    emit_drop_all_owned(fn_ctx)?;
+    fn_ctx.builder.build_return(Some(&boxed.value))?;
+
+    fn_ctx.builder.position_at_end(merge_bb);
+    Ok(TypedValue::new(ok_payload.value, fn_ok))
+}
+
 /// Evaluate a pointer-typed operand and yield its address plus the pointee
 /// type. References, raw pointers, and owning allocations all carry the
 /// address of the pointee's storage.
@@ -1030,6 +1131,9 @@ pub(crate) fn emit_copy_value<'ctx>(
         Ty::Option(inner) => {
             let inner = (**inner).clone();
             return emit_copy_option_value(fn_ctx, &inner, tv);
+        }
+        Ty::Result { ok, err } => {
+            return super::result_cell::emit_copy_result_value(fn_ctx, ok, err, &tv);
         }
     };
     let callee = fn_ctx

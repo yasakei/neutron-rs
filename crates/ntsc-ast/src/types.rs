@@ -18,6 +18,12 @@ pub enum TypeAnnotation {
     /// `option[Type]` — an explicitly nullable value.
     Option(Box<TypeAnnotation>),
 
+    /// `result[Ok, Err]` — a value that is either `Ok` or `Err` payload.
+    Result {
+        ok: Box<TypeAnnotation>,
+        err: Box<TypeAnnotation>,
+    },
+
     /// `view T` / `view mut T` — borrows a value for the call instead of
     /// owning it; the bool is the mutability of the borrow.
     View(Box<TypeAnnotation>, bool),
@@ -72,6 +78,7 @@ impl TypeAnnotation {
             TokenKind::TypeArray => Self::Array(None),
             TokenKind::TypeObject => Self::Object,
             TokenKind::TypeOption => return None,
+            TokenKind::TypeResult => return None,
             TokenKind::TypeAny => Self::Any,
             TokenKind::TypePointer => Self::Pointer,
             TokenKind::TypeSlice => Self::Slice(None),
@@ -90,6 +97,7 @@ impl TypeAnnotation {
             Self::Array(_) => "array",
             Self::Object => "object",
             Self::Option(_) => "option",
+            Self::Result { .. } => "result",
             Self::View(..) => "view",
             Self::Shared(_) => "shared",
             Self::Any => "any",

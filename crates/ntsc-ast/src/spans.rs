@@ -236,6 +236,13 @@ fn shift_expr(expr: &mut Expr, base: usize) {
             }
             shift_span(span, base);
         }
+        Expr::Propagate {
+            value,
+            question_span,
+        } => {
+            shift_expr(value, base);
+            shift_span(question_span, base);
+        }
     }
 }
 

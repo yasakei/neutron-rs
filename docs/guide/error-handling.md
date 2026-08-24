@@ -47,6 +47,44 @@ counted and the block runs again while attempts remain; once exhausted, control
 passes to the `catch` handler, or the exception is re-thrown outward when there
 is no `catch`.
 
+## Results and `?`
+
+For expected failures, return a `result[Ok, Err]` instead of throwing. The
+global constructors `Ok(value)` and `Err(value)` build one, and postfix `?`
+propagates an error to the caller:
+
+```ntsc
+fun parse_num(bool good) -> result[int, string] {
+    if (good) {
+        return Ok(42)
+    }
+    return Err("not a number")
+}
+
+fun caller() -> result[int, string] {
+    var n = parse_num(true)?
+    return Ok(n)      // skipped when parse_num failed
+}
+```
+
+`expr?` unwraps an `Ok` payload, and on an `Err` immediately returns that
+error from the enclosing function. When the function reports errors as
+`string`, non-string payloads are converted automatically (`Err(7)?`
+propagates `"7"`).
+
+A `throw` inside a result-returning function becomes `Err(message)` at the
+function boundary instead of escaping to `try`/`catch`.
+
+Combinators keep chains flat: `unwrap_or(default)`, `map(f)`,
+`and_then(f)`, `or_else(f)` work on results; `ok_or(default)` and
+`ok_or_else(f)` turn an option into a result:
+
+```ntsc
+say(fmt.i64_to_str(Ok(5).unwrap_or(0)))   // 5
+var m = Ok(21).map(fun(int x) -> int { return x * 2 })
+say(fmt.i64_to_str(m.unwrap_or(0)))       // 42
+```
+
 ## Numeric and indexing faults
 
 Integer arithmetic and indexing throw ordinary catchable exceptions when an

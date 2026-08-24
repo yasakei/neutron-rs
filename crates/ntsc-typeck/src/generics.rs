@@ -614,6 +614,10 @@ fn annotation_to_ty(annotation: &TypeAnnotation) -> crate::Ty {
         )),
         TypeAnnotation::Object => Ty::Object,
         TypeAnnotation::Option(inner) => Ty::Option(Box::new(annotation_to_ty(inner))),
+        TypeAnnotation::Result { ok, err } => Ty::Result {
+            ok: Box::new(annotation_to_ty(ok)),
+            err: Box::new(annotation_to_ty(err)),
+        },
         TypeAnnotation::View(inner, mutable) => {
             Ty::View(Box::new(annotation_to_ty(inner)), *mutable)
         }
@@ -2344,7 +2348,7 @@ mod tests {
             }
             fun main() {
                 var User user = User()
-                var int result = read(user)
+                var int total = read(user)
             }
             "#,
         );

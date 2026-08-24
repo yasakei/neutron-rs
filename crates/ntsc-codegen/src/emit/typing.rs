@@ -26,6 +26,7 @@ pub(crate) fn ty_to_llvm<'ctx>(
         Ty::Nil => i64.as_basic_type_enum(),
         Ty::Array(_) => i64.as_basic_type_enum(),
         Ty::Option(_) => i64.as_basic_type_enum(),
+        Ty::Result { .. } => i64.as_basic_type_enum(),
         Ty::Object => i64.as_basic_type_enum(),
         Ty::Function { .. } => context
             .ptr_type(AddressSpace::default())
@@ -75,6 +76,7 @@ pub(crate) fn default_llvm_value<'ctx>(ty: &Ty, context: &'ctx Context) -> Basic
         | Ty::Nil
         | Ty::Array(_)
         | Ty::Option(_)
+        | Ty::Result { .. }
         | Ty::Object
         | Ty::Any
         | Ty::Shared(_)

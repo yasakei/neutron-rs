@@ -119,6 +119,7 @@ fn token_debug_name(kind: &TokenKind) -> &'static str {
         TokenKind::TypeArray => "array",
         TokenKind::TypeObject => "object",
         TokenKind::TypeOption => "option",
+        TokenKind::TypeResult => "result",
         TokenKind::TypeAny => "any",
         TokenKind::TypePointer => "pointer",
         TokenKind::TypeSlice => "slice",
@@ -930,6 +931,23 @@ impl<'src> Parser<'src> {
                     self.expect(TokenKind::RightBracket, "expected ']' after option type")
                         .ok()?;
                     Some(TypeAnnotation::Option(Box::new(inner)))
+                }
+                TokenKind::TypeResult => {
+                    self.expect(TokenKind::LeftBracket, "expected '[' after 'result'")
+                        .ok()?;
+                    let ok = self.parse_type_annotation(true)?;
+                    self.expect(
+                        TokenKind::Comma,
+                        "expected ',' between result ok and err types",
+                    )
+                    .ok()?;
+                    let err = self.parse_type_annotation(true)?;
+                    self.expect(TokenKind::RightBracket, "expected ']' after result type")
+                        .ok()?;
+                    Some(TypeAnnotation::Result {
+                        ok: Box::new(ok),
+                        err: Box::new(err),
+                    })
                 }
                 _ => TypeAnnotation::from_token(&token),
             };
@@ -2060,15 +2078,33 @@ impl<'src> Parser<'src> {
                 })
             }
             TokenKind::Question => {
+                // `?` is ambiguous between a postfix propagate operator
+                // (`f()?`) and a ternary condition (`c ? x : y`). Try the
+                // ternary tail first; if it does not parse, rewind and treat
+                // the `?` as propagation.
+                let checkpoint = self.position;
                 self.advance();
-                let then_branch = self.parse_expression()?;
-                self.expect(TokenKind::Colon, "expected ':' in ternary")?;
-                let else_branch = self.parse_expression()?;
-                Ok(Expr::Ternary {
-                    condition: Box::new(left),
-                    then_branch: Box::new(then_branch),
-                    else_branch: Box::new(else_branch),
-                })
+                let ternary = (|| {
+                    let then_branch = self.parse_expression().ok()?;
+                    self.expect(TokenKind::Colon, "expected ':' in ternary")
+                        .ok()?;
+                    let else_branch = self.parse_expression().ok()?;
+                    Some(Expr::Ternary {
+                        condition: Box::new(left.clone()),
+                        then_branch: Box::new(then_branch),
+                        else_branch: Box::new(else_branch),
+                    })
+                })();
+                if let Some(ternary) = ternary {
+                    Ok(ternary)
+                } else {
+                    self.position = checkpoint;
+                    let question = self.advance();
+                    Ok(Expr::Propagate {
+                        value: Box::new(left),
+                        question_span: question.span,
+                    })
+                }
             }
             TokenKind::Dot => {
                 self.advance();
@@ -2196,6 +2232,9 @@ fn type_source(annotation: &TypeAnnotation) -> String {
         TypeAnnotation::Bool => "bool".into(),
         TypeAnnotation::Array(Some(inner)) => format!("array[{}]", type_source(inner)),
         TypeAnnotation::Option(inner) => format!("option[{}]", type_source(inner)),
+        TypeAnnotation::Result { ok, err } => {
+            format!("result[{},{}]", type_source(ok), type_source(err))
+        }
         TypeAnnotation::Slice(Some(inner)) => format!("slice[{}]", type_source(inner)),
         TypeAnnotation::Shared(inner) => format!("shared {}", type_source(inner)),
         TypeAnnotation::Own(inner) => format!("own {}", type_source(inner)),
@@ -3316,7 +3355,8 @@ for (var i = 0; i < 10; i = i + 1) {
 
     #[test]
     fn mixed_precedence_operators() {
-        let source = "var result = 2 + 3 * 4 - 1";
+        // `result` is now a type keyword, so the accumulator uses another name.
+        let source = "var total = 2 + 3 * 4 - 1";
         let prog = parse_source(source).unwrap();
         match &prog.statements[0] {
             Stmt::Var {
@@ -3563,5 +3603,47 @@ while (true) {
 }"#;
         let prog = parse_source(source).unwrap();
         assert_eq!(prog.statements.len(), 2);
+    }
+
+    #[test]
+    fn parse_result_annotation() {
+        let prog = parse_source("fun f() -> result[int, string] { return Ok(1) }").unwrap();
+        match &prog.statements[0] {
+            Stmt::Function { return_type, .. } => {
+                let ret = return_type.as_ref().expect("return type");
+                assert_eq!(type_source(&ret.ty), "result[int,string]");
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_question_propagate() {
+        let prog =
+            parse_source("fun f() -> result[int, string] { var v = g()?  return Ok(v) }").unwrap();
+        let Stmt::Function { body, .. } = &prog.statements[0] else {
+            panic!("expected Function")
+        };
+        // First statement: `let v = g()?` — the initializer is a Propagate.
+        let Stmt::Var {
+            initializer: Some(init),
+            ..
+        } = &body[0]
+        else {
+            panic!("expected Var")
+        };
+        assert!(matches!(init, Expr::Propagate { .. }));
+    }
+
+    #[test]
+    fn question_ternary_still_parses() {
+        let prog = parse_source("var x = a ? b : c").unwrap();
+        match &prog.statements[0] {
+            Stmt::Var {
+                initializer: Some(init),
+                ..
+            } => assert!(matches!(init, Expr::Ternary { .. })),
+            other => panic!("expected Var, got {:?}", other),
+        }
     }
 }

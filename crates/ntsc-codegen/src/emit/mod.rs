@@ -517,6 +517,7 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
                 | Ty::Object
                 | Ty::Shared(_)
                 | Ty::Option(_)
+                | Ty::Result { .. }
                 | Ty::Pointer
                 | Ty::Slice(_)
                 | Ty::Own(_)
@@ -531,15 +532,20 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
     /// elsewhere, so the exit-time drop is a no-op. Shared boxes are never
     /// moved (only retained) and class values use reference semantics
     /// (`var y = x` aliases `x`), so those slots are left untouched. Option
-    /// slots *are* nulled: an option is an owned cell, so a move that left
-    /// the slot intact would let both the destination and this scope's exit
-    /// free the same cell. A `dyn` fat pointer owns its header, so it is
-    /// nulled on move for the same reason.
+    /// and result slots *are* nulled: both are owned cells, so a move that
+    /// left the slot intact would let both the destination and this scope's
+    /// exit free the same cell. A `dyn` fat pointer owns its header, so it
+    /// is nulled on move for the same reason.
     fn null_var_slot(&mut self, name: &str) {
         if let Some((ptr, ty)) = self.lookup_var(name)
             && matches!(
                 ty,
-                Ty::Array(_) | Ty::String | Ty::Object | Ty::Option(_) | Ty::Dyn(_)
+                Ty::Array(_)
+                    | Ty::String
+                    | Ty::Object
+                    | Ty::Option(_)
+                    | Ty::Dyn(_)
+                    | Ty::Result { .. }
             )
         {
             let _ = self.builder.build_store(
@@ -569,6 +575,7 @@ pub(crate) mod literal;
 pub(crate) mod lookup;
 pub(crate) mod member;
 pub(crate) mod module;
+pub(crate) mod result_cell;
 pub(crate) mod runtime;
 pub(crate) mod stmt;
 #[cfg(test)]
@@ -593,6 +600,7 @@ pub(crate) use literal::*;
 pub(crate) use lookup::*;
 pub(crate) use member::*;
 pub use module::emit_module;
+pub(crate) use result_cell::*;
 pub(crate) use runtime::*;
 pub(crate) use stmt::*;
 pub(crate) use typing::*;
