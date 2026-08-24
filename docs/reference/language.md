@@ -483,9 +483,16 @@ Patterns:
 - Variable: `case x => ...` (binds the matched value)
 - Array destructure: `case [a, b, ...rest] => ...`
 - Object destructure: `case {name, age} => ...`
+- Result variants: `case Ok(v) => ...` / `case Err(e) => ...` bind the
+  active payload; the binder is scoped to the arm body and owns an
+  independent copy. Use `_` to ignore a payload (`case Err(_) => ...`),
+  and combine with guards: `case Err(e) if e == "timeout" => ...`. A
+  result scrutinee requires variant patterns; matching it against plain
+  values never succeeds.
 
 The first matching case executes; the match value is consumed once. Guards
-are boolean expressions after `if`.
+are boolean expressions after `if`; in a variant arm the guard runs after
+the binder is in scope, so it can read the payload.
 
 ### Try / catch / finally
 

@@ -1,10 +1,11 @@
-//! End-to-end test: the built-in `result[.., ..]` type, the `?` propagation
-//! operator, throw-to-Err integration, and the result/option combinators.
+//! End-to-end tests: the built-in `result[.., ..]` type, the `?` propagation
+//! operator, throw-to-Err integration, the result/option combinators, and
+//! destructuring `match` arms over results.
 
 use std::path::Path;
 
-#[test]
-fn result_e2e() {
+/// Build `source` against the debug runtime and return the program's stdout.
+fn compile_and_run(source: &str, name: &str) -> String {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let rewrite_dir = workspace.parent().unwrap().parent().unwrap();
     let runtime_lib = rewrite_dir.join(
@@ -27,6 +28,42 @@ fn result_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
+    let dir = std::env::temp_dir().join(format!("ntsc_{name}_e2e_test"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let obj_path = dir.join(format!("{name}.{}", ntsc_codegen::object_extension()));
+    let bin_path = dir.join(name);
+
+    ntsc_codegen::compile_source(source, ntsc_codegen::host_triple(), name, &dir)
+        .expect("compile_source failed");
+
+    assert!(obj_path.exists(), "object file not produced");
+
+    // Link.
+    ntsc_codegen::link_binary(&obj_path, &runtime_lib, &bin_path).expect("link_binary failed");
+
+    assert!(bin_path.exists(), "binary not produced");
+
+    // Run and capture output.
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
+
+    assert!(
+        output.status.success(),
+        "binary exited with non-zero status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Cleanup.
+    let _ = std::fs::remove_dir_all(&dir);
+
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn result_e2e() {
     let source = r#"fun double_it(int x) -> int {
     return x * 2
 }
@@ -116,34 +153,7 @@ fun main() -> int {
 }
 "#;
 
-    let dir = std::env::temp_dir().join("ntsc_result_e2e_test");
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let obj_path = dir.join(format!("result.{}", ntsc_codegen::object_extension()));
-    let bin_path = dir.join("result_ntsc_test");
-
-    // Compile.
-    ntsc_codegen::compile_source(source, ntsc_codegen::host_triple(), "result", &dir)
-        .expect("compile_source failed");
-
-    assert!(obj_path.exists(), "object file not produced");
-
-    // Link.
-    ntsc_codegen::link_binary(&obj_path, &runtime_lib, &bin_path).expect("link_binary failed");
-
-    assert!(bin_path.exists(), "binary not produced");
-
-    // Run and capture output.
-    let output = std::process::Command::new(&bin_path)
-        .output()
-        .expect("failed to run binary");
-
-    assert!(
-        output.status.success(),
-        "binary exited with non-zero status: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = compile_and_run(source, "result");
     let lines: Vec<&str> = stdout.trim().lines().collect();
     let expected = [
         "5",      // Ok(5).unwrap_or(0)
@@ -161,7 +171,59 @@ fun main() -> int {
         "made",   // option.ok_or_else builds the error lazily
     ];
     assert_eq!(lines, expected, "unexpected program output:\n{stdout}");
+}
 
-    // Cleanup.
-    let _ = std::fs::remove_dir_all(&dir);
+#[test]
+fn result_match_e2e() {
+    // Destructuring match over results: variant binders, `_` payload skip,
+    // guards reading the bound payload, default fallback, and a fresh call
+    // scrutinee (which must not leak its cell).
+    let source = r#"fun parse(int n) -> result[int, string] {
+    if (n < 0) { return Err("negative") }
+    return Ok(n * 2)
+}
+
+fun describe(result[int, string] r) -> string {
+    match (r) {
+        case Ok(v) => { return "ok:" + fmt.i64_to_str(v) }
+        case Err(e) => { return "err:" + e }
+    }
+}
+
+fun main() -> int {
+    var good = parse(21)
+    match (good) {
+        case Ok(v) => { say("ok: " + fmt.i64_to_str(v)) }
+        case Err(e) => { say("err: " + e) }
+        default => { say("unreachable") }
+    }
+
+    match (parse(-5)) {
+        case Ok(v) => { say("no: " + fmt.i64_to_str(v)) }
+        case Err(e) if e == "negative" => { say("caught: " + e) }
+        case Err(_) => { say("other error") }
+    }
+
+    match (parse(7)) {
+        case Ok(v) if v > 100 => { say("huge") }
+        case Ok(v) => { say("small: " + fmt.i64_to_str(v)) }
+        case Err(_) => { say("none") }
+    }
+
+    say(describe(Err("plain")))
+    say(describe(Ok(3)))
+    return 0
+}
+"#;
+
+    let stdout = compile_and_run(source, "result_match");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    let expected = [
+        "ok: 42",           // owned scrutinee, Ok binder sees the int payload
+        "caught: negative", // guard reads the bound error; fresh cell released
+        "small: 14",        // first arm's guard fails, second Ok arm matches
+        "err:plain",        // binder scoped per arm through a call boundary
+        "ok:3",
+    ];
+    assert_eq!(lines, expected, "unexpected program output:\n{stdout}");
 }

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use ntsc_ast::expr::{Expr, LiteralValue};
 use ntsc_ast::span::Span;
-use ntsc_ast::stmt::{Program, Stmt};
+use ntsc_ast::stmt::{MatchCase, MatchPattern, Program, Stmt};
 use ntsc_ast::token::{Token, TokenKind};
 use ntsc_ast::types::TypeAnnotation;
 
@@ -521,6 +521,54 @@ impl TypeChecker {
         }
     }
 
+    /// Check a destructuring match arm: the variant must exist on the
+    /// scrutinee's type (result cells expose `Ok` / `Err`), and the binder
+    /// is scoped to the arm body with the payload's type.
+    fn check_pattern_case(
+        &mut self,
+        case: &MatchCase,
+        pattern: &MatchPattern,
+        scrutinee_ty: Option<Ty>,
+    ) {
+        let variant = pattern.variant.lexeme();
+        let payload_ty = match (&scrutinee_ty, variant) {
+            (Some(Ty::Result { ok, err: _ }), "Ok") => Some((**ok).clone()),
+            (Some(Ty::Result { ok: _, err }), "Err") => Some((**err).clone()),
+            (Some(other), _) => {
+                self.errors.push(TypeError {
+                    code: None,
+                    help: None,
+                    message: format!("`{other}` has no variant `{variant}` to match here"),
+                    span: pattern.variant.span,
+                });
+                None
+            }
+            // Scrutinee type unknown (earlier errors): accept either
+            // variant and let the binder stay unchecked.
+            (None, "Ok" | "Err") => None,
+            (None, _) => {
+                return;
+            }
+        };
+
+        if let Some(binding) = &pattern.binding {
+            self.symbols.push_scope();
+            let binder_ty = payload_ty.unwrap_or(Ty::Any);
+            if let Err(msg) = self.symbols.define(binding.lexeme(), binder_ty) {
+                self.errors.push(TypeError {
+                    code: None,
+                    help: None,
+                    message: msg,
+                    span: binding.span,
+                });
+            }
+            self.check_statement(&case.body);
+            self.symbols.pop_scope();
+        } else {
+            self.check_statement(&case.body);
+        }
+    }
+
     fn check_statement(&mut self, stmt: &Stmt) {
         // The slice forbids exception machinery inside async bodies: they
         // would have to unwind across a suspended state machine.
@@ -698,10 +746,17 @@ impl TypeChecker {
                 cases,
                 default_case,
             } => {
-                let _ = self.check_expression(expression);
+                let scrutinee_ty = self.check_expression(expression);
                 for case in cases {
-                    let _ = self.check_expression(&case.value);
-                    self.check_statement(&case.body);
+                    match &case.pattern {
+                        Some(pattern) => {
+                            self.check_pattern_case(case, pattern, scrutinee_ty.clone())
+                        }
+                        None => {
+                            let _ = self.check_expression(&case.value);
+                            self.check_statement(&case.body);
+                        }
+                    }
                 }
                 if let Some(default) = default_case {
                     self.check_statement(default);
@@ -3803,6 +3858,42 @@ mod tests {
                 .iter()
                 .any(|error| { error.message.contains("cannot destructure a view") })
         );
+    }
+
+    #[test]
+    fn result_variant_pattern_binds_the_payload_type() {
+        let errors = check_source(
+            "fun f(result[int, string] r) -> int {\n match (r) { case Ok(v) => { return v } case Err(e) => { var int bad = e } } return 0 }",
+        )
+        .unwrap_err();
+        // `v` is an int (Ok payload); binding it to string errors on the
+        // Err arm's misuse of `e`, proving both binders got their types.
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.message == "type mismatch: expected `int`, got `string`" })
+        );
+    }
+
+    #[test]
+    fn variant_pattern_on_a_non_result_is_rejected() {
+        let errors = check_source(
+            "fun f() -> int { match (7) { case Ok(v) => { return v } default => { return 0 } } }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.message.contains("has no variant `Ok` to match here") })
+        );
+    }
+
+    #[test]
+    fn variant_pattern_accepts_a_result_scrutinee() {
+        assert!(check_source(
+            "fun f(result[int, string] r) -> int { match (r) { case Ok(v) => { return v } case Err(_) => { return -1 } } }"
+        )
+        .is_ok());
     }
 
     #[test]

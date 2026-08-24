@@ -202,9 +202,23 @@ pub struct ElifBranch {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchCase {
     pub value: Expr,
+    /// Present when the arm head is a variant pattern like `Ok(v)` or
+    /// `Err(e)`: the arm destructures an enum-like value and binds its
+    /// payload to `binding` for the arm body. `value` still holds the raw
+    /// parsed call form so generic AST consumers keep working, but checking
+    /// and lowering branch on this field instead.
+    pub pattern: Option<MatchPattern>,
     pub guard: Option<Expr>,
     pub body: Stmt,
     pub case_span: Span,
+}
+
+/// A destructuring match arm head: `VariantName` or `VariantName(binder)`.
+/// A `_` binder matches the variant while ignoring its payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchPattern {
+    pub variant: Token,
+    pub binding: Option<Token>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

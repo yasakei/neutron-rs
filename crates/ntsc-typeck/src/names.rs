@@ -230,11 +230,27 @@ impl Resolver {
             } => {
                 self.resolve_expression(expression);
                 for case in cases {
-                    self.resolve_expression(&case.value);
-                    if let Some(guard) = &case.guard {
-                        self.resolve_expression(guard);
+                    match &case.pattern {
+                        // The binder scopes to the arm body; the raw call
+                        // form in `value` is not resolved as an expression.
+                        Some(pattern) => {
+                            if let Some(binding) = &pattern.binding {
+                                self.in_scope(|resolver| {
+                                    resolver.define(binding.lexeme(), binding.span);
+                                    resolver.resolve_statement(&case.body);
+                                });
+                            } else {
+                                self.resolve_statement(&case.body);
+                            }
+                        }
+                        None => {
+                            self.resolve_expression(&case.value);
+                            if let Some(guard) = &case.guard {
+                                self.resolve_expression(guard);
+                            }
+                            self.resolve_statement(&case.body);
+                        }
                     }
-                    self.resolve_statement(&case.body);
                 }
                 if let Some(default_case) = default_case {
                     self.resolve_statement(default_case);

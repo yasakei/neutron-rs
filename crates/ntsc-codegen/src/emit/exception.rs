@@ -412,6 +412,34 @@ pub(crate) fn emit_match<'ctx>(
     let expr_val = emit_expression(fn_ctx, expression)?;
     let current_fn = fn_ctx.function;
 
+    // Variant patterns (`Ok(v)` / `Err(e)`) dispatch on the result cell's
+    // tag and bind the payload for the arm body.
+    let scrutinee = match &expr_val.ntsc_type {
+        Ty::Result { ok, err } => Some(((**ok).clone(), (**err).clone())),
+        _ => None,
+    };
+    if cases.iter().any(|case| case.pattern.is_some()) {
+        if fn_ctx.future_base.is_some() {
+            return Err(crate::CodegenError::LLVMError(
+                "match variant patterns are not supported inside async functions yet".into(),
+            ));
+        }
+        let Some((ok_ty, err_ty)) = scrutinee else {
+            return Err(crate::CodegenError::LLVMError(
+                "match variant patterns require a `result[.., ..]` scrutinee".into(),
+            ));
+        };
+        return emit_match_with_patterns(
+            fn_ctx,
+            expression,
+            cases,
+            default_case,
+            expr_val,
+            ok_ty,
+            err_ty,
+        );
+    }
+
     let merge_bb = fn_ctx.context.append_basic_block(current_fn, "match.merge");
 
     for (i, case) in cases.iter().enumerate() {
@@ -533,5 +561,236 @@ pub(crate) fn emit_match<'ctx>(
     }
 
     fn_ctx.builder.position_at_end(merge_bb);
+    Ok(())
+}
+
+/// Lower a match whose scrutinee is a `result[.., ..]` and which has at
+/// least one variant-pattern arm. Pattern arms test the cell's tag, bind
+/// the active payload to the arm's binder (an owned copy for heap payloads,
+/// so the scrutinee cell keeps its own), run an optional guard, then execute
+/// the body. Plain value arms keep the sequential-compare behavior. A fresh
+/// (temporary) scrutinee cell is dropped on the fall-through path; an owned
+/// scrutinee stays alive for its variable.
+fn emit_match_with_patterns<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    expression: &Expr,
+    cases: &[ntsc_ast::stmt::MatchCase],
+    default_case: &Option<Box<Stmt>>,
+    expr_val: TypedValue<'ctx>,
+    ok_ty: Ty,
+    err_ty: Ty,
+) -> Result<(), crate::CodegenError> {
+    let current_fn = fn_ctx.function;
+    let cell = option_cell_pointer(fn_ctx, expr_val.value)?;
+    let fresh_scrutinee = expr_is_fresh(fn_ctx, expression, &expr_val);
+
+    let merge_bb = fn_ctx.context.append_basic_block(current_fn, "match.merge");
+
+    for (i, case) in cases.iter().enumerate() {
+        let case_bb = fn_ctx
+            .context
+            .append_basic_block(current_fn, &format!("match.case{i}"));
+        let next_bb = fn_ctx
+            .context
+            .append_basic_block(current_fn, &format!("match.next{i}"));
+
+        match &case.pattern {
+            Some(pattern) => {
+                // Guards are evaluated inside the arm, after the binder is
+                // in scope, so `Ok(v) if v > 3` can read the payload.
+                let want_ok = pattern.variant.lexeme() == "Ok";
+                let tag = result_tag(fn_ctx, cell)?;
+                let expected = if want_ok {
+                    fn_ctx.context.i64_type().const_zero()
+                } else {
+                    fn_ctx.context.i64_type().const_int(1, false)
+                };
+                let matched = fn_ctx.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    tag,
+                    expected,
+                    "matchtag",
+                )?;
+                fn_ctx
+                    .builder
+                    .build_conditional_branch(matched, case_bb, next_bb)?;
+            }
+            None => {
+                let is_wildcard = matches!(
+                    &case.value,
+                    Expr::Variable { name } if name.lexeme() == "_"
+                );
+                if !is_wildcard {
+                    let case_val = emit_expression(fn_ctx, &case.value)?;
+                    let matched = match (&expr_val.ntsc_type, &case_val.ntsc_type) {
+                        (Ty::Int, Ty::Int) | (Ty::Bool, Ty::Bool) => {
+                            fn_ctx.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                expr_val.value.into_int_value(),
+                                case_val.value.into_int_value(),
+                                "matchcmp",
+                            )?
+                        }
+                        _ if case_val.value.is_int_value() && expr_val.value.is_int_value() => {
+                            fn_ctx.builder.build_int_compare(
+                                IntPredicate::EQ,
+                                expr_val.value.into_int_value(),
+                                case_val.value.into_int_value(),
+                                "matchcmp",
+                            )?
+                        }
+                        _ => fn_ctx.context.bool_type().const_zero(),
+                    };
+
+                    let matched = if let Some(guard) = &case.guard {
+                        let guard_val = emit_expression(fn_ctx, guard)?;
+                        match guard_val.value {
+                            BasicValueEnum::IntValue(i) if guard_val.ntsc_type == Ty::Bool => {
+                                fn_ctx.builder.build_and(matched, i, "matchguard")?
+                            }
+                            _ => {
+                                return Err(crate::CodegenError::LLVMError(format!(
+                                    "match guard must be `bool`, got `{}`",
+                                    guard_val.ntsc_type
+                                )));
+                            }
+                        }
+                    } else {
+                        matched
+                    };
+                    fn_ctx
+                        .builder
+                        .build_conditional_branch(matched, case_bb, next_bb)?;
+                } else {
+                    fn_ctx
+                        .builder
+                        .build_unconditional_branch(case_bb)
+                        .map_err(|e| crate::CodegenError::LLVMError(format!("match: {e}")))?;
+                }
+            }
+        }
+
+        fn_ctx.builder.position_at_end(case_bb);
+        let outer_scope = fn_ctx.begin_block_scope();
+        if let Some(pattern) = &case.pattern {
+            bind_pattern_payload(fn_ctx, cell, pattern, &ok_ty, &err_ty)?;
+        }
+
+        // A pattern arm's guard runs after its binder is in scope; a false
+        // guard falls through to the next arm.
+        if let Some(guard) = &case.guard
+            && case.pattern.is_some()
+        {
+            let guard_val = emit_expression(fn_ctx, guard)?;
+            let guard_cond = match guard_val.value {
+                BasicValueEnum::IntValue(i) if guard_val.ntsc_type == Ty::Bool => i,
+                _ => {
+                    return Err(crate::CodegenError::LLVMError(format!(
+                        "match guard must be `bool`, got `{}`",
+                        guard_val.ntsc_type
+                    )));
+                }
+            };
+            let body_bb = fn_ctx
+                .context
+                .append_basic_block(current_fn, &format!("match.armbody{i}"));
+            fn_ctx
+                .builder
+                .build_conditional_branch(guard_cond, body_bb, next_bb)?;
+            fn_ctx.builder.position_at_end(body_bb);
+        }
+
+        emit_statement_in_function(fn_ctx, &case.body)?;
+        fn_ctx.end_block_scope(outer_scope);
+        branch_to_merge_releasing_scrutinee(
+            fn_ctx,
+            fresh_scrutinee,
+            &expr_val,
+            (&ok_ty, &err_ty),
+            merge_bb,
+        )?;
+
+        fn_ctx.builder.position_at_end(next_bb);
+    }
+
+    // Default case: runs when no pattern matched.
+    if let Some(default) = default_case {
+        emit_statement_in_function(fn_ctx, default)?;
+    }
+
+    branch_to_merge_releasing_scrutinee(
+        fn_ctx,
+        fresh_scrutinee,
+        &expr_val,
+        (&ok_ty, &err_ty),
+        merge_bb,
+    )?;
+
+    fn_ctx.builder.position_at_end(merge_bb);
+    Ok(())
+}
+
+/// Branch to the match's merge block, first releasing a fresh temporary
+/// scrutinee cell. Every path into the merge block funnels through here so
+/// a matched arm cannot leave the cell behind; paths ending in `return` or
+/// a jump already have a terminator and are skipped.
+fn branch_to_merge_releasing_scrutinee<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    fresh_scrutinee: bool,
+    expr_val: &TypedValue<'ctx>,
+    (ok_ty, err_ty): (&Ty, &Ty),
+    merge_bb: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<(), crate::CodegenError> {
+    let terminated = fn_ctx
+        .builder
+        .get_insert_block()
+        .is_none_or(|block| block.get_terminator().is_some());
+    if fresh_scrutinee && !terminated {
+        emit_drop_result_value(fn_ctx, ok_ty, err_ty, expr_val)?;
+    }
+    if !terminated {
+        fn_ctx
+            .builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| crate::CodegenError::LLVMError(format!("match: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Bind a variant pattern's payload to the arm's binder: heap payloads are
+/// deep-copied so the binder owns its value independently of the cell;
+/// scalars move by value. `_` (no binding token) skips binding entirely.
+fn bind_pattern_payload<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    cell: PointerValue<'ctx>,
+    pattern: &ntsc_ast::stmt::MatchPattern,
+    ok_ty: &Ty,
+    err_ty: &Ty,
+) -> Result<(), crate::CodegenError> {
+    let Some(binding) = &pattern.binding else {
+        return Ok(());
+    };
+    let want_ok = pattern.variant.lexeme() == "Ok";
+    let payload_ty = if want_ok {
+        ok_ty.clone()
+    } else {
+        err_ty.clone()
+    };
+
+    let loaded = load_result_payload(fn_ctx, cell, want_ok, &payload_ty)?;
+    let owned = if payload_is_heap(&payload_ty) {
+        emit_copy_value(fn_ctx, TypedValue::new(loaded, payload_ty.clone()))?.value
+    } else {
+        loaded
+    };
+    let ptr = fn_ctx.alloca(binding.lexeme(), &payload_ty)?;
+    // The entry slot backs this binding on every pass of an enclosing loop;
+    // release the previous copy before rebinding.
+    if fn_ctx.future_base.is_none() {
+        emit_drop_slot_value(fn_ctx, ptr, &payload_ty)?;
+    }
+    fn_ctx.builder.build_store(ptr, owned)?;
+    fn_ctx.define_var(binding.lexeme(), ptr, payload_ty.clone());
+    fn_ctx.mark_owned_if_heap(binding.lexeme(), &payload_ty);
     Ok(())
 }

@@ -191,7 +191,7 @@ pub(crate) fn box_result_value<'ctx>(
 
 /// Whether a payload type owns heap data that must be dropped or deep-copied
 /// when its owning result cell is reclaimed or copied.
-fn payload_is_heap(ty: &Ty) -> bool {
+pub(crate) fn payload_is_heap(ty: &Ty) -> bool {
     matches!(
         ty,
         Ty::String

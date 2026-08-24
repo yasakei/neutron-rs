@@ -1361,6 +1361,7 @@ impl Context {
                     .into_iter()
                     .map(|case| ntsc_ast::stmt::MatchCase {
                         value: self.transform_expr(case.value, env),
+                        pattern: case.pattern,
                         guard: case.guard.map(|guard| self.transform_expr(guard, env)),
                         body: self.transform_stmt(case.body, env),
                         case_span: case.case_span,

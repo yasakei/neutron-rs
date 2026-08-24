@@ -4,7 +4,7 @@
 
 use crate::expr::{Expr, FunctionParam, ObjectProperty};
 use crate::span::Span;
-use crate::stmt::{ElifBranch, EnumMember, GenericParam, MatchCase, Program, Stmt};
+use crate::stmt::{ElifBranch, EnumMember, GenericParam, MatchCase, MatchPattern, Program, Stmt};
 use crate::token::Token;
 use crate::types::{ReturnType, TypeAnnotation};
 
@@ -407,12 +407,19 @@ fn shift_stmt(stmt: &mut Stmt, base: usize) {
             shift_expr(expression, base);
             for MatchCase {
                 value,
+                pattern,
                 guard,
                 body,
                 case_span,
             } in cases
             {
                 shift_expr(value, base);
+                if let Some(MatchPattern { variant, binding }) = pattern {
+                    shift_span(&mut variant.span, base);
+                    if let Some(binding) = binding {
+                        shift_span(&mut binding.span, base);
+                    }
+                }
                 if let Some(guard) = guard {
                     shift_expr(guard, base);
                 }
