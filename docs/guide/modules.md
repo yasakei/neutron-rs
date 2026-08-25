@@ -17,11 +17,11 @@ say(fmt.i64_to_str(n))
 The available modules are:
 
 ```
-arrays    async     collections  crypto  encoding
-fmt       hash      http         io      json
-math      net       os           process random
-regex     sort      strings      sys     testing
-time
+arrays    async     collections  crypto  csv
+encoding  fmt       hash         http    io
+json      math      net          os      process
+random    regex     sort         strings sys
+testing   time      toml         yaml
 ```
 
 `use module` is still accepted and can serve as documentation of intent:

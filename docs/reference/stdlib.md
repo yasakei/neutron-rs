@@ -137,6 +137,68 @@ negative argument.
 | `json.stringify_pretty(json)` | `string` | Pretty-prints. |
 | `json.escape_string(s)` | `string` | Escapes a string for embedding in JSON. |
 
+## CSV
+
+`csv` parses and serializes comma-separated value text.  `csv.parse` returns a
+JSON array of objects (each row becomes an object keyed by the header row);
+`csv.stringify` accepts the same format and produces CSV text.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `csv.parse(s)` | `string` | Parses CSV text into a JSON array of objects; the first row is used as keys. Throws on malformed input. |
+| `csv.stringify(v)` | `string` | Serializes a JSON array of objects into CSV text. Throws when `v` is not an array of objects. |
+
+An empty input produces `[]`.
+
+```ntsc
+var data = csv.parse("name,age\nAlice,30\nBob,25")
+// [{"name":"Alice","age":"30"},{"name":"Bob","age":"25"}]
+
+var text = csv.stringify(data)
+// "name,age\nAlice,30\nBob,25"
+```
+
+## TOML
+
+`toml` parses and serializes TOML text.  `toml.parse` returns a JSON object;
+`toml.stringify` accepts a JSON object and produces TOML text.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `toml.parse(s)` | `string` | Parses TOML text into a JSON object. Throws on malformed input. |
+| `toml.stringify(v)` | `string` | Serializes a JSON object into TOML text. Throws when `v` is not an object. |
+
+An empty input produces `{}`.
+
+```ntsc
+var data = toml.parse("name = \"Alice\"\nage = 30\nactive = true")
+// {"name":"Alice","age":30,"active":true}
+
+var text = toml.stringify(data)
+// name = "Alice"\nage = 30\nactive = true
+```
+
+## YAML
+
+`yaml` parses and serializes YAML text.  `yaml.parse` returns a JSON object
+(or array for top-level sequences); `yaml.stringify` accepts a JSON value and
+produces YAML text.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `yaml.parse(s)` | `string` | Parses YAML text into a JSON value. Throws on malformed input. |
+| `yaml.stringify(v)` | `string` | Serializes a JSON value into YAML text. |
+
+An empty input produces `{}`.
+
+```ntsc
+var data = yaml.parse("name: Alice\nage: 30\nactive: true")
+// {"name":"Alice","age":30,"active":true}
+
+var text = yaml.stringify(data)
+// name: Alice\nage: 30\nactive: true
+```
+
 ## HTTP
 
 `http` performs blocking requests. On network or HTTP failure the request
@@ -476,6 +538,7 @@ Assertions throw on failure. The test runner also uses them.
 | `testing.assert_false(b)` | `bool` | Passes when `b` is `false`. |
 | `testing.assert_eq(a, b)` | `bool` | Passes when `a == b` (`int`, `float`, `bool`, or `string`). |
 | `testing.assert_ne(a, b)` | `bool` | Passes when `a != b`. |
+| `testing.bench(f, n, warmup)` | `float` | Benchmarks `f` over `n` iterations (with an optional `warmup` phase); returns the average microseconds per iteration. `f` is a function reference taking one `int` and returning any value. |
 
 ## Async
 
