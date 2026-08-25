@@ -187,6 +187,17 @@ impl Resolver {
                     resolver.resolve_statement(body);
                 });
             }
+            Stmt::ForAwait {
+                variable,
+                producer,
+                body,
+            } => {
+                self.resolve_expression(producer);
+                self.in_scope(|resolver| {
+                    resolver.define(variable.lexeme(), variable.span);
+                    resolver.resolve_statement(body);
+                });
+            }
             Stmt::Function { params, body, .. } => self.resolve_function(params, body),
             Stmt::AsyncFunction { params, body, .. } => self.resolve_function(params, body),
             Stmt::Test { body, .. } => self.resolve_function(&[], body),
@@ -363,6 +374,11 @@ impl Resolver {
                 self.resolve_expression(callee);
                 for argument in arguments {
                     self.resolve_expression(argument);
+                }
+            }
+            Expr::AsyncBlock { body, .. } => {
+                for stmt in body {
+                    self.resolve_statement(stmt);
                 }
             }
             Expr::Member { object, .. } | Expr::OptionalMember { object, .. } => {

@@ -166,6 +166,24 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
 
     declare!("ntsc_async_sleep_drop", void_ty, i64_ty);
 
+    declare!(
+        "ntsc_async_wait_any",
+        void_ty,
+        async_poll_fn,
+        i64_ty,
+        async_poll_fn,
+        i64_ty
+    );
+
+    declare!(
+        "ntsc_async_wait_all",
+        void_ty,
+        async_poll_fn,
+        i64_ty,
+        async_poll_fn,
+        i64_ty
+    );
+
     // ── arrays module ────────────────────────────────────────────────────
 
     declare!("ntsc_arrays_new", i64_ty);

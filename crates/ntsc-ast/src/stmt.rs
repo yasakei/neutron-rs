@@ -63,6 +63,13 @@ pub enum Stmt {
         body: Box<Stmt>,
     },
 
+    /// `for await x in producer { ... }` — consume an async stream.
+    ForAwait {
+        variable: Token,
+        producer: Expr,
+        body: Box<Stmt>,
+    },
+
     Function {
         name: Token,
         generic_params: Vec<GenericParam>,

@@ -127,6 +127,14 @@ pub enum Expr {
         span: Span,
     },
 
+    /// `async { ... }` — inline async block that compiles to an anonymous
+    /// future. Can be passed to `wait_any`/`wait_all` or awaited directly.
+    AsyncBlock {
+        body: Vec<crate::stmt::Stmt>,
+        return_type: Option<ReturnTypeAnnotation>,
+        span: Span,
+    },
+
     /// `view target` / `view mut target` — block-scoped, non-owning view of a
     /// value; `mutable` marks the exclusive writable form.
     View {
@@ -253,6 +261,7 @@ impl Expr {
                 value,
                 question_span,
             } => value.span().to(*question_span),
+            Expr::AsyncBlock { span, .. } => *span,
         }
     }
 }

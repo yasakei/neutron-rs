@@ -53,6 +53,14 @@ pub(crate) struct AsyncLayout {
     sub_field_base: u32,
     await_infos: Vec<AwaitInfo>,
     ret_ty: Ty,
+
+    /// Anonymous async blocks compiled as part of this layout. Maps the
+    /// generated function name to the block body.
+    pub(crate) anon_async_blocks: Vec<(
+        String,
+        Vec<Stmt>,
+        Option<ntsc_ast::expr::ReturnTypeAnnotation>,
+    )>,
 }
 
 /// Infer the type of an async local that has no explicit annotation.
@@ -76,6 +84,9 @@ pub(crate) fn async_local_ty(
                 Expr::Variable { name } => name.lexeme(),
                 Expr::Member { object, property } if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "async") => {
                     property.lexeme()
+                }
+                Expr::AsyncBlock { return_type, .. } => {
+                    return function_return_ty(return_type);
                 }
                 _ => return Ty::Void,
             };
@@ -130,7 +141,7 @@ pub(crate) fn collect_async_locals(
                 add(name.lexeme(), Ty::Any, fields);
             }
         }
-        Stmt::ForIn { variable, body, .. } => {
+        Stmt::ForIn { variable, body, .. } | Stmt::ForAwait { variable, body, .. } => {
             add(variable.lexeme(), Ty::Any, fields);
             collect_async_locals(body, program, fields, field_names, field_tys);
         }
@@ -253,6 +264,8 @@ pub(crate) fn build_async_layout(
     let sub_field_base = field_names.len() as u32;
 
     let mut await_infos = Vec::new();
+    let mut anon_async_blocks = Vec::new();
+    let mut anon_counter = 0usize;
     for (stmt_idx, stmt) in body.iter().enumerate() {
         let is_await_statement = matches!(
             stmt,
@@ -268,8 +281,13 @@ pub(crate) fn build_async_layout(
             }
         );
         if is_await_statement {
-            let (child_name, child_ret_ty) = await_callee_info(stmt, program)?;
-            let child_param_count = await_callee_param_count(program, &child_name)?;
+            let (child_name, child_ret_ty, anon_body, anon_ret) =
+                await_callee_info(stmt, program, &mut anon_counter)?;
+            if let Some(body) = anon_body {
+                anon_async_blocks.push((child_name.clone(), body, anon_ret));
+            }
+            let child_param_count =
+                await_callee_param_count(program, &child_name, &anon_async_blocks)?;
             // One sub-future slot per top-level await statement, plus its
             // resume metadata. Type checking guarantees awaits appear only
             // as statement-level calls, variable initializers, or return
@@ -301,53 +319,109 @@ pub(crate) fn build_async_layout(
         sub_field_base,
         await_infos,
         ret_ty,
+        anon_async_blocks,
     })
 }
+
+/// `(child_name, return_type, anon_body?, anon_return_type?)` returned by
+/// `await_callee_info`.
+pub(crate) type AwaitCalleeResult = (
+    String,
+    Ty,
+    Option<Vec<Stmt>>,
+    Option<ntsc_ast::expr::ReturnTypeAnnotation>,
+);
 
 pub(crate) fn await_callee_info(
     stmt: &Stmt,
     program: &Program,
-) -> Result<(String, Ty), crate::CodegenError> {
+    anon_counter: &mut usize,
+) -> Result<AwaitCalleeResult, crate::CodegenError> {
     let (callee_expr, _arguments) = await_stmt_parts(stmt)?;
-    let callee_name = match callee_expr {
-        Expr::Variable { name } => name.lexeme(),
-        Expr::Member { object, property } if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "async") => {
-            property.lexeme()
+    match callee_expr {
+        Expr::Variable { name } => {
+            let callee_name = name.lexeme();
+            if callee_name == "sleep" {
+                return Ok(("sleep".to_string(), Ty::Void, None, None));
+            }
+            let ret_ty = program
+                .statements
+                .iter()
+                .find_map(|s| match s {
+                    Stmt::AsyncFunction {
+                        name: fn_name,
+                        return_type,
+                        ..
+                    } if fn_name.lexeme() == callee_name => Some(function_return_ty(return_type)),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "internal: awaited callee `{callee_name}` is not a module-level async function"
+                    ))
+                })?;
+            Ok((callee_name.to_string(), ret_ty, None, None))
         }
-        _ => {
-            return Err(crate::CodegenError::LLVMError(
-                "await requires a call to a module-level async function".into(),
-            ));
+        Expr::Member { object, property }
+            if matches!(
+                object.as_ref(),
+                Expr::Variable { name } if name.lexeme() == "async"
+            ) =>
+        {
+            let callee_name = property.lexeme();
+            if callee_name == "sleep" {
+                return Ok(("sleep".to_string(), Ty::Void, None, None));
+            }
+            let ret_ty = program
+                .statements
+                .iter()
+                .find_map(|s| match s {
+                    Stmt::AsyncFunction {
+                        name: fn_name,
+                        return_type,
+                        ..
+                    } if fn_name.lexeme() == callee_name => Some(function_return_ty(return_type)),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "internal: awaited callee `{callee_name}` is not a module-level async function"
+                    ))
+                })?;
+            Ok((callee_name.to_string(), ret_ty, None, None))
         }
-    };
-    if callee_name == "sleep" {
-        return Ok(("sleep".to_string(), Ty::Void));
+        Expr::AsyncBlock {
+            body, return_type, ..
+        } => {
+            *anon_counter += 1;
+            let name = format!("__anon_async_{}", anon_counter);
+            let ret_ty = function_return_ty(return_type);
+            Ok((name, ret_ty, Some(body.clone()), return_type.clone()))
+        }
+        _ => Err(crate::CodegenError::LLVMError(
+            "await requires a call to a module-level async function".into(),
+        )),
     }
-    let ret_ty = program
-        .statements
-        .iter()
-        .find_map(|s| match s {
-            Stmt::AsyncFunction {
-                name: fn_name,
-                return_type,
-                ..
-            } if fn_name.lexeme() == callee_name => Some(function_return_ty(return_type)),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            crate::CodegenError::LLVMError(format!(
-                "internal: awaited callee `{callee_name}` is not a module-level async function"
-            ))
-        })?;
-    Ok((callee_name.to_string(), ret_ty))
 }
 
 pub(crate) fn await_callee_param_count(
     program: &Program,
     child_name: &str,
+    anon_async_blocks: &[(
+        String,
+        Vec<Stmt>,
+        Option<ntsc_ast::expr::ReturnTypeAnnotation>,
+    )],
 ) -> Result<usize, crate::CodegenError> {
     if child_name == "sleep" {
         return Ok(1);
+    }
+    // Anonymous async blocks have no params.
+    if anon_async_blocks
+        .iter()
+        .any(|(name, _, _)| name == child_name)
+    {
+        return Ok(0);
     }
     program
         .statements
@@ -459,12 +533,35 @@ pub(crate) fn emit_async_function<'ctx>(
 
     let layout = build_async_layout(program, name_token, params, return_type, &body)?;
 
+    // Emit anonymous async blocks first.
+    for (anon_name, anon_body, anon_ret) in &layout.anon_async_blocks {
+        let anon_name_token = ntsc_ast::token::Token::new(
+            ntsc_ast::token::TokenKind::Identifier(anon_name.clone()),
+            ntsc_ast::span::Span::dummy(),
+        );
+        let anon_decl = Stmt::AsyncFunction {
+            name: anon_name_token,
+            params: vec![],
+            return_type: anon_ret.clone(),
+            body: anon_body.clone(),
+        };
+        emit_async_function(context, module, program, &anon_decl, done, in_progress)?;
+    }
+
     // Emit awaited callees first so their future struct types exist when
     // this future's fields reference them (reverse topological order). The
     // built-in `async.sleep` has no emitted callee: its future struct and
     // poll function are declared as part of the runtime.
     for info in &layout.await_infos {
         if info.child_name == "sleep" {
+            continue;
+        }
+        // Anonymous async blocks were already emitted above.
+        if layout
+            .anon_async_blocks
+            .iter()
+            .any(|(n, _, _)| n == &info.child_name)
+        {
             continue;
         }
         let callee = program

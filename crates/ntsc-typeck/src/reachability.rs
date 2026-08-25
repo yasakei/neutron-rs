@@ -69,7 +69,7 @@ impl ReachabilityChecker {
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
                 self.check_stmt(body);
             }
-            Stmt::For { body, .. } | Stmt::ForIn { body, .. } => {
+            Stmt::For { body, .. } | Stmt::ForIn { body, .. } | Stmt::ForAwait { body, .. } => {
                 self.check_stmt(body);
             }
             Stmt::Function { body, .. } => {

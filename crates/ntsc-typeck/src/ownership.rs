@@ -955,6 +955,16 @@ impl OwnershipChecker {
             } => {
                 self.check_for_in(variable, iterable, body);
             }
+            Stmt::ForAwait {
+                variable: _,
+                producer,
+                body,
+            } => {
+                let _ = self.check_expr(producer);
+                self.push_scope();
+                self.check_stmt(body);
+                self.pop_scope();
+            }
             Stmt::Return { value } => {
                 if let Some(expr) = value {
                     let _ = self.check_expr(expr);
@@ -1479,6 +1489,14 @@ impl OwnershipChecker {
             Expr::Await {
                 callee, arguments, ..
             } => self.check_call(callee, arguments, true),
+            Expr::AsyncBlock { body, .. } => {
+                self.push_scope();
+                for stmt in body {
+                    self.check_stmt(stmt);
+                }
+                self.pop_scope();
+                None
+            }
             Expr::View {
                 target, mutable, ..
             } => {
@@ -2141,6 +2159,10 @@ fn collect_stmt_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
             collect_expr_uses(iterable, uses);
             collect_stmt_uses(body, uses);
         }
+        Stmt::ForAwait { producer, body, .. } => {
+            collect_expr_uses(producer, uses);
+            collect_stmt_uses(body, uses);
+        }
         Stmt::Return { value } => {
             if let Some(value) = value {
                 collect_expr_uses(value, uses);
@@ -2231,6 +2253,11 @@ fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
             collect_expr_uses(callee, uses);
             for argument in arguments {
                 collect_expr_uses(argument, uses);
+            }
+        }
+        Expr::AsyncBlock { body, .. } => {
+            for stmt in body {
+                collect_stmt_uses(stmt, uses);
             }
         }
         Expr::Assign { name, value } => {

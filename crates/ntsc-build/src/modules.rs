@@ -606,6 +606,15 @@ fn stmt_byte_range(stmt: &Stmt) -> (usize, usize) {
             acc = add_expr(iterable, acc);
             add_sub(body, acc)
         }
+        ForAwait {
+            variable,
+            producer,
+            body,
+        } => {
+            acc = add_span(variable.span, acc);
+            acc = add_expr(producer, acc);
+            add_sub(body, acc)
+        }
         Function {
             name,
             params,

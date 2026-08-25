@@ -1336,6 +1336,15 @@ impl Context {
                 iterable: self.transform_expr(iterable, env),
                 body: Box::new(self.transform_stmt(*body, env)),
             },
+            Stmt::ForAwait {
+                variable,
+                producer,
+                body,
+            } => Stmt::ForAwait {
+                variable,
+                producer: self.transform_expr(producer, env),
+                body: Box::new(self.transform_stmt(*body, env)),
+            },
             Stmt::Class {
                 name,
                 generic_params,
@@ -1561,6 +1570,15 @@ impl Context {
                     .into_iter()
                     .map(|e| self.transform_expr(e, env))
                     .collect(),
+                span,
+            },
+            Expr::AsyncBlock {
+                body,
+                return_type,
+                span,
+            } => Expr::AsyncBlock {
+                body,
+                return_type,
                 span,
             },
             Expr::View {
@@ -1838,6 +1856,7 @@ fn collect_returns_from_stmt<'a>(statement: &'a Stmt, returns: &mut Vec<&'a Expr
         | Stmt::DoWhile { body, .. }
         | Stmt::For { body, .. }
         | Stmt::ForIn { body, .. }
+        | Stmt::ForAwait { body, .. }
         | Stmt::Unsafe { body }
         | Stmt::Quiet { body, .. } => collect_returns_from_stmt(body, returns),
         Stmt::Match {

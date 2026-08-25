@@ -389,13 +389,17 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Async => {
                 self.advance();
-                if !self.check(&TokenKind::Fun) {
-                    return Err(ParseError {
-                        message: "expected 'fun' after 'async'".into(),
+                if self.check(&TokenKind::Fun) {
+                    self.parse_async_function_declaration()
+                } else if self.check(&TokenKind::LeftBrace) {
+                    let block = self.parse_async_block_body(self.peek().span)?;
+                    Ok(Stmt::Expression { expression: block })
+                } else {
+                    Err(ParseError {
+                        message: "expected 'fun' or '{' after 'async'".into(),
                         span: self.peek().span,
-                    });
+                    })
                 }
-                self.parse_async_function_declaration()
             }
             TokenKind::Class => self.parse_class_declaration(),
             TokenKind::Enum => self.parse_enum_declaration(),
@@ -778,6 +782,32 @@ impl<'src> Parser<'src> {
             params,
             return_type,
             body,
+        })
+    }
+
+    /// `async { body }` — inline async block that compiles to an anonymous
+    /// future.
+    fn parse_async_block(&mut self) -> Result<Expr, ParseError> {
+        let async_tok = self.advance();
+        self.parse_async_block_body(async_tok.span)
+    }
+
+    /// Parse the `{ ... }` body of an async block. `async_tok_span` is the
+    /// span of the `async` keyword that was already consumed.
+    fn parse_async_block_body(&mut self, async_tok_span: Span) -> Result<Expr, ParseError> {
+        self.expect(TokenKind::LeftBrace, "expected '{' after 'async'")?;
+        let mut body = Vec::new();
+        self.skip_newlines();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            body.push(self.parse_statement()?);
+            self.skip_newlines();
+        }
+        let close = self.expect(TokenKind::RightBrace, "expected '}'")?;
+        let span = async_tok_span.to(close.span);
+        Ok(Expr::AsyncBlock {
+            body,
+            return_type: None,
+            span,
         })
     }
 
@@ -1275,6 +1305,32 @@ impl<'src> Parser<'src> {
     fn parse_for_statement(&mut self) -> Result<Stmt, ParseError> {
         let _for_token = self.advance();
 
+        // `for await x in producer { ... }`
+        if self.check(&TokenKind::Await) {
+            self.advance();
+            let variable = self.expect_ident("expected variable name after 'for await'")?;
+            self.expect(TokenKind::In, "expected 'in' after 'for await variable'")?;
+            let producer = self.parse_expression()?;
+            self.skip_newlines();
+            self.expect(TokenKind::LeftBrace, "expected '{' for for-await body")?;
+            let mut body = Vec::new();
+            self.skip_newlines();
+            while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+                body.push(self.parse_statement()?);
+                self.skip_newlines();
+            }
+            self.expect(TokenKind::RightBrace, "expected '}'")?;
+            return Ok(Stmt::ForAwait {
+                variable,
+                producer,
+                body: Box::new(Stmt::Block {
+                    statements: body,
+                    open_span: Span::dummy(),
+                    close_span: Span::dummy(),
+                }),
+            });
+        }
+
         if self.check(&TokenKind::LeftParen) {
             // Look ahead for `for (var key in expr)`; rewind to the saved
             // position if it does not match.
@@ -1704,6 +1760,16 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Await => {
                 let await_tok = self.advance();
+                if self.check(&TokenKind::Async) && matches!(self.peek_at(1), TokenKind::LeftBrace)
+                {
+                    let block = self.parse_async_block()?;
+                    let span = await_tok.span.to(block.span());
+                    return Ok(Expr::Await {
+                        callee: Box::new(block),
+                        arguments: vec![],
+                        span,
+                    });
+                }
                 let operand = self.parse_precedence(Precedence::Call)?;
                 match operand {
                     Expr::Call {
@@ -1720,6 +1786,21 @@ impl<'src> Parser<'src> {
                         message: "await requires an async function call".into(),
                         span: other.span(),
                     }),
+                }
+            }
+            TokenKind::Async => {
+                if matches!(self.peek_at(1), TokenKind::LeftBrace) {
+                    self.parse_async_block()
+                } else if matches!(self.peek_at(1), TokenKind::Dot) {
+                    let tok = self.advance();
+                    Ok(Expr::Variable {
+                        name: Token::new(TokenKind::Identifier("async".to_string()), tok.span),
+                    })
+                } else {
+                    Err(ParseError {
+                        message: "unexpected 'async' in expression".into(),
+                        span: self.peek().span,
+                    })
                 }
             }
             TokenKind::View => {
@@ -1761,14 +1842,6 @@ impl<'src> Parser<'src> {
                 })
             }
 
-            TokenKind::Async if matches!(self.peek_at(1), TokenKind::Dot) => {
-                // `async` is a reserved word, but it also names the async module
-                // (`async.sleep`, ...). Accept `async.` as a module reference.
-                let tok = self.advance();
-                Ok(Expr::Variable {
-                    name: Token::new(TokenKind::Identifier("async".to_string()), tok.span),
-                })
-            }
             TokenKind::LeftBracket => self.parse_array_literal(),
             TokenKind::LeftBrace => self.parse_object_literal(),
             TokenKind::Fun => self.parse_lambda(),

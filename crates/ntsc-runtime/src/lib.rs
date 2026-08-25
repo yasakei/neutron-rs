@@ -566,12 +566,18 @@ fn throw_string(message: &str) -> i64 {
 pub type AsyncPollFn = extern "C" fn(i64) -> i8;
 
 thread_local! {
-    /// Cooperative task stack: each entry is the poll function and future
-    /// handle of an in-progress async function. Suspending on a
-    /// sub-future pushes the sub-future; completing pops the current entry
-    /// so the parent (now on top) is re-polled.
+    /// Per-context cooperative task stack: each entry is the poll function
+    /// and future handle of an in-progress async function.
     static ASYNC_TASKS: RefCell<Vec<(AsyncPollFn, i64)>> = const { RefCell::new(Vec::new()) };
+
+    /// Stack of async contexts for `wait_any`/`wait_all`. Each entry is a
+    /// saved `(ASYNC_TASKS, result)` pair. The active context is always in
+    /// `ASYNC_TASKS`; pushing/saving/restoring swaps the TLS.
+    static ASYNC_STACKS: RefCell<Vec<AsyncStackEntry>> = const { RefCell::new(Vec::new()) };
 }
+
+/// A saved async context: the task list and result of the enclosing scope.
+type AsyncStackEntry = (Vec<(AsyncPollFn, i64)>, i64);
 
 /// Register a new `async.sleep(ms)` future and return its handle.
 #[unsafe(no_mangle)]
@@ -593,7 +599,50 @@ pub extern "C" fn ntsc_async_sleep_poll(id: i64) -> i8 {
     registry::async_sleep_poll(id)
 }
 
-/// Drive the root future to completion.
+/// Save the current async context and start a fresh one.
+///
+/// Pushes the current `(ASYNC_TASKS, result)` onto `ASYNC_STACKS` and
+/// replaces `ASYNC_TASKS` with an empty vec so `ntsc_async_push` and
+/// `ntsc_async_run` operate on a local context. Returns the previous
+/// result handle (NULL if this is the first nesting level).
+fn save_async_context() -> i64 {
+    ASYNC_STACKS.with(|stacks| {
+        ASYNC_TASKS.with(|tasks| {
+            let prev_tasks = tasks.borrow().clone();
+            let prev_result =
+                ASYNC_STACKS.with(|s| s.borrow().last().map(|(_, r)| *r).unwrap_or(NULL));
+            stacks.borrow_mut().push((prev_tasks, prev_result));
+            tasks.borrow_mut().clear();
+            prev_result
+        })
+    })
+}
+
+/// Restore a previously saved async context, returning the current
+/// result handle.
+fn restore_async_context(result: i64) -> i64 {
+    ASYNC_STACKS.with(|stacks| {
+        ASYNC_TASKS.with(|tasks| {
+            if let Some((saved, _)) = stacks.borrow_mut().pop() {
+                *tasks.borrow_mut() = saved;
+            }
+            let current_result = stacks.borrow().last().map(|(_, r)| *r).unwrap_or(NULL);
+            let _ = result;
+            current_result
+        })
+    })
+}
+
+/// Set the result handle for the current async context.
+fn set_async_context_result(result: i64) {
+    ASYNC_STACKS.with(|stacks| {
+        if let Some(entry) = stacks.borrow_mut().last_mut() {
+            entry.1 = result;
+        }
+    });
+}
+
+/// Drive the root future to completion in a fresh async context.
 ///
 /// The root's poll function and handle are pushed onto the thread-local
 /// task stack; the driver repeatedly polls the topmost task. A task that
@@ -604,11 +653,10 @@ pub extern "C" fn ntsc_async_run(poll_fn: AsyncPollFn, root: i64) {
     if root == NULL {
         return;
     }
+    save_async_context();
     ASYNC_TASKS.with(|tasks| {
         tasks.borrow_mut().push((poll_fn, root));
         loop {
-            // Peek the top task without holding the TLS borrow across the
-            // poll: the poll may call `ntsc_async_push`, which re-borrows.
             let (poll, future, depth_before) = {
                 let tasks = tasks.borrow();
                 let Some(&(poll, future)) = tasks.last() else {
@@ -635,9 +683,9 @@ pub extern "C" fn ntsc_async_run(poll_fn: AsyncPollFn, root: i64) {
     });
 }
 
-/// Schedule a sub-future: push `(poll_fn, future)` onto the task stack.
-/// Called by a poll function right before it returns `0` at a suspension
-/// point, so the driver polls the sub-future next.
+/// Schedule a sub-future: push `(poll_fn, future)` onto the current task
+/// stack. Called by a poll function right before it returns `0` at a
+/// suspension point, so the driver polls the sub-future next.
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_async_push(poll_fn: AsyncPollFn, future: i64) {
     if future == NULL {
@@ -646,6 +694,197 @@ pub extern "C" fn ntsc_async_push(poll_fn: AsyncPollFn, future: i64) {
     ASYNC_TASKS.with(|tasks| {
         tasks.borrow_mut().push((poll_fn, future));
     });
+}
+
+/// Run two async branches concurrently; return the result of whichever
+/// finishes first. The losing branch is dropped automatically.
+///
+/// Called from within a poll function. Each branch is pushed onto its own
+/// local task stack and polled round-robin until one completes. The
+/// winner's result handle is stored in the current async context.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_wait_any(
+    poll_a: AsyncPollFn,
+    future_a: i64,
+    poll_b: AsyncPollFn,
+    future_b: i64,
+) {
+    if future_a == NULL && future_b == NULL {
+        return;
+    }
+    if future_a == NULL || future_b == NULL {
+        let (poll, fut) = if future_a != NULL {
+            (poll_a, future_a)
+        } else {
+            (poll_b, future_b)
+        };
+        ASYNC_TASKS.with(|tasks| {
+            tasks.borrow_mut().push((poll, fut));
+        });
+        return;
+    }
+    let _ = save_async_context();
+    ASYNC_TASKS.with(|tasks| {
+        tasks.borrow_mut().push((poll_a, future_a));
+    });
+    ASYNC_STACKS.with(|stacks| {
+        stacks.borrow_mut().push((vec![(poll_b, future_b)], NULL));
+    });
+    let result = loop {
+        let (poll, fut, len_a) = ASYNC_TASKS.with(|tasks| {
+            let t = tasks.borrow();
+            let Some(&(p, f)) = t.last() else {
+                return (None, NULL, 0);
+            };
+            (Some(p), f, t.len())
+        });
+        let Some(poll_fn) = poll else {
+            break NULL;
+        };
+        let done_a = poll_fn(fut) == 1;
+        let (pushed_a, done_a_final) = ASYNC_TASKS.with(|tasks| {
+            let mut t = tasks.borrow_mut();
+            let pushed = t.len() > len_a;
+            if done_a {
+                t.pop();
+            }
+            (pushed, done_a)
+        });
+        if done_a_final {
+            break ASYNC_STACKS.with(|s| s.borrow().last().map(|(_, r)| *r).unwrap_or(NULL));
+        }
+        let (poll_b, fut_b, len_b) = ASYNC_STACKS.with(|stacks| {
+            let mut s = stacks.borrow_mut();
+            let Some(last) = s.last_mut() else {
+                return (None, NULL, 0);
+            };
+            let Some(&(p, f)) = last.0.last() else {
+                return (None, NULL, 0);
+            };
+            let len = last.0.len();
+            (Some(p), f, len)
+        });
+        let Some(poll_b_fn) = poll_b else {
+            break NULL;
+        };
+        let done_b = poll_b_fn(fut_b) == 1;
+        let pushed_b = ASYNC_STACKS.with(|stacks| {
+            let mut s = stacks.borrow_mut();
+            let Some(last) = s.last_mut() else {
+                return false;
+            };
+            let pushed = last.0.len() > len_b;
+            if done_b {
+                last.0.pop();
+            }
+            pushed
+        });
+        if done_b {
+            break ASYNC_STACKS.with(|s| s.borrow().last().map(|(_, r)| *r).unwrap_or(NULL));
+        }
+        if !pushed_a && !pushed_b {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    set_async_context_result(result);
+    let _ = restore_async_context(NULL);
+}
+
+/// Run two async branches concurrently; wait for both to finish and
+/// return the result of the second branch (first branch's result is
+/// discarded).
+///
+/// Called from within a poll function. Each branch is pushed onto its own
+/// local task stack and polled round-robin until both complete.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_wait_all(
+    poll_a: AsyncPollFn,
+    future_a: i64,
+    poll_b: AsyncPollFn,
+    future_b: i64,
+) {
+    if future_a == NULL && future_b == NULL {
+        return;
+    }
+    let _ = save_async_context();
+    if future_a != NULL {
+        ASYNC_TASKS.with(|tasks| {
+            tasks.borrow_mut().push((poll_a, future_a));
+        });
+    }
+    if future_b != NULL {
+        ASYNC_STACKS.with(|stacks| {
+            stacks.borrow_mut().push((vec![(poll_b, future_b)], NULL));
+        });
+    }
+    let mut done_a = future_a == NULL;
+    let mut done_b = future_b == NULL;
+    let mut result = NULL;
+    while !done_a || !done_b {
+        if !done_a {
+            let (poll, fut, len_a) = ASYNC_TASKS.with(|tasks| {
+                let t = tasks.borrow();
+                let Some(&(p, f)) = t.last() else {
+                    return (None, NULL, 0);
+                };
+                (Some(p), f, t.len())
+            });
+            if let Some(poll_fn) = poll {
+                let d = poll_fn(fut) == 1;
+                let pushed = ASYNC_TASKS.with(|tasks| {
+                    let mut t = tasks.borrow_mut();
+                    let pushed = t.len() > len_a;
+                    if d {
+                        t.pop();
+                    }
+                    pushed
+                });
+                done_a = d && !pushed;
+            } else {
+                done_a = true;
+            }
+        }
+        if !done_b {
+            let (poll_b, fut_b, len_b) = ASYNC_STACKS.with(|stacks| {
+                let mut s = stacks.borrow_mut();
+                let Some(last) = s.last_mut() else {
+                    return (None, NULL, 0);
+                };
+                let Some(&(p, f)) = last.0.last() else {
+                    return (None, NULL, 0);
+                };
+                let len = last.0.len();
+                (Some(p), f, len)
+            });
+            if let Some(poll_b_fn) = poll_b {
+                let d = poll_b_fn(fut_b) == 1;
+                let pushed = ASYNC_STACKS.with(|stacks| {
+                    let mut s = stacks.borrow_mut();
+                    let Some(last) = s.last_mut() else {
+                        return false;
+                    };
+                    let pushed = last.0.len() > len_b;
+                    if d {
+                        last.0.pop();
+                    }
+                    pushed
+                });
+                if d && !pushed {
+                    done_b = true;
+                    result =
+                        ASYNC_STACKS.with(|s| s.borrow().last().map(|(_, r)| *r).unwrap_or(NULL));
+                }
+            } else {
+                done_b = true;
+            }
+        }
+        if done_a && done_b {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    set_async_context_result(result);
+    let _ = restore_async_context(NULL);
 }
 
 #[cfg(test)]

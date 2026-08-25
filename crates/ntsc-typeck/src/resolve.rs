@@ -483,6 +483,10 @@ impl TypeChecker {
                 iterable: condition,
                 ..
             }
+            | Stmt::ForAwait {
+                producer: condition,
+                ..
+            }
             | Stmt::Match {
                 expression: condition,
                 ..
@@ -681,6 +685,24 @@ impl TypeChecker {
                 };
                 self.symbols.push_scope();
                 if let Err(msg) = self.symbols.define(variable.lexeme(), elem_ty) {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: msg,
+                        span: variable.span,
+                    });
+                }
+                self.check_statement(body);
+                self.symbols.pop_scope();
+            }
+            Stmt::ForAwait {
+                variable,
+                producer,
+                body,
+            } => {
+                let _producer_ty = self.check_expression(producer);
+                self.symbols.push_scope();
+                if let Err(msg) = self.symbols.define(variable.lexeme(), Ty::Any) {
                     self.errors.push(TypeError {
                         code: None,
                         help: None,
@@ -1892,6 +1914,14 @@ impl TypeChecker {
                 arguments,
                 span,
             } => self.check_await(callee, arguments, *span),
+            Expr::AsyncBlock { body, .. } => {
+                self.symbols.push_scope();
+                for stmt in body {
+                    self.check_statement(stmt);
+                }
+                self.symbols.pop_scope();
+                Some(Ty::Any)
+            }
             Expr::View {
                 target,
                 mutable,
@@ -2181,6 +2211,14 @@ impl TypeChecker {
                 };
                 self.check_function_call_args(callee_name, arguments, span);
                 Some(ret_ty)
+            }
+            Expr::AsyncBlock { body, .. } => {
+                self.symbols.push_scope();
+                for stmt in body {
+                    self.check_statement(stmt);
+                }
+                self.symbols.pop_scope();
+                Some(Ty::Any)
             }
             other => {
                 let _ = self.check_expression(other);
@@ -3023,6 +3061,7 @@ fn op_lexeme(kind: &TokenKind) -> &'static str {
 fn find_await(expr: &Expr) -> Option<Span> {
     match expr {
         Expr::Await { span, .. } => Some(*span),
+        Expr::AsyncBlock { .. } => None,
         Expr::Lambda { .. } => None,
         Expr::Literal { .. } | Expr::Variable { .. } | Expr::This { .. } => None,
         Expr::Binary { left, right, .. }
@@ -3124,6 +3163,9 @@ fn find_await_in_stmt(stmt: &Stmt) -> Option<Span> {
         Stmt::ForIn { iterable, body, .. } => {
             find_await(iterable).or_else(|| find_await_in_stmt(body))
         }
+        Stmt::ForAwait { producer, body, .. } => {
+            find_await(producer).or_else(|| find_await_in_stmt(body))
+        }
         Stmt::Match {
             expression,
             cases,
@@ -3203,7 +3245,7 @@ fn async_stmt_children(stmt: &Stmt) -> Vec<&Stmt> {
             children.push(body.as_ref());
             children
         }
-        Stmt::ForIn { body, .. } => vec![body.as_ref()],
+        Stmt::ForIn { body, .. } | Stmt::ForAwait { body, .. } => vec![body.as_ref()],
         Stmt::Match {
             cases,
             default_case,

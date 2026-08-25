@@ -323,6 +323,13 @@ pub(crate) fn emit_statement_in_function<'ctx>(
         } => {
             emit_for_in(fn_ctx, variable, iterable, body)?;
         }
+        Stmt::ForAwait {
+            variable,
+            producer,
+            body,
+        } => {
+            emit_for_await(fn_ctx, variable, producer, body)?;
+        }
         Stmt::Break { .. } => {
             fn_ctx.emit_break()?;
         }

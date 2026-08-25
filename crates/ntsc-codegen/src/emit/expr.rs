@@ -636,6 +636,10 @@ pub(crate) fn emit_expression<'ctx>(
             "internal: await must be lowered by the async state machine, not emitted directly"
                 .into(),
         )),
+        Expr::AsyncBlock { .. } => Err(crate::CodegenError::LLVMError(
+            "internal: async blocks must be lowered by the async state machine or await, not emitted directly"
+                .into(),
+        )),
         Expr::PostfixUnary { op, left } => {
             // i++ / i-- — increment/decrement a variable in place and return
             // the OLD value.

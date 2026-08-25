@@ -243,6 +243,19 @@ fn shift_expr(expr: &mut Expr, base: usize) {
             shift_expr(value, base);
             shift_span(question_span, base);
         }
+        Expr::AsyncBlock {
+            body,
+            return_type,
+            span,
+        } => {
+            for stmt in body {
+                shift_stmt(stmt, base);
+            }
+            if let Some(rt) = return_type {
+                shift_return(rt, base);
+            }
+            shift_span(span, base);
+        }
     }
 }
 
@@ -335,6 +348,15 @@ fn shift_stmt(stmt: &mut Stmt, base: usize) {
         } => {
             shift_token(variable, base);
             shift_expr(iterable, base);
+            shift_stmt(body, base);
+        }
+        Stmt::ForAwait {
+            variable,
+            producer,
+            body,
+        } => {
+            shift_token(variable, base);
+            shift_expr(producer, base);
             shift_stmt(body, base);
         }
         Stmt::Function {

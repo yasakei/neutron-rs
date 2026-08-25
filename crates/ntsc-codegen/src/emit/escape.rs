@@ -77,6 +77,7 @@ pub(crate) fn expr_mentions_var(expr: &Expr, var: &str) -> bool {
         | Expr::Await {
             callee, arguments, ..
         } => expr_mentions_var(callee, var) || arguments.iter().any(|a| expr_mentions_var(a, var)),
+        Expr::AsyncBlock { body, .. } => body.iter().any(|s| stmt_mentions_var(s, var)),
         Expr::Assign { name, value } => name.lexeme() == var || expr_mentions_var(value, var),
         Expr::IndexGet { object, index } => {
             expr_mentions_var(object, var) || expr_mentions_var(index, var)
@@ -182,6 +183,9 @@ pub(crate) fn stmt_mentions_var(stmt: &Stmt, var: &str) -> bool {
         }
         Stmt::ForIn { iterable, body, .. } => {
             expr_mentions_var(iterable, var) || stmt_mentions_var(body, var)
+        }
+        Stmt::ForAwait { producer, body, .. } => {
+            expr_mentions_var(producer, var) || stmt_mentions_var(body, var)
         }
         Stmt::Return { value } => value.as_ref().is_some_and(|v| expr_mentions_var(v, var)),
         Stmt::Throw { value } => expr_mentions_var(value, var),
@@ -309,6 +313,7 @@ pub(crate) fn expr_uses_var_safely(expr: &Expr, var: &str, ctx: ExprCtx, kind: E
                     .iter()
                     .all(|a| expr_uses_var_safely(a, var, ExprCtx::Data, kind))
         }
+        Expr::AsyncBlock { body, .. } => body.iter().all(|s| stmt_uses_var_safely(s, var, kind)),
         Expr::Assign { name, value } => {
             // Reassigning the object would drop its slot-allocated identity.
             name.lexeme() != var && expr_uses_var_safely(value, var, ExprCtx::Data, kind)
@@ -472,6 +477,10 @@ pub(crate) fn stmt_uses_var_safely(stmt: &Stmt, var: &str, kind: EscapeKind) -> 
         }
         Stmt::ForIn { iterable, body, .. } => {
             expr_uses_var_safely(iterable, var, ExprCtx::Data, kind)
+                && stmt_uses_var_safely(body, var, kind)
+        }
+        Stmt::ForAwait { producer, body, .. } => {
+            expr_uses_var_safely(producer, var, ExprCtx::Data, kind)
                 && stmt_uses_var_safely(body, var, kind)
         }
         Stmt::Match {
@@ -691,7 +700,7 @@ pub(crate) fn collect_class_drop_candidates(
                 }
                 collect_class_drop_candidates(std::slice::from_ref(body), candidates, module);
             }
-            Stmt::ForIn { body, .. } => {
+            Stmt::ForIn { body, .. } | Stmt::ForAwait { body, .. } => {
                 collect_class_drop_candidates(std::slice::from_ref(body), candidates, module);
             }
             Stmt::Match {
@@ -779,7 +788,9 @@ pub(crate) fn collect_copy_edges(stmts: &[Stmt], edges: &mut Vec<(String, String
                 }
                 collect_copy_edges(std::slice::from_ref(body), edges);
             }
-            Stmt::ForIn { body, .. } => collect_copy_edges(std::slice::from_ref(body), edges),
+            Stmt::ForIn { body, .. } | Stmt::ForAwait { body, .. } => {
+                collect_copy_edges(std::slice::from_ref(body), edges)
+            }
             Stmt::Match {
                 cases,
                 default_case,

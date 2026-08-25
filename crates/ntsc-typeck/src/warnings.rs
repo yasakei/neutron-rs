@@ -206,6 +206,17 @@ impl Linter {
                 self.check_stmt(body);
                 self.end_scope();
             }
+            Stmt::ForAwait {
+                variable,
+                producer,
+                body,
+            } => {
+                self.check_expr(producer);
+                self.scopes.push(HashMap::new());
+                self.declare(variable.lexeme(), variable.span);
+                self.check_stmt(body);
+                self.end_scope();
+            }
             Stmt::Function { body, .. }
             | Stmt::AsyncFunction { body, .. }
             | Stmt::Test { body, .. } => {
@@ -404,6 +415,13 @@ impl Linter {
                 for argument in arguments {
                     self.check_expr(argument);
                 }
+            }
+            Expr::AsyncBlock { body, .. } => {
+                self.scopes.push(HashMap::new());
+                for stmt in body {
+                    self.check_stmt(stmt);
+                }
+                self.end_scope();
             }
             Expr::View { target, .. } => self.check_expr(target),
             Expr::Borrow { target, .. } | Expr::RawDeref { target, .. } => self.check_expr(target),

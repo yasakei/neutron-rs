@@ -499,3 +499,21 @@ pub(crate) fn emit_for_in<'ctx>(
     }
     Ok(())
 }
+
+/// `for await x in producer { body }` — evaluate the producer (which
+/// returns an array), then iterate over it.
+pub(crate) fn emit_for_await<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    variable: &ntsc_ast::token::Token,
+    producer: &Expr,
+    body: &Stmt,
+) -> Result<(), crate::CodegenError> {
+    let producer_val = emit_expression(fn_ctx, producer)?;
+    emit_drop_borrowed_fresh_args(
+        fn_ctx,
+        std::slice::from_ref(producer),
+        std::slice::from_ref(&producer_val),
+        &[],
+    )?;
+    emit_for_in(fn_ctx, variable, producer, body)
+}
