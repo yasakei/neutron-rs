@@ -71,12 +71,20 @@ pub(crate) fn stdlib_return_ty(name: &str) -> Ty {
         | "ntsc_strings_char_at"
         | "ntsc_strings_from_char_code" => Ty::String,
 
-        "ntsc_json_parse"
+        "ntsc_csv_parse"
+        | "ntsc_csv_stringify"
+        | "ntsc_toml_parse"
+        | "ntsc_toml_stringify"
+        | "ntsc_yaml_parse"
+        | "ntsc_yaml_stringify"
+        | "ntsc_json_parse"
         | "ntsc_json_stringify"
         | "ntsc_json_get"
         | "ntsc_json_keys"
         | "ntsc_json_stringify_pretty" => Ty::String,
         "ntsc_json_is_valid" | "ntsc_json_has" => Ty::Bool,
+
+        "ntsc_testing_bench" => Ty::Float,
 
         "ntsc_http_get" | "ntsc_http_post" | "ntsc_http_put" | "ntsc_http_delete"
         | "ntsc_http_head" | "ntsc_http_patch" | "ntsc_http_request" => Ty::String,

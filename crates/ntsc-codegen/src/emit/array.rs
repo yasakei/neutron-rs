@@ -886,67 +886,111 @@ pub(crate) fn emit_testing_op<'ctx>(
     arg_values: &[TypedValue<'ctx>],
 ) -> Result<TypedValue<'ctx>, crate::CodegenError> {
     let ctx = fn_ctx.context;
-    let runtime_fn = match prop_name {
-        "assert_true" | "assert_false" => format!("ntsc_testing_{prop_name}"),
-        "assert_eq" | "assert_ne" => {
-            let a = arg_values.first().ok_or_else(|| {
-                crate::CodegenError::LLVMError(format!(
-                    "testing.{prop_name} requires two arguments"
-                ))
+    match prop_name {
+        "bench" => {
+            let fn_arg = arg_values.first().ok_or_else(|| {
+                crate::CodegenError::LLVMError("testing.bench requires a function argument".into())
             })?;
-            let suffix = match a.ntsc_type {
-                Ty::Int => "int",
-                Ty::Float => "float",
-                Ty::Bool => "bool",
-                Ty::String => "string",
+            let Ty::Function { .. } = &fn_arg.ntsc_type else {
+                return Err(crate::CodegenError::LLVMError(format!(
+                    "testing.bench first argument must be a function, got `{}`",
+                    fn_arg.ntsc_type
+                )));
+            };
+            let iters = arg_values.get(1).ok_or_else(|| {
+                crate::CodegenError::LLVMError(
+                    "testing.bench requires an iterations argument".into(),
+                )
+            })?;
+            let iters = coerce_value(fn_ctx, iters.clone(), &Ty::Int)?;
+            let warmup = arg_values.get(2).cloned().unwrap_or_else(|| {
+                TypedValue::new(ctx.i64_type().const_int(1, false).into(), Ty::Int)
+            });
+            let warmup = coerce_value(fn_ctx, warmup, &Ty::Int)?;
+            let fn_ptr = fn_arg.value.into_pointer_value();
+            let bench_fn = fn_ctx
+                .module
+                .get_function("ntsc_testing_bench")
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError("ntsc_testing_bench not declared".into())
+                })?;
+            let result = fn_ctx.builder.build_call(
+                bench_fn,
+                &[fn_ptr.into(), iters.value.into(), warmup.value.into()],
+                "bench_result",
+            )?;
+            let val = call_result_to_value(fn_ctx, &result);
+            Ok(TypedValue::new(val, Ty::Float))
+        }
+        _ => {
+            let runtime_fn = match prop_name {
+                "assert_true" | "assert_false" => format!("ntsc_testing_{prop_name}"),
+                "assert_eq" | "assert_ne" => {
+                    let a = arg_values.first().ok_or_else(|| {
+                        crate::CodegenError::LLVMError(format!(
+                            "testing.{prop_name} requires two arguments"
+                        ))
+                    })?;
+                    let suffix = match a.ntsc_type {
+                        Ty::Int => "int",
+                        Ty::Float => "float",
+                        Ty::Bool => "bool",
+                        Ty::String => "string",
+                        _ => {
+                            return Err(crate::CodegenError::LLVMError(format!(
+                                "testing.{prop_name} requires int, float, bool, or string arguments, got `{}`",
+                                a.ntsc_type
+                            )));
+                        }
+                    };
+                    format!("ntsc_testing_{prop_name}_{suffix}")
+                }
                 _ => {
                     return Err(crate::CodegenError::LLVMError(format!(
-                        "testing.{prop_name} requires int, float, bool, or string arguments, got `{}`",
-                        a.ntsc_type
+                        "unsupported testing operation `{prop_name}`"
                     )));
                 }
             };
-            format!("ntsc_testing_{prop_name}_{suffix}")
-        }
-        _ => {
-            return Err(crate::CodegenError::LLVMError(format!(
-                "unsupported testing operation `{prop_name}`"
-            )));
-        }
-    };
-    let fn_val = fn_ctx
-        .module
-        .get_function(&runtime_fn)
-        .ok_or_else(|| crate::CodegenError::LLVMError(format!("{runtime_fn} not declared")))?;
+            let fn_val = fn_ctx.module.get_function(&runtime_fn).ok_or_else(|| {
+                crate::CodegenError::LLVMError(format!("{runtime_fn} not declared"))
+            })?;
 
-    let param_tys = fn_val.get_type().get_param_types();
-    let mut llvm_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
-    if prop_name == "assert_eq" || prop_name == "assert_ne" {
-        let a = arg_values.first().ok_or_else(|| {
-            crate::CodegenError::LLVMError(format!("testing.{prop_name} requires two arguments"))
-        })?;
-        let b = arg_values.get(1).ok_or_else(|| {
-            crate::CodegenError::LLVMError(format!("testing.{prop_name} requires two arguments"))
-        })?;
-        let a = coerce_value_to_llvm(fn_ctx, a.clone(), &param_tys[0])?;
-        let b = coerce_value_to_llvm(fn_ctx, b.clone(), &param_tys[1])?;
-        llvm_args.push(a);
-        llvm_args.push(b);
-    } else if prop_name == "assert_true" || prop_name == "assert_false" {
-        let cond = arg_values.first().ok_or_else(|| {
-            crate::CodegenError::LLVMError(format!("testing.{prop_name} requires an argument"))
-        })?;
-        let cond = coerce_value_to_llvm(fn_ctx, cond.clone(), &param_tys[0])?;
-        llvm_args.push(cond);
+            let param_tys = fn_val.get_type().get_param_types();
+            let mut llvm_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
+            if prop_name == "assert_eq" || prop_name == "assert_ne" {
+                let a = arg_values.first().ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "testing.{prop_name} requires two arguments"
+                    ))
+                })?;
+                let b = arg_values.get(1).ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "testing.{prop_name} requires two arguments"
+                    ))
+                })?;
+                let a = coerce_value_to_llvm(fn_ctx, a.clone(), &param_tys[0])?;
+                let b = coerce_value_to_llvm(fn_ctx, b.clone(), &param_tys[1])?;
+                llvm_args.push(a);
+                llvm_args.push(b);
+            } else if prop_name == "assert_true" || prop_name == "assert_false" {
+                let cond = arg_values.first().ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "testing.{prop_name} requires an argument"
+                    ))
+                })?;
+                let cond = coerce_value_to_llvm(fn_ctx, cond.clone(), &param_tys[0])?;
+                llvm_args.push(cond);
+            }
+
+            fn_ctx
+                .builder
+                .build_call(fn_val, &llvm_args, "assert_call")?;
+            Ok(TypedValue::new(
+                ctx.bool_type().const_all_ones().into(),
+                Ty::Bool,
+            ))
+        }
     }
-
-    fn_ctx
-        .builder
-        .build_call(fn_val, &llvm_args, "assert_call")?;
-    Ok(TypedValue::new(
-        ctx.bool_type().const_all_ones().into(),
-        Ty::Bool,
-    ))
 }
 
 pub(crate) fn array_elem_size(ty: &Ty) -> i64 {

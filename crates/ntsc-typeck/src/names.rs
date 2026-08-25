@@ -22,6 +22,7 @@ pub const BUILTIN_MODULES: &[&str] = &[
     "arrays",
     "async",
     "collections",
+    "csv",
     "crypto",
     "encoding",
     "fmt",
@@ -42,6 +43,8 @@ pub const BUILTIN_MODULES: &[&str] = &[
     "sys",
     "testing",
     "time",
+    "toml",
+    "yaml",
 ];
 
 /// Resolve all declarations and references in a program.

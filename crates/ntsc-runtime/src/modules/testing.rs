@@ -3,6 +3,7 @@
 //! them.
 
 use crate::registry;
+use std::time::Instant;
 
 fn fail(fn_name: &str, msg: impl std::fmt::Display) -> i64 {
     super::throw_str(format!("testing.{fn_name}: {msg}"))
@@ -100,6 +101,29 @@ pub extern "C" fn ntsc_testing_assert_ne_string(a: i64, b: i64) -> i8 {
         return 0;
     }
     1
+}
+
+/// Run `fn` for `warmup` iterations (discarded), then `iterations` timed
+/// iterations.  Returns the average time per iteration in microseconds.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_testing_bench(
+    fn_ptr: extern "C" fn(i64),
+    iterations: i64,
+    warmup: i64,
+) -> f64 {
+    let w = warmup.max(0) as u64;
+    let n = iterations.max(1) as u64;
+    let dummy = 0i64;
+    for _ in 0..w {
+        fn_ptr(dummy);
+    }
+    let start = Instant::now();
+    for _ in 0..n {
+        fn_ptr(dummy);
+    }
+    let elapsed = start.elapsed();
+    let total_us = elapsed.as_secs_f64() * 1_000_000.0;
+    total_us / n as f64
 }
 
 #[cfg(test)]

@@ -287,6 +287,21 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
     declare!("ntsc_io_tell", i64_ty, i64_ty);
     declare!("ntsc_io_eof", i8_ty, i64_ty);
 
+    // ── csv module ───────────────────────────────────────────────────────
+
+    declare!("ntsc_csv_parse", i64_ty, i64_ty);
+    declare!("ntsc_csv_stringify", i64_ty, i64_ty);
+
+    // ── toml module ──────────────────────────────────────────────────────
+
+    declare!("ntsc_toml_parse", i64_ty, i64_ty);
+    declare!("ntsc_toml_stringify", i64_ty, i64_ty);
+
+    // ── yaml module ──────────────────────────────────────────────────────
+
+    declare!("ntsc_yaml_parse", i64_ty, i64_ty);
+    declare!("ntsc_yaml_stringify", i64_ty, i64_ty);
+
     // ── json module ──────────────────────────────────────────────────────
 
     declare!("ntsc_json_parse", i64_ty, i64_ty);
@@ -476,6 +491,15 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
     declare!("ntsc_testing_assert_ne_string", i8_ty, i64_ty, i64_ty);
     declare!("ntsc_testing_assert_eq_bool", i8_ty, i8_ty, i8_ty);
     declare!("ntsc_testing_assert_ne_bool", i8_ty, i8_ty, i8_ty);
+
+    let bench_fn_ptr_ty = ctx.ptr_type(AddressSpace::default());
+    declare!(
+        "ntsc_testing_bench",
+        f64_ty,
+        bench_fn_ptr_ty,
+        i64_ty,
+        i64_ty
+    );
 
     // ── time module ──────────────────────────────────────────────────────
 

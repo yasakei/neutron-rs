@@ -5,6 +5,7 @@
 pub mod arrays;
 pub mod collections;
 pub mod crypto;
+pub mod csv;
 pub mod encoding;
 pub mod fmt;
 pub mod hash;
@@ -24,6 +25,8 @@ pub mod strings;
 pub mod sys;
 pub mod testing;
 pub mod time;
+pub mod toml;
+pub mod yaml;
 
 use crate::registry;
 
@@ -31,6 +34,33 @@ use crate::registry;
 /// sentinel checked by generated callers.
 pub(crate) fn throw_str(msg: String) -> i64 {
     crate::ntsc_throw(registry::put_string(msg))
+}
+
+/// Convert NTSC escape sequences stored as literal characters in a
+/// runtime string into their real equivalents.  Processes `\n`, `\r`,
+/// `\t`, `\"`, and `\\` in a single left-to-right pass.
+pub(crate) fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

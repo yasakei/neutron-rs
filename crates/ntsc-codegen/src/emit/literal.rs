@@ -222,7 +222,7 @@ pub(crate) fn emit_variable<'ctx>(
     match name_str {
         // Standard library modules are represented as opaque objects.
         "math" | "fmt" | "time" | "sys" | "strings" | "json" | "http" | "crypto"
-        | "collections" | "regex" | "arrays" | "process" => {
+        | "collections" | "regex" | "arrays" | "process" | "csv" | "toml" | "yaml" => {
             return Ok(TypedValue::new(
                 fn_ctx
                     .context
