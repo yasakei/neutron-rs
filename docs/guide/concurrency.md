@@ -124,3 +124,38 @@ async fun main() -> int {
 `async.sleep(ms)` is the one suspending function. It pauses the coroutine for
 approximately `ms` milliseconds: the future reports "pending" until the
 deadline passes, and the executor re-polls it on a millisecond quantum.
+
+### Inline async blocks
+
+Instead of writing a separate `async fun`, you can inline a block directly at
+the `await` site:
+
+```ntsc
+async fun main() -> int {
+    var result = await async {
+        await async.sleep(50);
+        return 42
+    }
+    say(result)  // 42
+    return 0
+}
+```
+
+An inline `async { ... }` block compiles to an anonymous future. It cannot
+take parameters and must have a consistent return type across all paths.
+
+### `for await`
+
+`for await x in producer` iterates over `producer` (an array or other
+iterable). It is syntactically equivalent to `for (var x in producer)` today
+but signals intent to support streaming async iteration in the future.
+
+```ntsc
+async fun main() -> int {
+    var items = ["a", "b", "c"]
+    for await x in items {
+        say(x)
+    }
+    return 0
+}
+```

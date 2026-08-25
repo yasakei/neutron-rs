@@ -462,6 +462,16 @@ for (var name in iterable) { ... }
 The loop variable must be declared with `var`; its type is inferred from
 `get`'s return type (the iterator protocol).
 
+### For-await
+
+```
+for await name in producer { ... }
+```
+
+Evaluates `producer` and iterates over its elements. Currently equivalent to
+`for (var name in producer)` but reserved for future streaming iteration where
+`producer` is an async iterable.
+
 ### Break and continue
 
 Exit the innermost loop; skip to the next iteration.
@@ -666,6 +676,16 @@ destructuring.
 
 `await callee(args)` suspends the enclosing async function until the callee
 future completes, then yields its result. Only legal inside `async fun`.
+
+The callee can be a named async function or an inline async block:
+
+```
+var x = await compute()
+var y = await async { await async.sleep(10); return 42 }
+```
+
+An inline `async { ... }` block compiles to an anonymous future. It cannot
+take parameters; its return type is inferred from `return` statements.
 
 ### View
 
