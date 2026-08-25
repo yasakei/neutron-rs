@@ -800,4 +800,5 @@ With `--json`, diagnostics are emitted as structured JSON on stdout.
 - Only scalars and stdlib handles cross a thread boundary; views, `shared`
   values, and owned heap payloads are rejected. See
   [Threading rules](../guide/concurrency.md#threading-rules).
-- `try`/`throw`/`retry` are rejected inside async functions.
+- `try`/`throw`/`retry` are allowed inside async functions. A `throw`
+  propagates to the caller after `wait_any`/`wait_all` returns.

@@ -149,6 +149,19 @@ impl TypeChecker {
             )
             .expect("global scope should be empty");
 
+        // Pre-declare `wait_any` / `wait_all` concurrent combinators.
+        for name in ["wait_any", "wait_all"] {
+            symbols
+                .define(
+                    name,
+                    Ty::Function {
+                        params: vec![Ty::Any, Ty::Any],
+                        return_type: Box::new(Ty::Any),
+                    },
+                )
+                .expect("global scope should be empty");
+        }
+
         // Pre-declare builtin stdlib module names.
         for module in crate::names::BUILTIN_MODULES {
             symbols.define(module, Ty::Object).ok();
@@ -574,22 +587,6 @@ impl TypeChecker {
     }
 
     fn check_statement(&mut self, stmt: &Stmt) {
-        // The slice forbids exception machinery inside async bodies: they
-        // would have to unwind across a suspended state machine.
-        if self.async_depth > 0
-            && matches!(
-                stmt,
-                Stmt::Try { .. } | Stmt::Throw { .. } | Stmt::Retry { .. }
-            )
-        {
-            self.errors.push(TypeError {
-                code: None,
-                help: None,
-                message: "try/throw/retry is not supported inside async functions".into(),
-                span: self.stmt_span(stmt),
-            });
-            return;
-        }
         match stmt {
             Stmt::Function {
                 name,
@@ -3673,15 +3670,11 @@ mod tests {
     }
 
     #[test]
-    fn try_and_throw_are_rejected_inside_async_bodies() {
-        let errors =
-            check_source("async fun main() {\n    try { await async.sleep(1) } catch (err) { }\n}")
-                .unwrap_err();
-        assert!(errors.iter().any(|error| {
-            error
-                .message
-                .contains("try/throw/retry is not supported inside async")
-        }));
+    fn try_and_throw_are_allowed_inside_async_bodies() {
+        // throw inside async bodies is accepted: it sets the
+        // thread-local pending flag and the caller's exception check
+        // catches it.
+        check_source("async fun main() {\n    throw \"timeout\"\n}").unwrap();
     }
 
     #[test]

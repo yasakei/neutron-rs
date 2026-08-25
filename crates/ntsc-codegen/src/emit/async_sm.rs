@@ -61,6 +61,11 @@ pub(crate) struct AsyncLayout {
         Vec<Stmt>,
         Option<ntsc_ast::expr::ReturnTypeAnnotation>,
     )>,
+
+    /// Maps `Expr::AsyncBlock` spans to their generated anonymous function
+    /// names, used during poll emission to resolve standalone blocks and
+    /// `wait_any`/`wait_all` arguments.
+    pub(crate) block_span_to_name: HashMap<usize, String>,
 }
 
 /// Infer the type of an async local that has no explicit annotation.
@@ -311,6 +316,16 @@ pub(crate) fn build_async_layout(
         }
     }
 
+    // Discover standalone Expr::AsyncBlock (not inside await) from
+    // wait_any/wait_all arguments and expression-position blocks.
+    let mut block_span_to_name = HashMap::new();
+    collect_standalone_async_blocks(
+        body,
+        &mut anon_async_blocks,
+        &mut anon_counter,
+        &mut block_span_to_name,
+    );
+
     Ok(AsyncLayout {
         name: name.lexeme().to_string(),
         field_tys,
@@ -320,6 +335,7 @@ pub(crate) fn build_async_layout(
         await_infos,
         ret_ty,
         anon_async_blocks,
+        block_span_to_name,
     })
 }
 
@@ -331,6 +347,228 @@ pub(crate) type AwaitCalleeResult = (
     Option<Vec<Stmt>>,
     Option<ntsc_ast::expr::ReturnTypeAnnotation>,
 );
+
+/// Scan statements for `Expr::AsyncBlock` that appear outside of `await`
+/// (standalone expression blocks and `wait_any`/`wait_all` arguments) and
+/// register them as anonymous async blocks for compilation.
+fn collect_standalone_async_blocks(
+    stmts: &[Stmt],
+    anon_async_blocks: &mut Vec<(
+        String,
+        Vec<Stmt>,
+        Option<ntsc_ast::expr::ReturnTypeAnnotation>,
+    )>,
+    anon_counter: &mut usize,
+    block_span_to_name: &mut HashMap<usize, String>,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Expression { expression, .. } => {
+                collect_expr_async_blocks(
+                    expression,
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+            }
+            Stmt::Var {
+                initializer: Some(init),
+                ..
+            } => {
+                collect_expr_async_blocks(
+                    init,
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+            }
+            Stmt::Return {
+                value: Some(val), ..
+            } => {
+                collect_expr_async_blocks(val, anon_async_blocks, anon_counter, block_span_to_name);
+            }
+            Stmt::Block { statements, .. } => {
+                collect_standalone_async_blocks(
+                    statements,
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                elif_branches: _,
+                else_branch,
+            } => {
+                collect_expr_async_blocks(
+                    condition,
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+                collect_standalone_async_blocks(
+                    std::slice::from_ref(then_branch),
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+                if let Some(eb) = else_branch {
+                    collect_standalone_async_blocks(
+                        std::slice::from_ref(eb),
+                        anon_async_blocks,
+                        anon_counter,
+                        block_span_to_name,
+                    );
+                }
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                collect_expr_async_blocks(
+                    condition,
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+                collect_standalone_async_blocks(
+                    std::slice::from_ref(body),
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+            }
+            Stmt::For {
+                init,
+                condition,
+                update,
+                body,
+                ..
+            } => {
+                if let Some(i) = init {
+                    collect_standalone_async_blocks(
+                        std::slice::from_ref(i),
+                        anon_async_blocks,
+                        anon_counter,
+                        block_span_to_name,
+                    );
+                }
+                if let Some(c) = condition {
+                    collect_expr_async_blocks(
+                        c,
+                        anon_async_blocks,
+                        anon_counter,
+                        block_span_to_name,
+                    );
+                }
+                if let Some(u) = update {
+                    collect_expr_async_blocks(
+                        u,
+                        anon_async_blocks,
+                        anon_counter,
+                        block_span_to_name,
+                    );
+                }
+                collect_standalone_async_blocks(
+                    std::slice::from_ref(body),
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+            }
+            Stmt::ForIn { body, .. } | Stmt::ForAwait { body, .. } => {
+                collect_standalone_async_blocks(
+                    std::slice::from_ref(body),
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+            }
+            Stmt::Try {
+                try_block,
+                catch_block,
+                finally_block,
+                ..
+            } => {
+                collect_standalone_async_blocks(
+                    std::slice::from_ref(try_block),
+                    anon_async_blocks,
+                    anon_counter,
+                    block_span_to_name,
+                );
+                if let Some(cb) = catch_block {
+                    collect_standalone_async_blocks(
+                        std::slice::from_ref(cb),
+                        anon_async_blocks,
+                        anon_counter,
+                        block_span_to_name,
+                    );
+                }
+                if let Some(fb) = finally_block {
+                    collect_standalone_async_blocks(
+                        std::slice::from_ref(fb),
+                        anon_async_blocks,
+                        anon_counter,
+                        block_span_to_name,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_expr_async_blocks(
+    expr: &Expr,
+    anon_async_blocks: &mut Vec<(
+        String,
+        Vec<Stmt>,
+        Option<ntsc_ast::expr::ReturnTypeAnnotation>,
+    )>,
+    anon_counter: &mut usize,
+    block_span_to_name: &mut HashMap<usize, String>,
+) {
+    match expr {
+        Expr::AsyncBlock {
+            body,
+            return_type,
+            span,
+            ..
+        } => {
+            *anon_counter += 1;
+            let name = format!("__anon_async_{}", anon_counter);
+            anon_async_blocks.push((name.clone(), body.clone(), return_type.clone()));
+            block_span_to_name.insert(span.start, name);
+        }
+        Expr::Call {
+            callee, arguments, ..
+        } => {
+            if is_wait_any_or_all(callee) {
+                for arg in arguments {
+                    collect_expr_async_blocks(
+                        arg,
+                        anon_async_blocks,
+                        anon_counter,
+                        block_span_to_name,
+                    );
+                }
+            }
+        }
+        Expr::Await {
+            callee, arguments, ..
+        } => {
+            collect_expr_async_blocks(callee, anon_async_blocks, anon_counter, block_span_to_name);
+            for arg in arguments {
+                collect_expr_async_blocks(arg, anon_async_blocks, anon_counter, block_span_to_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_wait_any_or_all(expr: &Expr) -> bool {
+    matches!(expr, Expr::Variable { name } if name.lexeme() == "wait_any" || name.lexeme() == "wait_all")
+}
 
 pub(crate) fn await_callee_info(
     stmt: &Stmt,
@@ -681,6 +919,7 @@ pub(crate) fn emit_async_poll<'ctx>(
         );
         fn_ctx.future_base = Some((future, future_ty));
         fn_ctx.async_fields = Some(layout.fields.clone());
+        fn_ctx.block_span_to_name = Some(layout.block_span_to_name.clone());
 
         // Async state machines have no exception support: calls never check
         // the pending-exception flag. A segment can still *raise* (the

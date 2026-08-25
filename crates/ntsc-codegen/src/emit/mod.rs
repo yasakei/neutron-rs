@@ -223,6 +223,11 @@ pub(crate) struct FunctionContext<'ctx, 'm> {
     /// no longer be reached through `variables`. Their values are still live
     /// and dropped at function exit alongside the slots still bound by name.
     shadowed_owned_slots: Vec<(PointerValue<'ctx>, Ty)>,
+
+    /// Maps `Expr::AsyncBlock` spans to their generated anonymous function
+    /// names. Populated during async poll emission for standalone blocks and
+    /// `wait_any`/`wait_all` argument resolution.
+    pub(crate) block_span_to_name: Option<HashMap<usize, String>>,
 }
 
 impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
@@ -256,6 +261,7 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
             class_drops: HashSet::new(),
             owned_slots: HashSet::new(),
             shadowed_owned_slots: Vec::new(),
+            block_span_to_name: None,
         }
     }
 

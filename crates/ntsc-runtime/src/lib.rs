@@ -633,15 +633,6 @@ fn restore_async_context(result: i64) -> i64 {
     })
 }
 
-/// Set the result handle for the current async context.
-fn set_async_context_result(result: i64) {
-    ASYNC_STACKS.with(|stacks| {
-        if let Some(entry) = stacks.borrow_mut().last_mut() {
-            entry.1 = result;
-        }
-    });
-}
-
 /// Drive the root future to completion in a fresh async context.
 ///
 /// The root's poll function and handle are pushed onto the thread-local
@@ -700,17 +691,17 @@ pub extern "C" fn ntsc_async_push(poll_fn: AsyncPollFn, future: i64) {
 /// finishes first. The losing branch is dropped automatically.
 ///
 /// Called from within a poll function. Each branch is pushed onto its own
-/// local task stack and polled round-robin until one completes. The
-/// winner's result handle is stored in the current async context.
+/// local task stack and polled round-robin until one completes. Returns
+/// the winning future handle (can be used to read the result slot).
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_async_wait_any(
     poll_a: AsyncPollFn,
     future_a: i64,
     poll_b: AsyncPollFn,
     future_b: i64,
-) {
+) -> i64 {
     if future_a == NULL && future_b == NULL {
-        return;
+        return NULL;
     }
     if future_a == NULL || future_b == NULL {
         let (poll, fut) = if future_a != NULL {
@@ -721,7 +712,7 @@ pub extern "C" fn ntsc_async_wait_any(
         ASYNC_TASKS.with(|tasks| {
             tasks.borrow_mut().push((poll, fut));
         });
-        return;
+        return fut;
     }
     let _ = save_async_context();
     ASYNC_TASKS.with(|tasks| {
@@ -751,7 +742,7 @@ pub extern "C" fn ntsc_async_wait_any(
             (pushed, done_a)
         });
         if done_a_final {
-            break ASYNC_STACKS.with(|s| s.borrow().last().map(|(_, r)| *r).unwrap_or(NULL));
+            break future_a;
         }
         let (poll_b, fut_b, len_b) = ASYNC_STACKS.with(|stacks| {
             let mut s = stacks.borrow_mut();
@@ -780,19 +771,18 @@ pub extern "C" fn ntsc_async_wait_any(
             pushed
         });
         if done_b {
-            break ASYNC_STACKS.with(|s| s.borrow().last().map(|(_, r)| *r).unwrap_or(NULL));
+            break future_b;
         }
         if !pushed_a && !pushed_b {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     };
-    set_async_context_result(result);
     let _ = restore_async_context(NULL);
+    result
 }
 
 /// Run two async branches concurrently; wait for both to finish and
-/// return the result of the second branch (first branch's result is
-/// discarded).
+/// return the handle of the second branch.
 ///
 /// Called from within a poll function. Each branch is pushed onto its own
 /// local task stack and polled round-robin until both complete.
@@ -802,9 +792,9 @@ pub extern "C" fn ntsc_async_wait_all(
     future_a: i64,
     poll_b: AsyncPollFn,
     future_b: i64,
-) {
+) -> i64 {
     if future_a == NULL && future_b == NULL {
-        return;
+        return NULL;
     }
     let _ = save_async_context();
     if future_a != NULL {
@@ -819,7 +809,6 @@ pub extern "C" fn ntsc_async_wait_all(
     }
     let mut done_a = future_a == NULL;
     let mut done_b = future_b == NULL;
-    let mut result = NULL;
     while !done_a || !done_b {
         if !done_a {
             let (poll, fut, len_a) = ASYNC_TASKS.with(|tasks| {
@@ -871,8 +860,6 @@ pub extern "C" fn ntsc_async_wait_all(
                 });
                 if d && !pushed {
                     done_b = true;
-                    result =
-                        ASYNC_STACKS.with(|s| s.borrow().last().map(|(_, r)| *r).unwrap_or(NULL));
                 }
             } else {
                 done_b = true;
@@ -883,8 +870,8 @@ pub extern "C" fn ntsc_async_wait_all(
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    set_async_context_result(result);
     let _ = restore_async_context(NULL);
+    future_b
 }
 
 #[cfg(test)]

@@ -328,6 +328,148 @@ pub(crate) fn emit_call<'ctx>(
     if let Expr::Variable { name } = callee {
         let name_str = name.lexeme();
 
+        // `wait_any(a, b)` / `wait_all(a, b)` — concurrent execution of two
+        // inline async blocks. Each argument must be an `Expr::AsyncBlock`.
+        // Handled BEFORE emit_call_arguments to avoid evaluating the blocks
+        // as regular expressions.
+        if name_str == "wait_any" || name_str == "wait_all" {
+            if arguments.len() != 2 {
+                return Err(crate::CodegenError::LLVMError(format!(
+                    "{name_str} expects exactly 2 arguments"
+                )));
+            }
+            let anon_blocks = fn_ctx.block_span_to_name.clone().unwrap_or_default();
+            let mut handles = Vec::new();
+            let mut poll_fns = Vec::new();
+            for arg in &arguments {
+                let anon_name = match arg {
+                    Expr::AsyncBlock { span, .. } => {
+                        anon_blocks.get(&span.start).ok_or_else(|| {
+                            crate::CodegenError::LLVMError(
+                                "internal: async block not found in block_span_to_name".into(),
+                            )
+                        })?
+                    }
+                    _ => {
+                        return Err(crate::CodegenError::LLVMError(format!(
+                            "{name_str} arguments must be inline async blocks"
+                        )));
+                    }
+                };
+                let struct_name = format!("ntsc_future_{anon_name}");
+                let future_ty = fn_ctx.module.get_struct_type(&struct_name).ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "internal: async block future struct {struct_name} not declared"
+                    ))
+                })?;
+                let future_size = future_ty.size_of().ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!("internal: {struct_name} has no size"))
+                })?;
+                let future_ptr = fn_ctx
+                    .builder
+                    .build_alloca(future_ty, &format!("{name_str}_future"))?;
+                let zero = fn_ctx.context.i8_type().const_zero();
+                fn_ctx
+                    .builder
+                    .build_memset(future_ptr, 1, zero, future_size)?;
+                let state_ptr =
+                    fn_ctx
+                        .builder
+                        .build_struct_gep(future_ty, future_ptr, 0, "state_ptr")?;
+                fn_ctx
+                    .builder
+                    .build_store(state_ptr, fn_ctx.context.i32_type().const_int(0, false))?;
+                let poll_name = format!("ntsc_future_{anon_name}_poll");
+                let poll_fn_val = fn_ctx.module.get_function(&poll_name).ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "internal: poll function {poll_name} not declared"
+                    ))
+                })?;
+                let poll_ptr = poll_fn_val.as_global_value().as_pointer_value();
+                let poll_i8 = fn_ctx.builder.build_pointer_cast(
+                    poll_ptr,
+                    fn_ctx.context.ptr_type(AddressSpace::default()),
+                    &format!("{name_str}_poll_fn"),
+                )?;
+                let handle = fn_ctx.builder.build_ptr_to_int(
+                    future_ptr,
+                    fn_ctx.context.i64_type(),
+                    &format!("{name_str}_handle"),
+                )?;
+                handles.push(handle);
+                poll_fns.push(poll_i8);
+            }
+            let runtime_fn_name = if name_str == "wait_any" {
+                "ntsc_async_wait_any"
+            } else {
+                "ntsc_async_wait_all"
+            };
+            let runtime_fn = fn_ctx.module.get_function(runtime_fn_name).ok_or_else(|| {
+                crate::CodegenError::LLVMError(format!("{runtime_fn_name} not declared"))
+            })?;
+            let result_handle = fn_ctx.builder.build_call(
+                runtime_fn,
+                &[
+                    poll_fns[0].into(),
+                    handles[0].into(),
+                    poll_fns[1].into(),
+                    handles[1].into(),
+                ],
+                &format!("{name_str}_result"),
+            )?;
+
+            // A throw inside one of the branches sets the thread-local
+            // pending-exception flag.  Inside async poll functions
+            // `exception_checks` is off, so temporarily enable it to
+            // propagate the exception to the enclosing try/catch.
+            let saved_exc = fn_ctx.exception_checks;
+            fn_ctx.exception_checks = true;
+            fn_ctx.emit_pending_exception_check()?;
+            fn_ctx.exception_checks = saved_exc;
+
+            let winner_handle = call_result_to_value(fn_ctx, &result_handle).into_int_value();
+
+            // Read the result from the winning future's result field.
+            let winner_ptr = fn_ctx.builder.build_int_to_ptr(
+                winner_handle,
+                fn_ctx.context.ptr_type(AddressSpace::default()),
+                "winner_ptr",
+            )?;
+            // Determine the result type from the first block's return type.
+            let result_ty = match &arguments[0] {
+                Expr::AsyncBlock {
+                    return_type: Some(rt),
+                    ..
+                } => type_annotation_to_ty(&Some(rt.ty.clone())),
+                _ => Ty::Void,
+            };
+            if result_ty == Ty::Void {
+                return Ok(TypedValue::new(
+                    fn_ctx.context.i8_type().const_zero().into(),
+                    Ty::Void,
+                ));
+            }
+            let struct_name = format!(
+                "ntsc_future_{}",
+                anon_blocks.get(&arguments[0].span().start).unwrap()
+            );
+            let future_ty = fn_ctx.module.get_struct_type(&struct_name).ok_or_else(|| {
+                crate::CodegenError::LLVMError(format!(
+                    "internal: future struct {struct_name} not declared"
+                ))
+            })?;
+            let result_field =
+                fn_ctx
+                    .builder
+                    .build_struct_gep(future_ty, winner_ptr, 1, "result_ptr")?;
+            let result_val = fn_ctx.builder.build_load(
+                ty_to_llvm(&result_ty, fn_ctx.context),
+                result_field,
+                "result_val",
+            )?;
+            return Ok(TypedValue::new(result_val, result_ty));
+        }
+
         let arg_values = emit_call_arguments(fn_ctx, &arguments)?;
 
         // `alloc(value)` moves its argument into an owning allocation.

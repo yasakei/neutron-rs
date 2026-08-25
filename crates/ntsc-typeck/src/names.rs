@@ -68,6 +68,8 @@ impl Resolver {
         let mut global = HashSet::new();
         global.insert("say".into());
         global.insert("alloc".into());
+        global.insert("wait_any".into());
+        global.insert("wait_all".into());
 
         // Result constructors are builtins, like `say` and `alloc`.
         global.insert("Ok".into());

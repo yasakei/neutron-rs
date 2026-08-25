@@ -164,8 +164,9 @@ that arms a deadline on its first poll and completes once the clock passes it.
 
 ### Exception and async interaction
 
-`try`, `throw`, and `retry` are rejected inside async bodies because unwinding
-across a suspended state machine is not representable.
+`try`, `throw`, and `retry` work inside async bodies. A `throw` sets the
+thread-local pending-exception flag and propagates to the caller after
+`wait_any`/`wait_all` returns.
 
 ## Optimization
 

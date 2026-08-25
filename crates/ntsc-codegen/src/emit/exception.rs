@@ -99,7 +99,12 @@ pub(crate) fn emit_try_catch<'ctx>(
             .unwrap_basic()
             .into_int_value();
         fn_ctx.builder.build_call(clear_fn, &[], "catch_clear")?;
+        // Catch variables are transient and never survive a suspension
+        // point (await is forbidden inside catch bodies), so they must be
+        // stack-allocated even inside async poll functions.
+        let saved = fn_ctx.async_fields.take();
         let ptr = fn_ctx.alloca(var.lexeme(), &Ty::String)?;
+        fn_ctx.async_fields = saved;
 
         // The binding owns a clone of the message, and one entry-block slot
         // backs it on every pass, so a `try` inside a loop must release the

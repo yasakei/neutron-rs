@@ -168,7 +168,7 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
 
     declare!(
         "ntsc_async_wait_any",
-        void_ty,
+        i64_ty,
         async_poll_fn,
         i64_ty,
         async_poll_fn,
@@ -177,7 +177,7 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
 
     declare!(
         "ntsc_async_wait_all",
-        void_ty,
+        i64_ty,
         async_poll_fn,
         i64_ty,
         async_poll_fn,

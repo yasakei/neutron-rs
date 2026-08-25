@@ -636,10 +636,49 @@ pub(crate) fn emit_expression<'ctx>(
             "internal: await must be lowered by the async state machine, not emitted directly"
                 .into(),
         )),
-        Expr::AsyncBlock { .. } => Err(crate::CodegenError::LLVMError(
-            "internal: async blocks must be lowered by the async state machine or await, not emitted directly"
-                .into(),
-        )),
+        Expr::AsyncBlock { span, .. } => {
+            let anon_name = fn_ctx
+                .block_span_to_name
+                .as_ref()
+                .and_then(|m| m.get(&span.start))
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError(
+                        "internal: async block not found in block_span_to_name".into(),
+                    )
+                })?;
+
+            let struct_name = format!("ntsc_future_{anon_name}");
+            let future_ty = fn_ctx.module.get_struct_type(&struct_name).ok_or_else(|| {
+                crate::CodegenError::LLVMError(format!(
+                    "internal: async block future struct {struct_name} not declared"
+                ))
+            })?;
+
+            let future_size = future_ty.size_of().ok_or_else(|| {
+                crate::CodegenError::LLVMError(format!("internal: {struct_name} has no size"))
+            })?;
+            let future_ptr = fn_ctx.builder.build_alloca(future_ty, "anon_future")?;
+            let zero = fn_ctx.context.i8_type().const_zero();
+            fn_ctx
+                .builder
+                .build_memset(future_ptr, 1, zero, future_size)?;
+
+            let state_ptr =
+                fn_ctx
+                    .builder
+                    .build_struct_gep(future_ty, future_ptr, 0, "state_ptr")?;
+            fn_ctx
+                .builder
+                .build_store(state_ptr, fn_ctx.context.i32_type().const_int(0, false))?;
+
+            let handle = fn_ctx.builder.build_ptr_to_int(
+                future_ptr,
+                fn_ctx.context.i64_type(),
+                "anon_handle",
+            )?;
+
+            Ok(TypedValue::new(handle.into(), Ty::Int))
+        }
         Expr::PostfixUnary { op, left } => {
             // i++ / i-- — increment/decrement a variable in place and return
             // the OLD value.

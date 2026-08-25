@@ -116,8 +116,10 @@ async fun main() -> int {
   intact afterwards.
 - Await results flow back into the calling coroutine after the child future
   completes.
-- `try`, `throw`, and `retry` are rejected inside async bodies: exceptions
-  cannot unwind across a suspended state machine.
+- `try`, `throw`, and `retry` work inside async bodies. A `throw` sets
+  the thread-local pending-exception flag and propagates to the caller
+  after `wait_any`/`wait_all` returns. This enables the timeout pattern:
+  racing an operation against a sleep that throws a catchable error.
 
 ### The `async` module
 
