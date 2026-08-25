@@ -434,6 +434,14 @@ impl Resolver {
                     self.resolve_expression(update);
                 }
             }
+            Expr::TupleLiteral { elements, .. } => {
+                for element in elements {
+                    self.resolve_expression(element);
+                }
+            }
+            Expr::TupleIndex { object, .. } => {
+                self.resolve_expression(object);
+            }
         }
     }
 

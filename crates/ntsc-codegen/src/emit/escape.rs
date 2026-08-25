@@ -126,6 +126,8 @@ pub(crate) fn expr_mentions_var(expr: &Expr, var: &str) -> bool {
             fields.iter().any(|p| expr_mentions_var(&p.value, var))
                 || update.as_ref().is_some_and(|u| expr_mentions_var(u, var))
         }
+        Expr::TupleLiteral { elements, .. } => elements.iter().any(|e| expr_mentions_var(e, var)),
+        Expr::TupleIndex { object, .. } => expr_mentions_var(object, var),
     }
 }
 
@@ -377,6 +379,10 @@ pub(crate) fn expr_uses_var_safely(expr: &Expr, var: &str, ctx: ExprCtx, kind: E
                     .as_ref()
                     .is_some_and(|u| expr_uses_var_safely(u, var, ExprCtx::Base, kind))
         }
+        Expr::TupleLiteral { elements, .. } => elements
+            .iter()
+            .any(|e| expr_uses_var_safely(e, var, ExprCtx::Data, kind)),
+        Expr::TupleIndex { object, .. } => expr_uses_var_safely(object, var, ExprCtx::Base, kind),
     }
 }
 

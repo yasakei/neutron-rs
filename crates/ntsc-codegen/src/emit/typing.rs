@@ -47,6 +47,12 @@ pub(crate) fn ty_to_llvm<'ctx>(
         Ty::Own(_) | Ty::Ref(..) | Ty::RawPointer(..) | Ty::Dyn(_) => context
             .ptr_type(AddressSpace::default())
             .as_basic_type_enum(),
+        Ty::Tuple(elements) => {
+            let fields: Vec<inkwell::types::BasicTypeEnum> =
+                elements.iter().map(|e| ty_to_llvm(e, context)).collect();
+            let ll_ty = context.struct_type(&fields, false);
+            ll_ty.as_basic_type_enum()
+        }
     }
 }
 
@@ -83,6 +89,14 @@ pub(crate) fn default_llvm_value<'ctx>(ty: &Ty, context: &'ctx Context) -> Basic
         | Ty::Pointer
         | Ty::Slice(_)
         | Ty::Void => context.i64_type().const_zero().into(),
+        Ty::Tuple(elements) => {
+            let ll_ty = ty_to_llvm(&Ty::Tuple(elements.clone()), context);
+            if let inkwell::types::BasicTypeEnum::StructType(st) = ll_ty {
+                st.const_zero().into()
+            } else {
+                context.i64_type().const_zero().into()
+            }
+        }
         Ty::Function { .. } | Ty::Class(_) | Ty::Dyn(_) => context
             .ptr_type(AddressSpace::default())
             .const_null()

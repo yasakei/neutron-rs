@@ -1666,6 +1666,16 @@ impl OwnershipChecker {
                 }
                 Some(ValueKind::Heap)
             }
+            Expr::TupleLiteral { elements, .. } => {
+                for element in elements {
+                    let _ = self.check_expr(element);
+                }
+                Some(ValueKind::Heap)
+            }
+            Expr::TupleIndex { object, .. } => {
+                let _ = self.check_expr(object);
+                Some(ValueKind::Heap)
+            }
         }
     }
 
@@ -2002,6 +2012,8 @@ fn kind_of_annotation(annotation: &TypeAnnotation) -> ValueKind {
         // A trait object owns its fat-pointer header and (through it) the
         // wrapped instance.
         TypeAnnotation::Dyn(_) | TypeAnnotation::ImplTrait(_) => ValueKind::Heap,
+        // Tuples are stack-allocated value types.
+        TypeAnnotation::Tuple(_) => ValueKind::Scalar,
     }
 }
 
@@ -2326,6 +2338,12 @@ fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
             }
         }
         Expr::Propagate { value, .. } => collect_expr_uses(value, uses),
+        Expr::TupleLiteral { elements, .. } => {
+            for element in elements {
+                collect_expr_uses(element, uses);
+            }
+        }
+        Expr::TupleIndex { object, .. } => collect_expr_uses(object, uses),
     }
 }
 

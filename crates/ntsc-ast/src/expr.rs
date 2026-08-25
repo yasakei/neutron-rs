@@ -184,6 +184,19 @@ pub enum Expr {
         value: Box<Expr>,
         question_span: Span,
     },
+
+    /// `(e1, e2, ...)` — a fixed-size, heterogeneous product type.
+    TupleLiteral {
+        elements: Vec<Expr>,
+        span: Span,
+    },
+
+    /// `t.N` — numeric index into a tuple.
+    TupleIndex {
+        object: Box<Expr>,
+        index: usize,
+        dot_span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -262,6 +275,10 @@ impl Expr {
                 question_span,
             } => value.span().to(*question_span),
             Expr::AsyncBlock { span, .. } => *span,
+            Expr::TupleLiteral { span, .. } => *span,
+            Expr::TupleIndex {
+                object, dot_span, ..
+            } => object.span().to(*dot_span),
         }
     }
 }

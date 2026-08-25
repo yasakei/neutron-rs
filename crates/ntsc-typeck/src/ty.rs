@@ -76,6 +76,9 @@ pub enum Ty {
     /// class implementing `P` plus that impl's vtable. The value owns both
     /// the header and the wrapped instance.
     Dyn(String),
+
+    /// `(T1, T2, ...)` — a fixed-size, heterogeneous product type.
+    Tuple(Vec<Ty>),
 }
 
 impl Ty {
@@ -119,6 +122,10 @@ impl Ty {
                 format!("{}{}", if *mutable { "*mut " } else { "*const " }, inner)
             }
             Self::Dyn(trait_name) => format!("dyn {trait_name}"),
+            Self::Tuple(elems) => {
+                let inner: Vec<_> = elems.iter().map(|e| e.label()).collect();
+                format!("({})", inner.join(", "))
+            }
         }
     }
 
@@ -131,7 +138,7 @@ impl Ty {
         !matches!(
             self,
             Ty::Int | Ty::Float | Ty::Bool | Ty::Void | Ty::Nil | Ty::View(..)
-        )
+        ) && !matches!(self, Ty::Tuple(elems) if !elems.iter().any(|e| e.viewable()))
     }
 
     /// Returns true if this type is assignable from `other`.
@@ -209,6 +216,9 @@ impl Ty {
                     && r1.is_assignable_from(r2)
             }
             (Self::Class(a), Self::Class(b)) => a == b,
+            (Self::Tuple(a), Self::Tuple(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.is_assignable_from(y))
+            }
 
             // A view-typed target accepts: another view (a shared target
             // takes shared or mutable views, a mutable target takes only

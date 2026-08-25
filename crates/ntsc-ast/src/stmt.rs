@@ -142,10 +142,13 @@ pub enum Stmt {
         body: Box<Stmt>,
     },
 
-    /// `var [a, b] = expr` / `var {x, y} = expr`. In object destructuring,
-    /// `keys` hold the source keys and `names` the binding variables (aliases).
+    /// `var [a, b] = expr` / `var {x, y} = expr` / `var (a, b) = expr`.
+    /// In object destructuring, `keys` hold the source keys and `names`
+    /// the binding variables (aliases). `is_tuple` is set for positional
+    /// tuple destructuring.
     Destructure {
         is_array: bool,
+        is_tuple: bool,
         names: Vec<Token>,
         keys: Vec<String>,
         initializer: Expr,

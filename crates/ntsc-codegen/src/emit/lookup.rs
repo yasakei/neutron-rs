@@ -54,6 +54,12 @@ pub(crate) fn type_annotation_to_ty(ann: &Option<ntsc_ast::types::TypeAnnotation
         }
         Some(TypeAnnotation::ImplTrait(_)) => Ty::Any,
         Some(TypeAnnotation::Dyn(token)) => Ty::Dyn(token.lexeme().to_string()),
+        Some(TypeAnnotation::Tuple(types)) => Ty::Tuple(
+            types
+                .iter()
+                .map(|t| type_annotation_to_ty(&Some(t.clone())))
+                .collect(),
+        ),
         None => Ty::Any,
     }
 }

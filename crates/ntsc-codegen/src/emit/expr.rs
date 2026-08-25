@@ -247,6 +247,54 @@ pub(crate) fn emit_expression<'ctx>(
             }
             Ok(val)
         }
+        Expr::TupleLiteral { elements, .. } => {
+            let mut elem_vals = Vec::new();
+            let mut elem_tys = Vec::new();
+            for elem in elements {
+                let val = emit_expression(fn_ctx, elem)?;
+                elem_vals.push(val.value);
+                elem_tys.push(val.ntsc_type.clone());
+            }
+            let ty = Ty::Tuple(elem_tys);
+            let ll_ty = ty_to_llvm(&ty, fn_ctx.context);
+            if let inkwell::types::BasicTypeEnum::StructType(st) = ll_ty {
+                let mut agg: inkwell::values::AggregateValueEnum = st.get_undef().into();
+                for (i, val) in elem_vals.iter().enumerate() {
+                    agg = fn_ctx
+                        .builder
+                        .build_insert_value(agg, *val, i as u32, "tuple_insert")?;
+                }
+                let sv = agg.into_struct_value();
+                Ok(TypedValue::new(sv.into(), ty))
+            } else {
+                unreachable!()
+            }
+        }
+        Expr::TupleIndex {
+            object,
+            index,
+            dot_span,
+        } => {
+            let obj_val = emit_expression(fn_ctx, object)?;
+            if let Ty::Tuple(element_tys) = &obj_val.ntsc_type
+                && *index < element_tys.len()
+            {
+                let element_ty = element_tys[*index].clone();
+                let ll_ty = ty_to_llvm(&obj_val.ntsc_type, fn_ctx.context);
+                if let inkwell::types::BasicTypeEnum::StructType(_st) = ll_ty {
+                    let extracted = fn_ctx.builder.build_extract_value(
+                        obj_val.value.into_struct_value(),
+                        *index as u32,
+                        "tuple_idx",
+                    )?;
+                    return Ok(TypedValue::new(extracted, element_ty));
+                }
+            }
+            Err(crate::CodegenError::LLVMError(format!(
+                "cannot index into non-tuple at {:?}",
+                dot_span
+            )))
+        }
         Expr::This { .. } => {
             if let Some((ptr, ty)) = fn_ctx.lookup_var("this") {
                 let loaded =
@@ -1159,6 +1207,8 @@ pub(crate) fn emit_copy_value<'ctx>(
         Ty::Int | Ty::Float | Ty::Bool | Ty::Void | Ty::Nil | Ty::Any | Ty::Function { .. } => {
             return Ok(tv);
         }
+        // Tuples are stack-allocated value types — no deep copy needed.
+        Ty::Tuple(_) => return Ok(tv),
         Ty::Class(name) => {
             let name = name.clone();
             return emit_copy_class_value(fn_ctx, &name, tv);

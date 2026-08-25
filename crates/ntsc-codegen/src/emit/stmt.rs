@@ -394,11 +394,16 @@ pub(crate) fn emit_statement_in_function<'ctx>(
         }
         Stmt::Destructure {
             is_array,
+            is_tuple,
             names,
             keys,
             initializer,
         } => {
-            emit_destructure(fn_ctx, *is_array, names, keys, initializer)?;
+            if *is_tuple {
+                emit_tuple_destructure(fn_ctx, names, initializer)?;
+            } else {
+                emit_destructure(fn_ctx, *is_array, names, keys, initializer)?;
+            }
         }
         Stmt::Unsafe { body } => {
             emit_statement_in_function(fn_ctx, body)?;

@@ -445,6 +445,14 @@ impl Linter {
                     self.check_expr(update);
                 }
             }
+            Expr::TupleLiteral { elements, .. } => {
+                for element in elements {
+                    self.check_expr(element);
+                }
+            }
+            Expr::TupleIndex { object, .. } => {
+                self.check_expr(object);
+            }
         }
     }
 }

@@ -59,6 +59,9 @@ pub enum TypeAnnotation {
     /// `dyn Trait` — a fat pointer pairing an instance with its impl's
     /// vtable.
     Dyn(Token),
+
+    /// `(T1, T2, ...)` — a fixed-size, heterogeneous product type.
+    Tuple(Vec<TypeAnnotation>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +124,7 @@ impl TypeAnnotation {
             Self::Named(_) => "named type",
             Self::ImplTrait(_) => "impl trait",
             Self::Dyn(_) => "dyn trait",
+            Self::Tuple(_) => "tuple",
         }
     }
 }

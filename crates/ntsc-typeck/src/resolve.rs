@@ -886,6 +886,7 @@ impl TypeChecker {
             }
             Stmt::Destructure {
                 is_array,
+                is_tuple,
                 names,
                 initializer,
                 ..
@@ -898,6 +899,41 @@ impl TypeChecker {
                         message: "cannot destructure a view; destructuring moves values out of their source".into(),
                         span: initializer.span(),
                     });
+                }
+
+                if *is_tuple {
+                    // Tuple destructuring: each binding gets the
+                    // corresponding element type.
+                    if let Some(Ty::Tuple(element_tys)) = &init_ty {
+                        for (position, name) in names.iter().enumerate() {
+                            let bound_ty = if position < element_tys.len() {
+                                element_tys[position].clone()
+                            } else {
+                                Ty::Any
+                            };
+                            if let Err(msg) = self.symbols.define(name.lexeme(), bound_ty.clone()) {
+                                self.errors.push(TypeError {
+                                    code: None,
+                                    help: None,
+                                    message: msg,
+                                    span: name.span,
+                                });
+                            }
+                        }
+                    } else {
+                        let bound_ty = Ty::Any;
+                        for name in names {
+                            if let Err(msg) = self.symbols.define(name.lexeme(), bound_ty.clone()) {
+                                self.errors.push(TypeError {
+                                    code: None,
+                                    help: None,
+                                    message: msg,
+                                    span: name.span,
+                                });
+                            }
+                        }
+                    }
+                    return;
                 }
 
                 // Each bound name is a new variable. Array destructuring
@@ -1861,6 +1897,52 @@ impl TypeChecker {
                     });
                 }
                 val_ty
+            }
+            Expr::TupleLiteral { elements, .. } => {
+                let tys: Vec<Ty> = elements
+                    .iter()
+                    .map(|e| self.check_expression(e).unwrap_or(Ty::Any))
+                    .collect();
+                Some(Ty::Tuple(tys))
+            }
+            Expr::TupleIndex {
+                object,
+                index,
+                dot_span,
+            } => {
+                let obj_ty = self.check_expression(object);
+                match obj_ty {
+                    Some(Ty::Tuple(tys)) => {
+                        if *index < tys.len() {
+                            Some(tys[*index].clone())
+                        } else {
+                            self.errors.push(TypeError {
+                                code: None,
+                                message: format!(
+                                    "tuple index `{index}` is out of range (tuple has {} element{})",
+                                    tys.len(),
+                                    if tys.len() == 1 { "" } else { "s" }
+                                ),
+                                help: None,
+                                span: *dot_span,
+                            });
+                            Some(Ty::Any)
+                        }
+                    }
+                    _ => {
+                        self.errors.push(TypeError {
+                            code: None,
+                            message: "cannot index into a non-tuple value with a numeric index"
+                                .into(),
+                            help: Some(
+                                "use `var (a, b) = expr` to destructure, or `.field` for objects"
+                                    .into(),
+                            ),
+                            span: *dot_span,
+                        });
+                        Some(Ty::Any)
+                    }
+                }
             }
             Expr::MemberSet {
                 object,
@@ -2976,6 +3058,12 @@ impl TypeChecker {
             // Rewritten to the concrete class before checking runs.
             Some(TypeAnnotation::ImplTrait(_)) => Ty::Any,
             Some(TypeAnnotation::Dyn(token)) => Ty::Dyn(token.lexeme().to_string()),
+            Some(TypeAnnotation::Tuple(types)) => Ty::Tuple(
+                types
+                    .iter()
+                    .map(|t| self.resolve_annotation(Some(t)))
+                    .collect(),
+            ),
             None => Ty::Any,
         }
     }
@@ -3108,6 +3196,8 @@ fn find_await(expr: &Expr) -> Option<Span> {
             .find_map(|field| find_await(&field.value))
             .or_else(|| update.as_ref().and_then(|u| find_await(u))),
         Expr::Propagate { value, .. } => find_await(value),
+        Expr::TupleLiteral { elements, .. } => elements.iter().find_map(find_await),
+        Expr::TupleIndex { object, .. } => find_await(object),
     }
 }
 

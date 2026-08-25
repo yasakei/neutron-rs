@@ -276,6 +276,43 @@ pub(crate) fn emit_destructure<'ctx>(
     Ok(())
 }
 
+/// Destructure a tuple value into individual variable bindings.
+///
+/// Tuples are stack-allocated LLVM structs (value types). Each element is
+/// extracted via GEP and stored in a fresh alloca.
+pub(crate) fn emit_tuple_destructure<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    names: &[ntsc_ast::token::Token],
+    initializer: &Expr,
+) -> Result<(), crate::CodegenError> {
+    let source = emit_expression(fn_ctx, initializer)?;
+    let source = deref_shared(fn_ctx, source)?;
+    if let Ty::Tuple(element_tys) = &source.ntsc_type {
+        let tuple_ll_ty = ty_to_llvm(&source.ntsc_type, fn_ctx.context);
+        for (position, name) in names.iter().enumerate() {
+            if position >= element_tys.len() {
+                break;
+            }
+            let element_ty = &element_tys[position];
+            if let inkwell::types::BasicTypeEnum::StructType(_st) = tuple_ll_ty {
+                let extracted = fn_ctx.builder.build_extract_value(
+                    source.value.into_struct_value(),
+                    position as u32,
+                    "tuple_elem",
+                )?;
+                let bound = TypedValue::new(extracted, element_ty.clone());
+                let ptr = fn_ctx.alloca(name.lexeme(), &bound.ntsc_type)?;
+                fn_ctx.builder.build_store(ptr, bound.value)?;
+                fn_ctx.define_var(name.lexeme(), ptr, bound.ntsc_type.clone());
+                if ty_is_owned_handle(element_ty) && fn_ctx.future_base.is_none() {
+                    fn_ctx.mark_owned_if_heap(name.lexeme(), &bound.ntsc_type);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Load an element from an untyped (`[]`) array as a runtime string
 /// pointer.
 ///

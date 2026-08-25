@@ -256,6 +256,18 @@ fn shift_expr(expr: &mut Expr, base: usize) {
             }
             shift_span(span, base);
         }
+        Expr::TupleLiteral { elements, span } => {
+            for element in elements {
+                shift_expr(element, base);
+            }
+            shift_span(span, base);
+        }
+        Expr::TupleIndex {
+            object, dot_span, ..
+        } => {
+            shift_expr(object, base);
+            shift_span(dot_span, base);
+        }
     }
 }
 

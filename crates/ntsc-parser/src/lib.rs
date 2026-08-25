@@ -479,6 +479,48 @@ impl<'src> Parser<'src> {
         is_static: bool,
         is_const: bool,
     ) -> Result<Stmt, ParseError> {
+        // Peek ahead: if the current token is `(` and the pattern looks like
+        // tuple destructuring (`(ident, ident)` or `(ident)` followed by `=`),
+        // handle it before the type annotation parser consumes the `(`.
+        if self.peek().kind == TokenKind::LeftParen && !is_static {
+            let saved = self.position;
+            self.advance(); // `(`
+            let mut is_destructure = false;
+            if self.peek().kind != TokenKind::RightParen
+                && matches!(self.peek().kind, TokenKind::Identifier(_))
+            {
+                let after_name = self.peek_at(1);
+                if matches!(after_name, TokenKind::Comma | TokenKind::RightParen) {
+                    // Looks like `(name, ...)` — check if `=` follows after `)`.
+                    let saved2 = self.position;
+                    // Skip past the name(s) and commas.
+                    while self.peek().kind != TokenKind::RightParen
+                        && self.peek().kind != TokenKind::Eof
+                    {
+                        self.advance();
+                    }
+                    if self.peek().kind == TokenKind::RightParen {
+                        self.advance(); // `)`
+                        if self.peek().kind == TokenKind::Equal {
+                            is_destructure = true;
+                        }
+                    }
+                    self.position = saved2;
+                }
+            }
+            self.position = saved;
+
+            if is_destructure {
+                if view.is_some() {
+                    return Err(ParseError {
+                        message: "cannot destructure a view declaration".into(),
+                        span: self.peek().span,
+                    });
+                }
+                return self.parse_tuple_destructure(None);
+            }
+        }
+
         let type_annotation = self.parse_declaration_type_annotation();
 
         if self.check(&TokenKind::LeftBracket) || self.check(&TokenKind::LeftBrace) {
@@ -561,6 +603,7 @@ impl<'src> Parser<'src> {
             self.consume_terminator();
             return Ok(Stmt::Destructure {
                 is_array,
+                is_tuple: false,
                 names,
                 keys,
                 initializer,
@@ -573,8 +616,57 @@ impl<'src> Parser<'src> {
 
         Ok(Stmt::Destructure {
             is_array,
+            is_tuple: false,
             names,
             keys,
+            initializer,
+        })
+    }
+
+    fn parse_tuple_destructure(
+        &mut self,
+        type_annotation: Option<TypeAnnotation>,
+    ) -> Result<Stmt, ParseError> {
+        self.advance(); // consume `(`
+        let mut names = Vec::new();
+        loop {
+            if self.check(&TokenKind::RightParen) {
+                break;
+            }
+            let name = self.expect_ident("expected variable name in tuple destructuring")?;
+            names.push(name);
+            if self.consume(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(
+            TokenKind::RightParen,
+            "expected ')' after tuple destructuring",
+        )?;
+        if type_annotation.is_some() {
+            self.consume_terminator();
+        } else {
+            self.expect(TokenKind::Equal, "expected '=' in tuple destructuring")?;
+            let initializer = self.parse_expression()?;
+            self.consume_terminator();
+            return Ok(Stmt::Destructure {
+                is_array: false,
+                is_tuple: true,
+                names,
+                keys: vec![],
+                initializer,
+            });
+        }
+
+        self.expect(TokenKind::Equal, "expected '=' in tuple destructuring")?;
+        let initializer = self.parse_expression()?;
+        self.consume_terminator();
+
+        Ok(Stmt::Destructure {
+            is_array: false,
+            is_tuple: true,
+            names,
+            keys: vec![],
             initializer,
         })
     }
@@ -932,6 +1024,32 @@ impl<'src> Parser<'src> {
             let _shared_token = self.advance();
             let inner = self.parse_type_annotation(true)?;
             return Some(TypeAnnotation::Shared(Box::new(inner)));
+        }
+        // Tuple type: `(T1, T2, ...)` — detect by `(` followed by a type
+        // then `,`. A single `(T)` is just grouping (handled elsewhere).
+        if self.peek().kind == TokenKind::LeftParen && *self.peek_at(1) != TokenKind::RightParen {
+            let saved = self.position;
+            self.advance(); // consume `(`
+            let first = self.parse_type_annotation(true);
+            match first {
+                Some(first_type) if self.check(&TokenKind::Comma) => {
+                    let mut types = vec![first_type];
+                    while self.consume(&TokenKind::Comma).is_some() {
+                        if self.check(&TokenKind::RightParen) {
+                            break;
+                        }
+                        if let Some(ty) = self.parse_type_annotation(true) {
+                            types.push(ty);
+                        }
+                    }
+                    self.expect(TokenKind::RightParen, "expected ')' after tuple type")
+                        .ok()?;
+                    return Some(TypeAnnotation::Tuple(types));
+                }
+                _ => {}
+            }
+            // Not a tuple — reset and fall through.
+            self.position = saved;
         }
         if self.peek().kind.is_type_keyword() {
             let token = self.advance();
@@ -1761,6 +1879,21 @@ impl<'src> Parser<'src> {
             TokenKind::LeftParen => {
                 let open = self.advance();
                 let expr = self.parse_expression()?;
+                // If followed by a comma, this is a tuple literal `(e1, e2, ...)`.
+                if self.check(&TokenKind::Comma) {
+                    let mut elements = vec![expr];
+                    while self.consume(&TokenKind::Comma).is_some() {
+                        if self.check(&TokenKind::RightParen) {
+                            break;
+                        }
+                        elements.push(self.parse_expression()?);
+                    }
+                    let close = self.expect(TokenKind::RightParen, "expected ')' after tuple")?;
+                    return Ok(Expr::TupleLiteral {
+                        elements,
+                        span: open.span.to(close.span),
+                    });
+                }
                 let close = self.expect(TokenKind::RightParen, "expected ')'")?;
                 Ok(Expr::Grouping {
                     expression: Box::new(expr),
@@ -2200,7 +2333,18 @@ impl<'src> Parser<'src> {
                 }
             }
             TokenKind::Dot => {
-                self.advance();
+                let dot_token = self.advance();
+                // Tuple index: `t.0`, `t.1`
+                if let TokenKind::NumberLiteral(ref s) = self.peek().kind
+                    && let Ok(idx) = s.parse::<usize>()
+                {
+                    let num_token = self.advance();
+                    return Ok(Expr::TupleIndex {
+                        object: Box::new(left),
+                        index: idx,
+                        dot_span: dot_token.span.to(num_token.span),
+                    });
+                }
                 let property = self.parse_member_name()?;
                 Ok(Expr::Member {
                     object: Box::new(left),
