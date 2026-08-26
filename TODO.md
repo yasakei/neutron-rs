@@ -188,6 +188,30 @@ Fast without heroics:
 - No flags to tune for typical programs; optimizations are on by default.
 - An in-repo benchmark suite guards regressions per language feature.
 
+## [ ] Features needed before a package manager
+
+Building `ntsc` (the package manager) in Neutron itself requires these
+primitives — most are implementable with existing stdlib modules, some need
+new APIs or language support:
+
+- [ ] **Recursive directory walk:** `sys.walk(path)` or equivalent that yields every file/directory under a root. The `io` and `sys` modules have the pieces (`exists`, `read_dir`-ish), but no single call traverses a tree yet.
+- [ ] **Glob pattern matching:** `fnmatch("src/**/*.nt", path)` style matching for source selection and ignore rules. Could live in a `paths` or `glob` stdlib module, or be built on top of `regex`.
+- [ ] **Archive extraction (tar/zip):** Either shell out to `tar`/`unzip` via `process.exec`, or implement minimal pure-Neutron extractors for `.tar.gz` and `.zip`. The latter requires gzip decompression (inflate), which is non-trivial.
+- [ ] **Path manipulation:** A `Path` class or `paths` module with `join`, `parent`, `file_name`, `extension`, `with_extension`, `relative_to`. The existing `os` module covers some basics but not the full set a package manager needs.
+- [ ] **Semver parsing and comparison:** Parse `"1.2.3"` into major/minor/patch, compare versions, resolve compatible ranges (`^1.0.0`, `>=1.2 <2.0`). A `semver` module or built-in support.
+- [ ] **Lockfile read/write:** Deterministic dependency resolution output. JSON or TOML — both parsers exist, but the resolution algorithm (topological sort with conflict detection) needs implementing.
+- [ ] **Streaming HTTP downloads:** `http.get` returns the full body at once. For large packages, streaming with progress reporting would be better. Currently not supported.
+- [ ] **Concurrent downloads with progress:** `async` + `wait_all` can parallelize, but there's no progress callback or partial-result streaming yet. A channel-based progress pattern would work.
+- [ ] **File locking:** Prevent concurrent `ntsc` invocations from corrupting the package directory. Advisory file locks via `fcntl`-style API or a stdlib wrapper.
+- [ ] **_symlink support:** Creating symlinks for local development (`ntsc link`). May need `os.symlink` or a small FFI call.
+- [ ] **Hash verification beyond SHA256:** Optional signature verification (ed25519 or similar) for trusted registries. Depends on crypto module expansion.
+
+### Nice to have (not blockers)
+
+- [ ] **HTTP streaming response body** for large downloads with progress.
+- [ ] **tar.gz and zip decompression** in pure Neutron (avoids shelling out).
+- [ ] **Cross-platform path normalization** (handle `\` vs `/` transparently).
+
 ---
 
 ## Completion criteria
