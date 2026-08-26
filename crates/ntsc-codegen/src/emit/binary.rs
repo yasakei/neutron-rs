@@ -17,6 +17,12 @@ pub(crate) fn emit_binary<'ctx>(
         peel_view(normalize_self(fn_ctx, rhs_val)?)
     };
 
+    // Operator overloading: when at least one operand is a class type,
+    // attempt to dispatch to an operator method on that class.
+    if let Some(result) = try_emit_operator_method(fn_ctx, op, &lhs, &rhs)? {
+        return Ok(result);
+    }
+
     let op_ty = match (&lhs.ntsc_type, &rhs.ntsc_type) {
         (Ty::Int, Ty::Int) => Ty::Int,
         (Ty::Float, Ty::Float) | (Ty::Float, Ty::Int) | (Ty::Int, Ty::Float) => Ty::Float,
@@ -496,6 +502,79 @@ pub(crate) fn emit_binary<'ctx>(
             op.kind, op_ty
         ))),
     }
+}
+
+/// Try to emit a binary operator as a method call on a class type.
+/// Returns `Some(result)` when at least one operand is a class with the
+/// operator method, `None` to fall through to built-in operations.
+fn try_emit_operator_method<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    op: &ntsc_ast::token::Token,
+    lhs: &TypedValue<'ctx>,
+    rhs: &TypedValue<'ctx>,
+) -> Result<Option<TypedValue<'ctx>>, crate::CodegenError> {
+    let method_name = match &op.kind {
+        TokenKind::Plus => "+",
+        TokenKind::Minus => "-",
+        TokenKind::Star => "*",
+        TokenKind::Slash => "/",
+        TokenKind::Percent => "%",
+        TokenKind::EqualEqual => "==",
+        TokenKind::BangEqual => "!=",
+        TokenKind::Less => "<",
+        TokenKind::LessEqual => "<=",
+        TokenKind::Greater => ">",
+        TokenKind::GreaterEqual => ">=",
+        _ => return Ok(None),
+    };
+
+    // Determine the receiver (left operand for most operators).
+    let dispatch_label = match &lhs.ntsc_type {
+        Ty::View(inner, _) => inner.label(),
+        other => other.label(),
+    };
+
+    let Some(declaring) = class_method_declaring_class(&dispatch_label, method_name) else {
+        return Ok(None);
+    };
+
+    let fn_name = format!("{declaring}.{method_name}");
+    let Some(fn_val) = fn_ctx.module.get_function(&fn_name) else {
+        return Ok(None);
+    };
+
+    let method_param_tys = class_method_declared_param_types(&declaring, method_name);
+
+    // Build the LLVM argument list: receiver pointer + right operand.
+    // Operator parameters are `view` by convention, so the right operand
+    // is passed by pointer without ownership transfer.
+    let receiver = if declaring == dispatch_label {
+        lhs.value.into_pointer_value()
+    } else {
+        fn_ctx.builder.build_pointer_cast(
+            lhs.value.into_pointer_value(),
+            fn_ctx.context.ptr_type(AddressSpace::default()),
+            "op_receiver",
+        )?
+    };
+
+    let mut llvm_args = vec![BasicMetadataValueEnum::PointerValue(receiver)];
+    // Pass each parameter (excluding `this`) from the right-hand operand.
+    // Most operators take exactly one parameter; multi-operand cases are
+    // future-proofed by iterating the declared parameter types.
+    for param_ty in &method_param_tys {
+        let val = match param_ty {
+            Ty::View(..) => TypedValue::new(rhs.value, Ty::View(Box::new(rhs.ntsc_type.clone()), false)),
+            _ => rhs.clone(),
+        };
+        llvm_args.push(val.value.into());
+    }
+
+    let result = fn_ctx.builder.build_call(fn_val, &llvm_args, "op_method")?;
+    let ret_val = call_result_to_value(fn_ctx, &result);
+    let ret_ty = class_method_ret_ty(&declaring, method_name).unwrap_or(Ty::Any);
+
+    Ok(Some(TypedValue::new(ret_val, ret_ty)))
 }
 
 #[derive(Copy, Clone)]

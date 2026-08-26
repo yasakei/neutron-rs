@@ -95,6 +95,10 @@ struct ClassInfo {
     /// Method names. Their signatures are not modelled here, so a method
     /// reference stays `any` and its call is unchecked.
     methods: HashSet<String>,
+
+    /// Operator method names to their declared return types.
+    /// Populated for methods whose name is an operator symbol (+, -, etc.).
+    operator_returns: HashMap<String, Ty>,
 }
 
 /// The type checker state.
@@ -355,6 +359,7 @@ impl TypeChecker {
                 parent: parent.as_ref().map(|p| p.lexeme().to_string()),
                 fields: HashMap::new(),
                 methods: HashSet::new(),
+                operator_returns: HashMap::new(),
             };
             for member in body {
                 match member {
@@ -380,9 +385,24 @@ impl TypeChecker {
                         };
                         info.fields.insert(field.lexeme().to_string(), ty);
                     }
-                    Stmt::Function { name: method, .. }
-                    | Stmt::AsyncFunction { name: method, .. } => {
-                        info.methods.insert(method.lexeme().to_string());
+                    Stmt::Function {
+                        name: method,
+                        return_type,
+                        ..
+                    }
+                    | Stmt::AsyncFunction {
+                        name: method,
+                        return_type,
+                        ..
+                    } => {
+                        let lexeme = method.lexeme().to_string();
+                        info.methods.insert(lexeme.clone());
+                        if is_operator_name(&lexeme) {
+                            let ret = self.resolve_annotation(
+                                return_type.as_ref().map(|r| &r.ty),
+                            );
+                            info.operator_returns.insert(lexeme, ret);
+                        }
                     }
                     _ => {}
                 }
@@ -469,6 +489,28 @@ impl TypeChecker {
             .and_then(base_class_name)
             .and_then(|class| self.class_field_ty(class, property.lexeme()))
             .unwrap_or(Ty::Any)
+    }
+
+    /// Look up the declared return type of an operator method on `class_name`,
+    /// walking the `extends` chain. Returns `None` when the class does not
+    /// define the operator.
+    fn lookup_operator_return(&self, class_name: &str, op: &str) -> Option<Ty> {
+        let mut current = Some(class_name);
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name) {
+                break;
+            }
+            if let Some(info) = self.classes.get(name) {
+                if let Some(ret) = info.operator_returns.get(op) {
+                    return Some(ret.clone());
+                }
+                current = info.parent.as_deref();
+            } else {
+                break;
+            }
+        }
+        None
     }
 
     /// Best-effort source span for a statement, used for diagnostics.
@@ -2389,6 +2431,38 @@ impl TypeChecker {
                 Some(Ty::String)
             }
 
+            // Operator overloading: when at least one operand is a class
+            // type, look up the operator method and use its declared return
+            // type. Must come before the generic "same type → bool" arm so
+            // class types with custom operators are intercepted first.
+            (op_tok, Some(l), Some(r))
+                if binary_op_method_name(op_tok).is_some()
+                    && (base_class_name(l).is_some()
+                        || base_class_name(r).is_some()) =>
+            {
+                if let Some(method_name) = binary_op_method_name(op_tok) {
+                    let class_name = base_class_name(l)
+                        .or_else(|| base_class_name(r));
+                    if let Some(class) = class_name {
+                        if let Some(ret) = self.lookup_operator_return(class, method_name) {
+                            return Some(ret);
+                        }
+                        self.errors.push(TypeError {
+                            code: None,
+                            help: None,
+                            message: format!(
+                                "type `{}` does not implement binary operator `{}`",
+                                l,
+                                op_lexeme(op_tok)
+                            ),
+                            span: op.span,
+                        });
+                        return Some(Ty::Any);
+                    }
+                }
+                Some(Ty::Any)
+            }
+
             // Comparison: same type → bool
             (
                 TokenKind::EqualEqual
@@ -2479,6 +2553,33 @@ impl TypeChecker {
         match (&op.kind, &right_ty) {
             (TokenKind::Minus, Some(Ty::Int)) => Some(Ty::Int),
             (TokenKind::Minus, Some(Ty::Float)) => Some(Ty::Float),
+
+            // Unary operator overloading for class types. Must come before
+            // the generic `Bang → bool` and `Minus → error` arms.
+            (TokenKind::Minus, Some(ty)) if base_class_name(ty).is_some() => {
+                if let Some(class) = base_class_name(ty)
+                    && let Some(ret) = self.lookup_operator_return(class, "-")
+                {
+                    return Some(ret);
+                }
+                self.errors.push(TypeError {
+                    code: None,
+                    help: None,
+                    message: format!("type `{}` does not implement unary operator `-`", ty),
+                    span: op.span,
+                });
+                Some(Ty::Any)
+            }
+            (TokenKind::Bang, Some(ty)) if base_class_name(ty).is_some() => {
+                if let Some(class) = base_class_name(ty)
+                    && let Some(ret) = self.lookup_operator_return(class, "!")
+                {
+                    return Some(ret);
+                }
+                // No `!` operator defined — fall back to bool negation.
+                Some(Ty::Bool)
+            }
+
             (TokenKind::Bang, _) => Some(Ty::Bool),
             (TokenKind::Minus, Some(Ty::Any)) => Some(Ty::Any),
             (TokenKind::Minus, Some(ty)) => {
@@ -3137,6 +3238,33 @@ fn op_lexeme(kind: &TokenKind) -> &'static str {
         TokenKind::And | TokenKind::AndSym => "&&",
         TokenKind::Or | TokenKind::OrSym => "||",
         _ => "?",
+    }
+}
+
+/// Whether a method name is an operator symbol that may be overloaded.
+fn is_operator_name(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-" | "*" | "/" | "%" | "!" | "==" | "!=" | "<" | "<=" | ">" | ">="
+    )
+}
+
+/// Map a binary operator token kind to the operator method name used for
+/// overloading (the lexeme stored as a method name on the class).
+fn binary_op_method_name(kind: &TokenKind) -> Option<&'static str> {
+    match kind {
+        TokenKind::Plus => Some("+"),
+        TokenKind::Minus => Some("-"),
+        TokenKind::Star => Some("*"),
+        TokenKind::Slash => Some("/"),
+        TokenKind::Percent => Some("%"),
+        TokenKind::EqualEqual => Some("=="),
+        TokenKind::BangEqual => Some("!="),
+        TokenKind::Less => Some("<"),
+        TokenKind::LessEqual => Some("<="),
+        TokenKind::Greater => Some(">"),
+        TokenKind::GreaterEqual => Some(">="),
+        _ => None,
     }
 }
 

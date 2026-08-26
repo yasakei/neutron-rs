@@ -24,6 +24,46 @@ impl std::error::Error for ParseError {}
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+/// Whether `kind` is an operator token that may be used as an overloaded
+/// method name inside a class body (`fun +(view Vec other) -> Vec`).
+fn is_operator_token(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::Bang
+            | TokenKind::EqualEqual
+            | TokenKind::BangEqual
+            | TokenKind::Less
+            | TokenKind::LessEqual
+            | TokenKind::Greater
+            | TokenKind::GreaterEqual
+    )
+}
+
+/// Map an operator token kind to its source-level lexeme, used when
+/// synthesising an `Identifier(lexeme)` token for an operator method name.
+fn operator_token_lexeme(kind: &TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Plus => "+",
+        TokenKind::Minus => "-",
+        TokenKind::Star => "*",
+        TokenKind::Slash => "/",
+        TokenKind::Percent => "%",
+        TokenKind::Bang => "!",
+        TokenKind::EqualEqual => "==",
+        TokenKind::BangEqual => "!=",
+        TokenKind::Less => "<",
+        TokenKind::LessEqual => "<=",
+        TokenKind::Greater => ">",
+        TokenKind::GreaterEqual => ">=",
+        _ => "",
+    }
+}
+
 fn token_debug_name(kind: &TokenKind) -> &'static str {
     match kind {
         TokenKind::LeftParen => "(",
@@ -381,7 +421,11 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Fun => {
                 // `fun name(...)` is a declaration; `fun(...)` is a lambda expression.
-                if self.peek_at_ident(1) && !self.peek_at_type_keyword(1) {
+                // Operator tokens (+, -, *, /, %, !) are accepted as method
+                // names inside class bodies for operator overloading.
+                if (self.peek_at_ident(1) && !self.peek_at_type_keyword(1))
+                    || self.peek_at_operator(1)
+                {
                     self.parse_function_declaration()
                 } else {
                     self.parse_expression_statement()
@@ -707,7 +751,7 @@ impl<'src> Parser<'src> {
 
     fn parse_function_declaration(&mut self) -> Result<Stmt, ParseError> {
         let _fun_token = self.advance();
-        let name = self.expect_ident("expected function name")?;
+        let name = self.parse_method_name()?;
         let mut generic_params = self.parse_generic_params()?;
         let (params, return_type) = self.parse_function_signature()?;
         self.parse_where_bounds(&mut generic_params)?;
@@ -720,6 +764,26 @@ impl<'src> Parser<'src> {
             return_type,
             body,
         })
+    }
+
+    /// Parse a method name: either a regular identifier or an operator
+    /// token (+, -, *, /, %, !) used for operator overloading. Operator
+    /// tokens are converted to `Identifier(lexeme)` so the rest of the
+    /// pipeline sees the source text uniformly.
+    fn parse_method_name(&mut self) -> Result<Token, ParseError> {
+        if let TokenKind::Identifier(_) = self.peek().kind {
+            Ok(self.advance())
+        } else if is_operator_token(&self.peek().kind) {
+            let tok = self.peek().clone();
+            let lexeme = operator_token_lexeme(&tok.kind).to_string();
+            self.advance();
+            Ok(Token::new(TokenKind::Identifier(lexeme), tok.span))
+        } else {
+            Err(ParseError {
+                message: "expected method name".to_string(),
+                span: self.peek().span,
+            })
+        }
     }
 
     fn parse_generic_params(&mut self) -> Result<Vec<GenericParam>, ParseError> {
@@ -1254,6 +1318,10 @@ impl<'src> Parser<'src> {
 
     fn peek_at_type_keyword(&self, offset: usize) -> bool {
         self.peek_at(offset).is_type_keyword()
+    }
+
+    fn peek_at_operator(&self, offset: usize) -> bool {
+        is_operator_token(self.peek_at(offset))
     }
 
     fn peek_at(&self, offset: usize) -> &TokenKind {

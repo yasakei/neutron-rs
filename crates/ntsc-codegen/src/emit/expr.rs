@@ -1430,12 +1430,23 @@ pub(crate) fn emit_unary<'ctx>(
                     builder.build_float_neg(operand.value.into_float_value(), "fnegtmp")?;
                 Ok(TypedValue::new(result.into(), Ty::Float))
             }
+            // Unary operator overloading for class types.
+            ty @ Ty::Class(_) => {
+                emit_unary_operator_method(fn_ctx, "-", &operand, ty)
+            }
             _ => Ok(TypedValue::new(
                 default_llvm_value(&Ty::Any, fn_ctx.context),
                 Ty::Any,
             )),
         },
         TokenKind::Bang => {
+            // Unary operator overloading for class types.
+            if let Ty::Class(_) = &operand.ntsc_type
+                && let Some(result) =
+                    try_emit_unary_operator_method(fn_ctx, "!", &operand)?
+            {
+                return Ok(result);
+            }
             let zero = fn_ctx.context.bool_type().const_zero();
             let cmp = builder.build_int_compare(
                 IntPredicate::EQ,
@@ -1455,4 +1466,56 @@ pub(crate) fn emit_unary<'ctx>(
             Ty::Any,
         )),
     }
+}
+
+/// Emit a unary operator method call on a class type.
+fn emit_unary_operator_method<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    method_name: &str,
+    operand: &TypedValue<'ctx>,
+    ty: &Ty,
+) -> Result<TypedValue<'ctx>, crate::CodegenError> {
+    let dispatch_label = ty.label();
+    let Some(declaring) = class_method_declaring_class(&dispatch_label, method_name) else {
+        return Ok(TypedValue::new(
+            default_llvm_value(&Ty::Any, fn_ctx.context),
+            Ty::Any,
+        ));
+    };
+    let fn_name = format!("{declaring}.{method_name}");
+    let Some(fn_val) = fn_ctx.module.get_function(&fn_name) else {
+        return Ok(TypedValue::new(
+            default_llvm_value(&Ty::Any, fn_ctx.context),
+            Ty::Any,
+        ));
+    };
+    let receiver = operand.value.into_pointer_value();
+    let llvm_args = vec![BasicMetadataValueEnum::PointerValue(receiver)];
+    let result = fn_ctx.builder.build_call(fn_val, &llvm_args, "unary_op")?;
+    let ret_val = call_result_to_value(fn_ctx, &result);
+    let ret_ty = class_method_ret_ty(&declaring, method_name).unwrap_or(Ty::Any);
+    Ok(TypedValue::new(ret_val, ret_ty))
+}
+
+/// Try to emit a unary `!` operator as a method call. Returns `Some(result)`
+/// when the class defines `!`, `None` to fall through to bool negation.
+fn try_emit_unary_operator_method<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    method_name: &str,
+    operand: &TypedValue<'ctx>,
+) -> Result<Option<TypedValue<'ctx>>, crate::CodegenError> {
+    let dispatch_label = operand.ntsc_type.label();
+    let Some(declaring) = class_method_declaring_class(&dispatch_label, method_name) else {
+        return Ok(None);
+    };
+    let fn_name = format!("{declaring}.{method_name}");
+    let Some(fn_val) = fn_ctx.module.get_function(&fn_name) else {
+        return Ok(None);
+    };
+    let receiver = operand.value.into_pointer_value();
+    let llvm_args = vec![BasicMetadataValueEnum::PointerValue(receiver)];
+    let result = fn_ctx.builder.build_call(fn_val, &llvm_args, "unary_op")?;
+    let ret_val = call_result_to_value(fn_ctx, &result);
+    let ret_ty = class_method_ret_ty(&declaring, method_name).unwrap_or(Ty::Any);
+    Ok(Some(TypedValue::new(ret_val, ret_ty)))
 }
