@@ -205,15 +205,26 @@ fn walk_recursive(base: &Path, dir: &Path, results: &mut Vec<String>) {
 pub extern "C" fn ntsc_sys_symlink(target: i64, link: i64) -> i8 {
     let target = registry::get_string(target).unwrap_or_default();
     let link = registry::get_string(link).unwrap_or_default();
-    match std::os::unix::fs::symlink(&target, &link) {
-        Ok(_) => 1,
-        Err(e) => {
-            let _ = fail(
-                "symlink",
-                format!("cannot create symlink '{link}' -> '{target}': {e}"),
-            );
-            0
+    #[cfg(unix)]
+    {
+        match std::os::unix::fs::symlink(&target, &link) {
+            Ok(_) => 1,
+            Err(e) => {
+                let _ = fail(
+                    "symlink",
+                    format!("cannot create symlink '{link}' -> '{target}': {e}"),
+                );
+                0
+            }
         }
+    }
+    #[cfg(windows)]
+    {
+        let _ = fail(
+            "symlink",
+            "symlink creation is not supported on Windows (requires elevated privileges)",
+        );
+        0
     }
 }
 
