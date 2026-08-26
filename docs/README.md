@@ -25,7 +25,9 @@ examples. Read it in order if you are new to NTSC.
 | [Ownership](guide/ownership.md) | The Own - Move - View model: moves, views, `view mut`, `copy`, and escape analysis. |
 | [Shared values](guide/shared-values.md) | The `shared T` escape hatch for explicit aliasing. |
 | [Arrays and iterators](guide/arrays-and-iterators.md) | Arrays, indexing, `for-in`, the iterator protocol, and the `arrays` module. |
+| [Tuples](guide/tuples.md) | Tuple literals, indexing, destructuring, and multiple return values. |
 | [Error handling](guide/error-handling.md) | Exceptions, `try`/`catch`/`finally`, `retry`, results with `?` propagation, and the standard library error convention. |
+| [Unsafe and raw pointers](guide/unsafe-and-pointers.md) | `unsafe` blocks, raw pointers, `memory.raw_address`, and safety rules. |
 | [Modules and imports](guide/modules.md) | Multi-file projects and the file-import system. |
 | [Concurrency](guide/concurrency.md) | Threads, channels, and `async`/`await`. |
 | [Testing](guide/testing.md) | `test` blocks and the `ntsc test` runner. |
@@ -67,9 +69,12 @@ The language currently provides:
 - Ownership with move semantics, block-scoped views (`view`, `view mut`),
   explicit deep copies (`copy`), and a `shared T` alias escape hatch.
 - Escape analysis that stack-allocates non-escaping class instances.
-- Classes with constructors and methods, single inheritance, enums, and
-  `match` with guards and destructuring patterns.
+- Classes with constructors and methods, single inheritance, enums,
+  operator overloading, and `match` with guards and destructuring patterns.
 - Lambdas and a first-class function type.
+- Tuples for multiple return values and heterogeneous grouping.
+- Compile-time constant evaluation (`static const`) with pure function
+  folding.
 - Exceptions (`throw`/`try`/`catch`/`finally`), `retry`, and unsafe blocks.
 - The iterator protocol, letting any class with `length()` and `get(i)`
   participate in `for-in`.

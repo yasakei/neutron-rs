@@ -35,7 +35,7 @@ The goal is to add the missing language features that would make Neutron a fully
 - [x] Add `Option<T>` combinators: `ok_or`, `ok_or_else` to bridge `Option` and `Result`.
 - [x] Add e2e tests: `?` propagation, error conversion, combinator chaining.
 
-## [ ] Operator overloading
+## [X] Operator overloading
 
 Make custom types feel built-in:
 
@@ -54,15 +54,15 @@ Take data apart in one line instead of manual tag checks:
 - Bound values are usable immediately — the compiler handles view/copy details silently.
 - Add e2e tests: result matching, array destructuring, ranges, exhaustive switch.
 
-## [ ] Compile-time evaluation
+## [x] Compile-time evaluation
 
 Constants cost nothing at runtime and need no new syntax to learn:
 
-- `static const LIMIT = 4 * 1024` accepts any constant expression, including references to earlier constants.
-- Constants work anywhere fixed sizes are needed (array lengths).
-- A pure function called from a constant context runs at build time — same code, same spelling.
-- Circular references get a clear error showing the cycle.
-- Add e2e tests: folded arithmetic, constants as array sizes, build-time function call.
+- [x] `static const LIMIT = 4 * 1024` accepts any constant expression, including references to earlier constants.
+- [x] Constants work anywhere fixed sizes are needed (array lengths).
+- [x] A pure function called from a constant context runs at build time — same code, same spelling.
+- [x] Circular references get a clear error showing the cycle.
+- [x] Add e2e tests: folded arithmetic, constants as array sizes, build-time function call.
 
 ## [ ] Derived implementations
 
@@ -73,7 +73,7 @@ One word deletes boilerplate:
 - Deriving is always equivalent to the code you would have written by hand — no surprises.
 - Add e2e tests: derived equality/formatting, enum accessors.
 
-## [ ] Tuples and multiple return values
+## [x] Tuples and multiple return values
 
 Return two values as easily as one:
 

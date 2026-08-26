@@ -114,8 +114,11 @@ infinity and an undefined one is NaN.
 
 ## Unsafe blocks
 
-`unsafe <body>` is parsed and type-checked. It currently lowers to a plain
-block; exception-converting semantics are not yet implemented.
+`unsafe { ... }` gates raw-pointer operations at type-check time. Inside an
+`unsafe` block, raw pointer dereferences and `memory.raw_address(...)` are
+permitted. The block itself is a plain block at runtime — it does not change
+error-handling behavior. See [Unsafe and raw pointers](unsafe-and-pointers.md)
+for details.
 
 ## Standard library error convention
 

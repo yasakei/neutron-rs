@@ -92,6 +92,74 @@ Without an initializer the variable starts at its zero value (`0`, `0.0`,
 static var int calls = 0
 ```
 
+### Compile-time constants
+
+`static const` declares a constant that is evaluated at compile time. The
+initializer must be a constant expression: literals, arithmetic on constants,
+references to earlier constants, and calls to pure functions (functions whose
+body is a single `return`):
+
+```ntsc
+static const var int SIZE = 1024
+static const var int HALF = SIZE / 2
+```
+
+Constants can reference other constants declared above them:
+
+```ntsc
+static const var int BASE = 100
+static const var int OFFSET = 23
+static const var int LIMIT = BASE + OFFSET   // folded to 123
+```
+
+Arithmetic is folded at build time — `LIMIT` becomes the literal `123` in the
+compiled output. Comparisons work too:
+
+```ntsc
+static const var bool OK = 3 < 5   // folded to true
+```
+
+#### Pure functions at build time
+
+A function whose body is a single `return` statement is considered *pure* and
+can be called from a `static const` initializer. The call runs at compile time:
+
+```ntsc
+fun double(int x) -> int {
+    return x * 2
+}
+
+static const var int VAL = double(21)   // folded to 42
+```
+
+Pure functions can compose with constants:
+
+```ntsc
+fun square(int x) -> int {
+    return x * x
+}
+
+static const var int N = 5
+static const var int SQ = square(N)   // folded to 25
+```
+
+#### Using constants
+
+Constants can be used anywhere a literal is accepted — as array sizes, loop
+bounds, or initializers:
+
+```ntsc
+static const var int COUNT = 3 * 2
+
+fun main() {
+    var i = 0
+    while (i < COUNT) {
+        say("" + i)
+        i = i + 1
+    }
+}
+```
+
 ## Operators
 
 Precedence from highest to lowest:
@@ -125,11 +193,15 @@ n++
 say("" + n)   // 2
 ```
 
+Classes can overload these operators — see [Classes](classes.md#operator-overloading).
+
 ### Comparison and logic
 
 `==`, `!=`, `<`, `<=`, `>`, `>=` compare scalars; `==` on heap values compares
 identity, not contents. `&&` and `||` short-circuit. `!` negates a boolean.
 The words `and` and `or` are not operators; use the symbols.
+
+Classes can overload comparison operators — see [Classes](classes.md#operator-overloading).
 
 ### Bitwise
 
@@ -231,3 +303,42 @@ A `case` with a guard places `if <condition>` between the pattern and the
 arrow. The first matching case wins; the match value is consumed once.
 
 See [Classes and enums](classes.md) for matching on enum values.
+
+## Tuples
+
+Tuples group multiple values into a single value. Each element can have a
+different type:
+
+```ntsc
+var t = (10, "hello", true)
+```
+
+Elements are accessed by zero-based dot index:
+
+```ntsc
+say("" + t.0)   // 10
+say(t.1)        // hello
+```
+
+Tuples can be destructured into individual variables:
+
+```ntsc
+var (a, b, c) = t
+say("" + a)   // 10
+say(b)        // hello
+```
+
+Functions can return tuples, which is useful for multiple return values:
+
+```ntsc
+fun bounds() -> (int, int) {
+    return (100, 200)
+}
+
+fun main() {
+    var (w, h) = bounds()
+    say("" + w)   // 100
+}
+```
+
+See the [Tuples](tuples.md) guide for full details.

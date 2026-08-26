@@ -22,6 +22,11 @@ pub fn emit_module(
     // recorded while erasing trait declarations.
     super::dyn_obj::load_trait_tables(ntsc_typeck::take_trait_object_tables());
 
+    // Compile-time constant values folded by the type checker.
+    CONST_EVAL_VALUES.with(|map| {
+        *map.borrow_mut() = ntsc_typeck::take_const_values();
+    });
+
     let module = context.create_module("ntsc_main");
 
     // Anchor the module to the target machine's ABI. The optimization pass

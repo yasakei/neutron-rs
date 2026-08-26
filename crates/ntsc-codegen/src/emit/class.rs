@@ -304,6 +304,10 @@ pub(crate) fn emit_top_level_var<'ctx>(
 /// string literals are built lazily on first use (permanent handles, so the
 /// global is only filled once). The name is registered in `STATIC_CONSTS`
 /// so `emit_variable` resolves references from anywhere.
+///
+/// When the type checker has pre-evaluated the constant (folded arithmetic,
+/// pure function calls, etc.), the folded value is used directly instead of
+/// pattern-matching on the AST.
 pub(crate) fn emit_static_const<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
@@ -311,13 +315,28 @@ pub(crate) fn emit_static_const<'ctx>(
     type_annotation: &Option<ntsc_ast::types::TypeAnnotation>,
     initializer: &Option<Expr>,
 ) -> Result<(), crate::CodegenError> {
-    let ty = type_annotation
-        .as_ref()
-        .map(|ann| type_annotation_to_ty(&Some(ann.clone())))
-        .or_else(|| initializer.as_ref().and_then(expr_to_literal_ty))
-        .unwrap_or(Ty::Any);
+    let name_str = name.lexeme().to_string();
 
-    let global_name = format!("ntsc_const_{}", name.lexeme());
+    // Check for a pre-evaluated constant value from the type checker.
+    let pre_evaluated = CONST_EVAL_VALUES.with(|map| map.borrow().get(&name_str).cloned());
+
+    let ty = if let Some(ref val) = pre_evaluated {
+        // Infer type from the pre-evaluated value.
+        match val {
+            ntsc_typeck::ConstValue::Int(_) => Ty::Int,
+            ntsc_typeck::ConstValue::Float(_) => Ty::Float,
+            ntsc_typeck::ConstValue::Bool(_) => Ty::Bool,
+            ntsc_typeck::ConstValue::String(_) => Ty::String,
+        }
+    } else {
+        type_annotation
+            .as_ref()
+            .map(|ann| type_annotation_to_ty(&Some(ann.clone())))
+            .or_else(|| initializer.as_ref().and_then(expr_to_literal_ty))
+            .unwrap_or(Ty::Any)
+    };
+
+    let global_name = format!("ntsc_const_{name_str}");
     let llvm_ty = ty_to_llvm(&ty, context);
     let slot = module.add_global(
         llvm_ty,
@@ -325,7 +344,25 @@ pub(crate) fn emit_static_const<'ctx>(
         &global_name,
     );
 
-    if let Some(init) = initializer {
+    // Use pre-evaluated value when available, otherwise fall back to
+    // pattern-matching on the AST for backward compatibility.
+    if let Some(ref val) = pre_evaluated {
+        match val {
+            ntsc_typeck::ConstValue::Int(n) => {
+                slot.set_initializer(&context.i64_type().const_int(*n as u64, true));
+            }
+            ntsc_typeck::ConstValue::Float(f) => {
+                slot.set_initializer(&context.f64_type().const_float(*f));
+            }
+            ntsc_typeck::ConstValue::Bool(b) => {
+                slot.set_initializer(&context.bool_type().const_int(*b as u64, false));
+            }
+            ntsc_typeck::ConstValue::String(_) => {
+                // Strings are built lazily on first use.
+                slot.set_initializer(&llvm_ty.const_zero());
+            }
+        }
+    } else if let Some(init) = initializer {
         match (init, &ty) {
             (
                 Expr::Literal {
@@ -408,12 +445,10 @@ pub(crate) fn emit_static_const<'ctx>(
     }
 
     STATIC_CONST_TYPES.with(|map| {
-        map.borrow_mut()
-            .insert(name.lexeme().to_string(), ty.clone());
+        map.borrow_mut().insert(name_str.clone(), ty.clone());
     });
     STATIC_CONST_INITS.with(|map| {
-        map.borrow_mut()
-            .insert(name.lexeme().to_string(), initializer.clone());
+        map.borrow_mut().insert(name_str, initializer.clone());
     });
     Ok(())
 }

@@ -191,3 +191,133 @@ fun main() {
 
 The loop is equivalent to iterating indices `0 .. length()` and calling
 `get(i)` on each. See [Arrays and iterators](arrays-and-iterators.md).
+
+## Operator overloading
+
+Classes can overload operators by defining methods named after the operator
+symbol. When an operator is applied to a value of that class, the
+corresponding method is called.
+
+### Binary operators
+
+Define a method named after the operator. The right operand is a parameter:
+
+```ntsc
+class Vec {
+    var float x
+    var float y
+
+    fun init(float x, float y) {
+        this.x = x
+        this.y = y
+    }
+
+    fun +(view Vec other) -> Vec {
+        return Vec(this.x + other.x, this.y + other.y)
+    }
+
+    fun -(view Vec other) -> Vec {
+        return Vec(this.x - other.x, this.y - other.y)
+    }
+
+    fun *(float scalar) -> Vec {
+        return Vec(this.x * scalar, this.y * scalar)
+    }
+}
+
+fun main() {
+    var a = Vec(1.0, 2.0)
+    var b = Vec(3.0, 4.0)
+    var c = a + b
+    say("" + c.x)   // 4.0
+}
+```
+
+The right-hand parameter is typically `view` for class types to avoid
+consuming the operand. Scalar parameters (like `float scalar`) are passed
+by value.
+
+### Comparison operators
+
+Comparison operators return `bool` and work the same way:
+
+```ntsc
+class Point {
+    var int x
+    var int y
+
+    fun init(int x, int y) {
+        this.x = x
+        this.y = y
+    }
+
+    fun ==(view Point other) -> bool {
+        return this.x == other.x && this.y == other.y
+    }
+
+    fun !=(view Point other) -> bool {
+        return this.x != other.x || this.y != other.y
+    }
+
+    fun <(view Point other) -> bool {
+        return this.x < other.x
+    }
+
+    fun >(view Point other) -> bool {
+        return this.x > other.x
+    }
+}
+```
+
+With `<` defined, instances of `Point` can be used with `sort.sort_by` and
+other stdlib functions that accept a comparison function.
+
+### Unary operators
+
+Unary operators take no parameters:
+
+```ntsc
+class Vec {
+    var float x
+    var float y
+
+    fun init(float x, float y) {
+        this.x = x
+        this.y = y
+    }
+
+    fun -() -> Vec {
+        return Vec(-this.x, -this.y)
+    }
+}
+
+fun main() {
+    var a = Vec(3.0, -4.0)
+    var b = -a
+    say("" + b.x)   // -3.0
+}
+```
+
+### Supported operators
+
+| Operator | Method name | Example |
+| --- | --- | --- |
+| `+` | `+` | `a + b` |
+| `-` | `-` | `a - b` |
+| `*` | `*` | `a * b` |
+| `/` | `/` | `a / b` |
+| `%` | `%` | `a % b` |
+| `==` | `==` | `a == b` |
+| `!=` | `!=` | `a != b` |
+| `<` | `<` | `a < b` |
+| `<=` | `<=` | `a <= b` |
+| `>` | `>` | `a > b` |
+| `>=` | `>=` | `a >= b` |
+| unary `-` | `-` | `-a` |
+| unary `!` | `!` | `!a` |
+
+Operators can be chained:
+
+```ntsc
+var c = a + b * 2.0   // calls * then +
+```

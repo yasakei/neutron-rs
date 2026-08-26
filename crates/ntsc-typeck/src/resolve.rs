@@ -8,9 +8,23 @@ use ntsc_ast::stmt::{MatchCase, MatchPattern, Program, Stmt};
 use ntsc_ast::token::{Token, TokenKind};
 use ntsc_ast::types::TypeAnnotation;
 
+use crate::const_eval::{ConstEvaluator, ConstValue};
 use crate::names::resolve_program;
 use crate::scope::SymbolTable;
 use crate::ty::Ty;
+
+thread_local! {
+    /// Evaluated constant values produced by the type checker, keyed by
+    /// variable name. Codegen reads these to emit folded constants.
+    static CONST_EVAL_VALUES: std::cell::RefCell<HashMap<String, ConstValue>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Take the evaluated constant values out of thread-local storage.
+/// Called by codegen after `check_program` to consume the results.
+pub fn take_const_values() -> HashMap<String, ConstValue> {
+    CONST_EVAL_VALUES.with(|cell| cell.borrow_mut().drain().collect())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A type error with source location.
@@ -136,6 +150,10 @@ struct TypeChecker {
 
     /// Declared members of every class in the program, by class name.
     classes: HashMap<String, ClassInfo>,
+
+    /// Compile-time constant evaluator — folds arithmetic, resolves
+    /// references to earlier constants, and evaluates pure functions.
+    const_eval: ConstEvaluator,
 }
 
 impl TypeChecker {
@@ -182,6 +200,7 @@ impl TypeChecker {
             consts: HashSet::new(),
             capture_bases: Vec::new(),
             classes: HashMap::new(),
+            const_eval: ConstEvaluator::new(),
         }
     }
 
@@ -1001,7 +1020,7 @@ impl TypeChecker {
 
     fn check_function(
         &mut self,
-        _name: &str,
+        name: &str,
         params: &[ntsc_ast::expr::FunctionParam],
         return_type: &Option<ntsc_ast::types::ReturnType>,
         body: &[Stmt],
@@ -1063,6 +1082,20 @@ impl TypeChecker {
 
         for stmt in body {
             self.check_statement(stmt);
+        }
+
+        // Store function body for const evaluation.
+        // Only non-async functions with simple bodies (single return) are
+        // evaluated at build time.
+        if !is_async && !name.is_empty() {
+            let param_names: Vec<String> =
+                params.iter().map(|p| p.name.lexeme().to_string()).collect();
+            self.const_eval
+                .fn_bodies
+                .insert(name.to_string(), body.to_vec());
+            self.const_eval
+                .fn_params
+                .insert(name.to_string(), param_names);
         }
 
         self.async_depth = prev_async_depth;
@@ -1374,18 +1407,33 @@ impl TypeChecker {
         self.validate_shared_annotation(type_annotation.as_ref(), name.span);
         self.validate_no_view_storage_annotation(type_annotation.as_ref(), name.span);
 
+        let mut const_folded_val: Option<ConstValue> = None;
         if is_const {
             self.consts.insert(name.lexeme().to_string());
-            if !matches!(initializer, Some(init) if is_constant_expr(init)) {
-                self.errors.push(TypeError {
-                    code: None,
-                    help: None,
-                    message: format!(
-                        "`static const` variable `{}` requires a constant literal initializer",
-                        name.lexeme()
-                    ),
-                    span: name.span,
-                });
+            if let Some(init) = initializer {
+                if self.const_eval.is_constant_expr(init) {
+                    // Evaluate at compile time.
+                    if let Some(val) = self.const_eval.eval(init) {
+                        const_folded_val = Some(val.clone());
+                        let const_name = name.lexeme().to_string();
+                        CONST_EVAL_VALUES.with(|cell| {
+                            cell.borrow_mut().insert(const_name.clone(), val.clone());
+                        });
+                        // Register in the evaluator so later constants can
+                        // reference this one.
+                        self.const_eval.constants.insert(const_name, val);
+                    }
+                } else {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: format!(
+                            "`static const` variable `{}` requires a constant expression initializer",
+                            name.lexeme()
+                        ),
+                        span: name.span,
+                    });
+                }
             }
         }
 
@@ -1410,9 +1458,18 @@ impl TypeChecker {
             }
         }
         let declared_ty = self.resolve_annotation(type_annotation.as_ref());
-        let init_ty = initializer
-            .as_ref()
-            .and_then(|expr| self.check_expression(expr));
+        let init_ty = if let Some(val) = const_folded_val {
+            Some(match val {
+                ConstValue::Int(_) => Ty::Int,
+                ConstValue::Float(_) => Ty::Float,
+                ConstValue::Bool(_) => Ty::Bool,
+                ConstValue::String(_) => Ty::String,
+            })
+        } else {
+            initializer
+                .as_ref()
+                .and_then(|expr| self.check_expression(expr))
+        };
 
         // A view declaration stores a borrow, so a view-typed initializer is
         // allowed there (and only there).
@@ -3174,18 +3231,6 @@ impl TypeChecker {
 /// the value it points at.
 fn is_borrow_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::View(..) | Ty::Ref(..))
-}
-
-/// Whether an expression is a compile-time constant: a literal, a negated
-/// literal, or a parenthesized constant. Used to validate `static const`
-/// initializers.
-fn is_constant_expr(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal { .. } => true,
-        Expr::Unary { op, right } if op.lexeme() == "-" => is_constant_expr(right),
-        Expr::Grouping { expression, .. } => is_constant_expr(expression),
-        _ => false,
-    }
 }
 
 fn base_class_name(ty: &Ty) -> Option<&str> {

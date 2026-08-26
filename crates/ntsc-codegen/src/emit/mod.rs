@@ -93,6 +93,13 @@ thread_local! {
 }
 
 thread_local! {
+    /// `static const` variable name → pre-evaluated compile-time value,
+    /// populated by the type checker's const evaluator.
+    static CONST_EVAL_VALUES: RefCell<HashMap<String, ntsc_typeck::ConstValue>> =
+        RefCell::new(HashMap::new());
+}
+
+thread_local! {
     /// Class name → method name → declared return type.
     ///
     /// Used by the for-in iterator protocol to type the loop variable from

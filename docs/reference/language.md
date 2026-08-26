@@ -117,6 +117,7 @@ bool       float      array      object     any        result
 | `&T` / `&mut T` | Addressable reference / exclusive reference. |
 | `*const T` / `*mut T` | Raw pointer, usable only inside `unsafe`. |
 | `slice[T]` | Bounds-checked window over an `array[T]`. |
+| `(T, U, ...)` | Tuple type. |
 | class name | Instance of that class. |
 
 ### Type annotations
@@ -170,7 +171,9 @@ default and makes the dynamic boundary visible in source.
 
 ## Pointers and references
 
-Neutron keeps checked ownership separate from raw addresses.
+Neutron keeps checked ownership separate from raw addresses. See the
+[Unsafe and raw pointers](../guide/unsafe-and-pointers.md) guide for
+the full story.
 
 | Form | Meaning |
 | --- | --- |
@@ -252,13 +255,42 @@ type. `var` also starts the declaration of a `static var`:
 static var int calls = 0
 ```
 
+### Compile-time constants
+
+```
+static const [type] name = constant-expression
+```
+
+`static const` declares a value folded at compile time. The initializer must
+be a constant expression: literals, arithmetic on constants, references to
+earlier constants, and calls to pure functions (single-`return` bodies):
+
+```
+static const var int SIZE = 1024
+static const var int HALF = SIZE / 2       // folded to 512
+static const var bool OK = 3 < 5           // folded to true
+```
+
+Pure functions called from constant initializers are evaluated at build time:
+
+```ntsc
+fun double(int x) -> int {
+    return x * 2
+}
+static const var int VAL = double(21)   // folded to 42
+```
+
+Constants can reference earlier constants but not later ones. Circular
+references are rejected with an error.
+
 ### Destructuring
 
-Arrays and objects can be unpacked:
+Arrays, objects, and tuples can be unpacked:
 
 ```
 var [a, b] = [1, 2]
 var {name, age} = obj
+var (x, y) = (10, 20)
 ```
 
 Each name becomes a variable in the current scope.
@@ -404,6 +436,39 @@ class Name [extends Parent] {
 - Non-escaping classes without `init` are stack-allocated by escape analysis.
 
 Instantiation: `Name(args)`.
+
+### Operator overloading
+
+A class can overload operators by defining methods named after the operator
+symbol. Binary operators take the right operand as a parameter; unary operators
+take no parameters. Comparison operators return `bool`.
+
+```ntsc
+class Vec {
+    var float x
+    var float y
+
+    fun init(float x, float y) {
+        this.x = x
+        this.y = y
+    }
+
+    fun +(view Vec other) -> Vec {
+        return Vec(this.x + other.x, this.y + other.y)
+    }
+
+    fun -() -> Vec {
+        return Vec(-this.x, -this.y)
+    }
+
+    fun ==(view Vec other) -> bool {
+        return this.x == other.x && this.y == other.y
+    }
+}
+```
+
+Supported operator methods: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`,
+`>`, `>=`, unary `-`, unary `!`.
 
 ## Enums
 
@@ -666,6 +731,19 @@ As under Functions.
 ### Array literal
 
 `[e1, e2, ...]`. Homogeneous; the empty literal needs an annotation.
+
+### Tuple literal
+
+`(e1, e2, ...)` produces a tuple. Elements may have different types. The
+length is part of the type:
+
+```ntsc
+var t = (10, "hello")       // (int, string)
+var t2: (int, int) = (1, 2)
+```
+
+Tuple elements are accessed by zero-based dot index: `t.0`, `t.1`. Indexing
+is bounds-checked.
 
 ### Object literal
 
