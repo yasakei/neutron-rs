@@ -81,7 +81,10 @@ The language currently provides:
 - Threads, message-passing channels, and `async`/`await` coroutines lowered
   to state machines.
 - A standard library of over twenty modules, from `strings` and `arrays` to
-  `net`, `json`, and `crypto`.
+  `net`, `json`, `crypto`, `glob`, `paths`, and `archive`.
+- Filesystem operations: recursive directory walk, symlinks, file locking.
+- HTTP: range downloads, file downloads with progress, concurrent downloads.
+- Crypto: SHA-256/384/224/512, MD5, HMAC, file hashing, hash verification.
 - A test runner driven by `test` blocks.
 - Debug-mode leak detection and a release-mode LLVM optimization pipeline.
 - Cross-platform support for Linux, macOS, and Windows.

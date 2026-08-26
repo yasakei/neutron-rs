@@ -113,6 +113,10 @@ negative argument.
 | `sys.exec(command)` | `int` | Runs a command; returns its exit status. |
 | `sys.cp(src, dst)` | `bool` | Copies a file. |
 | `sys.rm(path)` | `bool` | Removes a file. |
+| `sys.walk(root)` | `string` | Recursively lists all files and directories under `root`, newline-separated. |
+| `sys.symlink(target, link)` | `bool` | Creates a symbolic link at `link` pointing to `target`. Throws on failure. |
+| `sys.readlink(path)` | `string` | Returns the target of a symbolic link. Throws if not a symlink. |
+| `sys.is_symlink(path)` | `bool` | Whether the path is a symbolic link. |
 
 ## Time
 
@@ -216,6 +220,10 @@ bundled CA root certificates.
 | `http.patch(url, data)` | `string` | PATCH request. |
 | `http.request(method, url, data)` | `string` | Arbitrary method. |
 | `http.status_code(response)` | `int` | Status code of a response string. |
+| `http.get_range(url, start, len)` | `string` | Fetches a byte range from a URL. Throws on failure. |
+| `http.get_file(url, dest)` | `string` | Downloads a URL to a file. Returns JSON with status and byte count. Throws on failure. |
+| `http.download_with_progress(url, dest, chunk_size)` | `string` | Downloads in chunks. Returns JSON with status, bytes, and chunk count. Throws on failure. |
+| `http.concurrent_download(urls, dest, max_parallel)` | `string` | Downloads multiple URLs in parallel. Returns JSON with per-URL results. Throws on failure. |
 
 ## Collections
 
@@ -393,6 +401,8 @@ Sockets are integer handles. `net.tcp_connect` throws on connection failure.
 | `os.temp_dir()` | `string` | Temporary directory. |
 | `os.temp_path(prefix)` | `string` | A unique temp path. |
 | `os.temp_file(prefix)` | `string` | Creates and returns a temp file path. |
+| `os.file_lock(path)` | `int` | Acquires an advisory file lock; returns a handle > 0. Throws on failure. |
+| `os.file_unlock(path)` | `bool` | Releases a file lock. |
 
 ## Crypto
 
@@ -406,6 +416,16 @@ invalid input.
 | `crypto.hex_encode(s)` | `string` | Hex encode. |
 | `crypto.hex_decode(hex)` | `string` | Hex decode. |
 | `crypto.sha256(s)` | `string` | SHA-256 digest (hex). |
+| `crypto.sha512(s)` | `string` | SHA-512 digest (hex). |
+| `crypto.sha384(s)` | `string` | SHA-384 digest (hex). |
+| `crypto.sha224(s)` | `string` | SHA-224 digest (hex). |
+| `crypto.md5(s)` | `string` | MD5 digest (hex). |
+| `crypto.hmac_sha256(key, msg)` | `string` | HMAC-SHA256 (hex). |
+| `crypto.hmac_sha512(key, msg)` | `string` | HMAC-SHA512 (hex). |
+| `crypto.verify_sha256(data, hash)` | `bool` | Verifies a SHA-256 hash. |
+| `crypto.verify_sha512(data, hash)` | `bool` | Verifies a SHA-512 hash. |
+| `crypto.file_sha256(path)` | `string` | SHA-256 hash of a file's contents. |
+| `crypto.file_sha512(path)` | `string` | SHA-512 hash of a file's contents. |
 | `crypto.random_bytes(count)` | `string` | Random bytes. |
 | `crypto.random_string(length, alphabet)` | `string` | Random string. |
 | `crypto.xor_cipher(data, key)` | `string` | XOR cipher. |
@@ -545,6 +565,52 @@ Assertions throw on failure. The test runner also uses them.
 | Function | Returns | Behavior |
 | --- | --- | --- |
 | `async.sleep(ms)` | `int` | Suspends the coroutine for approximately `ms` milliseconds. |
+
+## Glob
+
+The `glob` module provides filesystem pattern matching using shell-style
+glob syntax: `*` matches any characters except `/`, `**` matches any
+characters including `/`, `?` matches a single character, and `[abc]`
+matches a character class.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `glob.matches(pattern, path)` | `bool` | Whether `path` matches the glob `pattern`. |
+| `glob.find(root, pattern)` | `string` | Finds files under `root` matching `pattern`, newline-separated. |
+| `glob.is_match(pattern, path)` | `bool` | Alias for `glob.matches`. |
+
+## Paths
+
+The `paths` module provides cross-platform path manipulation without
+requiring an `os` module dependency.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `paths.join(a, b)` | `string` | Joins two path components. |
+| `paths.parent(path)` | `string` | Directory part of the path. |
+| `paths.file_name(path)` | `string` | Final component (file or directory name). |
+| `paths.extension(path)` | `string` | File extension without the dot. |
+| `paths.with_extension(path, ext)` | `string` | Replaces the extension. |
+| `paths.stem(path)` | `string` | Filename without extension. |
+| `paths.absolute(path)` | `string` | Converts to an absolute path. |
+| `paths.relative(path, base)` | `string` | Computes `path` relative to `base`. |
+| `paths.is_absolute(path)` | `bool` | Whether the path is absolute. |
+| `paths.components(path)` | `string` | Splits the path into components, newline-separated. |
+| `paths.normalize(path)` | `string` | Resolves `.` and `..` segments. |
+
+## Archive
+
+The `archive` module extracts tar, tar.gz, and zip archives. All functions
+accept file paths (not raw data) since binary content cannot travel through
+the string registry.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `archive.extract_tar_gz(path, dest)` | `string` | Extracts a `.tar.gz` file to `dest`. Returns the number of files extracted. Throws on failure. |
+| `archive.extract_tar(path, dest)` | `string` | Extracts an uncompressed `.tar` file. |
+| `archive.extract_zip(path, dest)` | `string` | Extracts a `.zip` file. |
+| `archive.list_tar(path)` | `string` | Lists entry names in a tar file, newline-separated. |
+| `archive.list_zip(path)` | `string` | Lists entry names in a zip file, newline-separated. |
 
 ## Unused legacy `arrays` module
 

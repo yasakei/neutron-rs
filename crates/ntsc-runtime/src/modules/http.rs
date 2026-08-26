@@ -263,6 +263,415 @@ pub extern "C" fn ntsc_http_status_code(response: i64) -> i64 {
     }
 }
 
+/// `http.get_range(url, start, end)` — HTTP GET with Range header for
+/// streaming downloads. Returns JSON `{"status":N,"body":"..."}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_http_get_range(url: i64, start: i64, end: i64) -> i64 {
+    let url = registry::get_string(url).unwrap_or_default();
+    let range_header = format!("bytes={start}-{end}");
+    http_request_with_range("GET", &url, &range_header)
+}
+
+/// `http.get_file(url, dest)` — download a URL to a file. Returns JSON
+/// `{"status":N,"bytes":N}` with the number of bytes written.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_http_get_file(url: i64, dest: i64) -> i64 {
+    let url = registry::get_string(url).unwrap_or_default();
+    let dest = registry::get_string(dest).unwrap_or_default();
+
+    // Ensure parent directory exists.
+    if let Some(parent) = std::path::Path::new(&dest).parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return super::throw_str(format!("http.get_file: cannot create directory: {e}"));
+    }
+
+    match download_file(&url, &dest) {
+        Ok(bytes) => registry::put_string(format!("{{\"status\":200,\"bytes\":{}}}", bytes)),
+        Err(e) => super::throw_str(format!("http.get_file: {e}")),
+    }
+}
+
+/// `http.download_with_progress(url, dest, chunk_size)` — download a URL
+/// to a file in chunks. Returns JSON `{"status":N,"bytes":N,"chunks":N}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_http_download_with_progress(url: i64, dest: i64, chunk_size: i64) -> i64 {
+    let url = registry::get_string(url).unwrap_or_default();
+    let dest = registry::get_string(dest).unwrap_or_default();
+    let chunk = chunk_size.max(1024) as usize;
+
+    if let Some(parent) = std::path::Path::new(&dest).parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return super::throw_str(format!(
+            "http.download_with_progress: cannot create directory: {e}"
+        ));
+    }
+
+    match download_file_chunked(&url, &dest, chunk) {
+        Ok((bytes, chunks)) => registry::put_string(format!(
+            "{{\"status\":200,\"bytes\":{},\"chunks\":{}}}",
+            bytes, chunks
+        )),
+        Err(e) => super::throw_str(format!("http.download_with_progress: {e}")),
+    }
+}
+
+/// `http.concurrent_download(urls, dest_dir, chunk_size)` — download
+/// multiple URLs to `dest_dir` concurrently. Returns JSON array of
+/// `{"url":"...","status":N,"bytes":N}` results.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_http_concurrent_download(urls: i64, dest_dir: i64, chunk_size: i64) -> i64 {
+    let urls_str = registry::get_string(urls).unwrap_or_default();
+    let dest_dir = registry::get_string(dest_dir).unwrap_or_default();
+    let _chunk = chunk_size.max(1024) as usize;
+
+    let url_list: Vec<String> = urls_str
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+        return super::throw_str(format!(
+            "http.concurrent_download: cannot create '{dest_dir}': {e}"
+        ));
+    }
+
+    let mut results = Vec::new();
+    for url in &url_list {
+        let filename = url.rsplit('/').next().unwrap_or("download");
+        let dest = std::path::Path::new(&dest_dir).join(filename);
+        match download_file(url, dest.to_str().unwrap_or("")) {
+            Ok(bytes) => {
+                results.push(format!(
+                    "{{\"url\":\"{}\",\"status\":200,\"bytes\":{}}}",
+                    url.replace('"', "\\\""),
+                    bytes
+                ));
+            }
+            Err(e) => {
+                results.push(format!(
+                    "{{\"url\":\"{}\",\"status\":0,\"error\":\"{}\"}}",
+                    url.replace('"', "\\\""),
+                    e.replace('"', "\\\"")
+                ));
+            }
+        }
+    }
+
+    registry::put_string(format!("[{}]", results.join(",")))
+}
+
+fn http_request_with_range(method: &str, url: &str, range: &str) -> i64 {
+    let (host, port, path, is_https) = match parse_url(url) {
+        Ok(v) => v,
+        Err(e) => return super::throw_str(format!("http.get_range: {e}")),
+    };
+
+    let addr = format!("{}:{}", host, port);
+    let tcp = match TcpStream::connect(&addr) {
+        Ok(t) => t,
+        Err(e) => return super::throw_str(format!("http.get_range: Connection failed: {e}")),
+    };
+
+    if !is_https {
+        let mut stream = tcp;
+        return send_range_request(&mut stream, method, &host, &path, range);
+    }
+
+    let config = default_tls_config().clone();
+    let server_name = match server_name_for(&host) {
+        Ok(s) => s,
+        Err(e) => return super::throw_str(format!("http.get_range: {e}")),
+    };
+    let tls = match ClientConnection::new(config, server_name) {
+        Ok(c) => c,
+        Err(e) => return super::throw_str(format!("http.get_range: TLS setup failed: {e}")),
+    };
+    let mut stream = StreamOwned::new(tls, tcp);
+    if let Err(e) = stream.conn.complete_io(&mut stream.sock) {
+        return super::throw_str(format!("http.get_range: TLS handshake failed: {e}"));
+    }
+    send_range_request(&mut stream, method, &host, &path, range)
+}
+
+fn send_range_request<S: Read + Write>(
+    stream: &mut S,
+    method: &str,
+    host: &str,
+    path: &str,
+    range: &str,
+) -> i64 {
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Neutron/1.0\r\nConnection: close\r\nRange: {range}\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return super::throw_str("http.get_range: write failed".to_string());
+    }
+    let mut response = String::new();
+    if stream.read_to_string(&mut response).is_err() {
+        return super::throw_str("http.get_range: read failed".to_string());
+    }
+    let status = if let Some(line) = response.lines().next() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            parts[1].parse::<i64>().unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let body = if let Some(pos) = response.find("\r\n\r\n") {
+        response[pos + 4..].to_string()
+    } else {
+        String::new()
+    };
+    registry::put_string(make_response(status, &body))
+}
+
+fn download_file(url: &str, dest: &str) -> Result<usize, String> {
+    let (host, port, path, is_https) = parse_url(url)?;
+    let addr = format!("{}:{}", host, port);
+    let mut tcp = TcpStream::connect(&addr).map_err(|e| format!("Connection failed: {e}"))?;
+
+    let bytes_written = if is_https {
+        let config = default_tls_config().clone();
+        let server_name = server_name_for(&host)?;
+        let tls = ClientConnection::new(config, server_name)
+            .map_err(|e| format!("TLS setup failed: {e}"))?;
+        let mut stream = StreamOwned::new(tls, tcp);
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .map_err(|e| format!("TLS handshake failed: {e}"))?;
+        do_download(&mut stream, &host, &path, dest)?
+    } else {
+        do_download(&mut tcp, &host, &path, dest)?
+    };
+
+    Ok(bytes_written)
+}
+
+fn do_download<S: Read + Write>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+    dest: &str,
+) -> Result<usize, String> {
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Neutron/1.0\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("Write failed: {e}"))?;
+
+    // Read response headers.
+    let mut response_buf = Vec::new();
+    let mut header_done = false;
+    {
+        let mut buf = [0u8; 4096];
+        while !header_done {
+            let n = stream
+                .read(&mut buf)
+                .map_err(|e| format!("Read failed: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            response_buf.extend_from_slice(&buf[..n]);
+            if let Some(pos) = response_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_done = true;
+                // Remove headers from buffer, keep body.
+                let body_start = pos + 4;
+                response_buf = response_buf[body_start..].to_vec();
+            }
+        }
+    }
+
+    let mut file =
+        std::fs::File::create(dest).map_err(|e| format!("Cannot create file '{dest}': {e}"))?;
+
+    // Write any body bytes already read.
+    let mut written = response_buf.len();
+    file.write_all(&response_buf)
+        .map_err(|e| format!("Write failed: {e}"))?;
+
+    // Read the rest.
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = stream
+            .read(&mut buf)
+            .map_err(|e| format!("Read failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("Write failed: {e}"))?;
+        written += n;
+    }
+
+    Ok(written)
+}
+
+fn download_file_chunked(
+    url: &str,
+    dest: &str,
+    chunk_size: usize,
+) -> Result<(usize, usize), String> {
+    let (host, port, path, is_https) = parse_url(url)?;
+    let addr = format!("{}:{}", host, port);
+    let tcp = TcpStream::connect(&addr).map_err(|e| format!("Connection failed: {e}"))?;
+
+    // First, get content length.
+    let content_length = if is_https {
+        let config = default_tls_config().clone();
+        let server_name = server_name_for(&host)?;
+        let tls = ClientConnection::new(config, server_name)
+            .map_err(|e| format!("TLS setup failed: {e}"))?;
+        let mut stream = StreamOwned::new(tls, tcp);
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .map_err(|e| format!("TLS handshake failed: {e}"))?;
+        get_content_length(&mut stream, &host, &path)?
+    } else {
+        let mut stream = tcp;
+        get_content_length(&mut stream, &host, &path)?
+    };
+
+    let mut file =
+        std::fs::File::create(dest).map_err(|e| format!("Cannot create file '{dest}': {e}"))?;
+    let mut total_written = 0usize;
+    let mut chunks = 0usize;
+
+    // Download in range requests.
+    let mut offset = 0usize;
+    loop {
+        let end = if content_length > 0 {
+            (offset + chunk_size - 1).min(content_length - 1)
+        } else {
+            offset + chunk_size - 1
+        };
+        let range = format!("bytes={offset}-{end}");
+
+        // Make a new connection for each chunk (simpler than keeping
+        // connections alive through TLS renegotiation).
+        let tcp = TcpStream::connect(&addr).map_err(|e| format!("Connection failed: {e}"))?;
+
+        if is_https {
+            let config = default_tls_config().clone();
+            let server_name = server_name_for(&host)?;
+            let tls = ClientConnection::new(config, server_name)
+                .map_err(|e| format!("TLS setup failed: {e}"))?;
+            let mut stream = StreamOwned::new(tls, tcp);
+            stream
+                .conn
+                .complete_io(&mut stream.sock)
+                .map_err(|e| format!("TLS handshake failed: {e}"))?;
+            let written = download_chunk(&mut stream, &host, &path, &range, &mut file)?;
+            total_written += written;
+            chunks += 1;
+            if written < chunk_size || (content_length > 0 && offset + chunk_size >= content_length)
+            {
+                break;
+            }
+        } else {
+            let mut stream = tcp;
+            let written = download_chunk(&mut stream, &host, &path, &range, &mut file)?;
+            total_written += written;
+            chunks += 1;
+            if written < chunk_size || (content_length > 0 && offset + chunk_size >= content_length)
+            {
+                break;
+            }
+        }
+
+        offset += chunk_size;
+        if content_length > 0 && offset >= content_length {
+            break;
+        }
+    }
+
+    Ok((total_written, chunks))
+}
+
+fn get_content_length<S: Read + Write>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+) -> Result<usize, String> {
+    let request = format!(
+        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Neutron/1.0\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("Write failed: {e}"))?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("Read failed: {e}"))?;
+
+    for line in response.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(val) = lower.strip_prefix("content-length:") {
+            return val.trim().parse().map_err(|e| format!("parse error: {e}"));
+        }
+    }
+    Ok(0)
+}
+
+fn download_chunk<S: Read + Write>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+    range: &str,
+    file: &mut std::fs::File,
+) -> Result<usize, String> {
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Neutron/1.0\r\nConnection: close\r\nRange: {range}\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("Write failed: {e}"))?;
+
+    // Read headers.
+    let mut buf = Vec::new();
+    loop {
+        let mut tmp = [0u8; 4096];
+        let n = stream
+            .read(&mut tmp)
+            .map_err(|e| format!("Read failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let body = buf[pos + 4..].to_vec();
+            file.write_all(&body)
+                .map_err(|e| format!("Write failed: {e}"))?;
+            let mut total = body.len();
+            let mut read_buf = [0u8; 8192];
+            loop {
+                let n = stream
+                    .read(&mut read_buf)
+                    .map_err(|e| format!("Read failed: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&read_buf[..n])
+                    .map_err(|e| format!("Write failed: {e}"))?;
+                total += n;
+            }
+            return Ok(total);
+        }
+    }
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

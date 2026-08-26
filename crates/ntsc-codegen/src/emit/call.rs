@@ -38,9 +38,15 @@ pub(crate) fn stdlib_return_ty(name: &str) -> Ty {
         "ntsc_time_sleep" => Ty::Void,
 
         "ntsc_sys_read" | "ntsc_sys_listdir" | "ntsc_sys_cwd" | "ntsc_sys_env"
-        | "ntsc_sys_args" => Ty::String,
-        "ntsc_sys_write" | "ntsc_sys_append" | "ntsc_sys_exists" | "ntsc_sys_mkdir"
-        | "ntsc_sys_cp" | "ntsc_sys_rm" => Ty::Bool,
+        | "ntsc_sys_args" | "ntsc_sys_walk" | "ntsc_sys_readlink" => Ty::String,
+        "ntsc_sys_write"
+        | "ntsc_sys_append"
+        | "ntsc_sys_exists"
+        | "ntsc_sys_mkdir"
+        | "ntsc_sys_cp"
+        | "ntsc_sys_rm"
+        | "ntsc_sys_symlink"
+        | "ntsc_sys_is_symlink" => Ty::Bool,
         "ntsc_sys_exit" | "ntsc_sys_sleep" => Ty::Void,
         "ntsc_sys_exec" => Ty::Int,
 
@@ -86,18 +92,36 @@ pub(crate) fn stdlib_return_ty(name: &str) -> Ty {
 
         "ntsc_testing_bench" => Ty::Float,
 
-        "ntsc_http_get" | "ntsc_http_post" | "ntsc_http_put" | "ntsc_http_delete"
-        | "ntsc_http_head" | "ntsc_http_patch" | "ntsc_http_request" => Ty::String,
+        "ntsc_http_get"
+        | "ntsc_http_post"
+        | "ntsc_http_put"
+        | "ntsc_http_delete"
+        | "ntsc_http_head"
+        | "ntsc_http_patch"
+        | "ntsc_http_request"
+        | "ntsc_http_get_range"
+        | "ntsc_http_get_file"
+        | "ntsc_http_download_with_progress"
+        | "ntsc_http_concurrent_download" => Ty::String,
         "ntsc_http_status_code" => Ty::Int,
 
         "ntsc_crypto_base64_encode"
         | "ntsc_crypto_base64_decode"
         | "ntsc_crypto_sha256"
+        | "ntsc_crypto_sha512"
+        | "ntsc_crypto_sha384"
+        | "ntsc_crypto_sha224"
+        | "ntsc_crypto_md5"
+        | "ntsc_crypto_hmac_sha256"
+        | "ntsc_crypto_hmac_sha512"
         | "ntsc_crypto_hex_encode"
         | "ntsc_crypto_hex_decode"
         | "ntsc_crypto_random_bytes"
         | "ntsc_crypto_random_string"
-        | "ntsc_crypto_xor_cipher" => Ty::String,
+        | "ntsc_crypto_xor_cipher"
+        | "ntsc_crypto_file_sha256"
+        | "ntsc_crypto_file_sha512" => Ty::String,
+        "ntsc_crypto_verify_sha256" | "ntsc_crypto_verify_sha512" => Ty::Bool,
 
         "ntsc_collections_set_new"
         | "ntsc_collections_set_to_array"
@@ -168,7 +192,12 @@ pub(crate) fn stdlib_return_ty(name: &str) -> Ty {
         | "ntsc_os_path_ext"
         | "ntsc_os_path_stem"
         | "ntsc_os_path_abs" => Ty::String,
-        "ntsc_os_setenv" | "ntsc_os_unsetenv" | "ntsc_os_has_env" | "ntsc_os_is_abs" => Ty::Bool,
+        "ntsc_os_setenv"
+        | "ntsc_os_unsetenv"
+        | "ntsc_os_has_env"
+        | "ntsc_os_is_abs"
+        | "ntsc_os_file_unlock" => Ty::Bool,
+        "ntsc_os_file_lock" => Ty::Int,
 
         "ntsc_io_stdin" | "ntsc_io_stdout" | "ntsc_io_stderr" | "ntsc_io_open"
         | "ntsc_io_write" | "ntsc_io_write_line" | "ntsc_io_tell" => Ty::Int,
@@ -209,6 +238,31 @@ pub(crate) fn stdlib_return_ty(name: &str) -> Ty {
         "ntsc_random_seed" | "ntsc_random_bool" => Ty::Bool,
         "ntsc_random_int" => Ty::Int,
         "ntsc_random_float" => Ty::Float,
+
+        // ── paths module ─────────────────────────────────────────────────
+        "ntsc_paths_join"
+        | "ntsc_paths_parent"
+        | "ntsc_paths_file_name"
+        | "ntsc_paths_extension"
+        | "ntsc_paths_with_extension"
+        | "ntsc_paths_stem"
+        | "ntsc_paths_absolute"
+        | "ntsc_paths_relative"
+        | "ntsc_paths_components"
+        | "ntsc_paths_normalize" => Ty::String,
+        "ntsc_paths_is_absolute" => Ty::Bool,
+
+        // ── glob module ──────────────────────────────────────────────────
+        "ntsc_glob_matches" | "ntsc_glob_is_match" => Ty::Bool,
+        "ntsc_glob_find" => Ty::String,
+
+        // ── archive module ───────────────────────────────────────────────
+        "ntsc_archive_extract_tar_gz"
+        | "ntsc_archive_extract_tar"
+        | "ntsc_archive_extract_zip"
+        | "ntsc_archive_list_tar"
+        | "ntsc_archive_list_zip" => Ty::String,
+
         _ => Ty::Any,
     }
 }

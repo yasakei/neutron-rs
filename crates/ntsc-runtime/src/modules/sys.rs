@@ -164,6 +164,80 @@ pub extern "C" fn ntsc_sys_rm(path: i64) -> i8 {
     }
 }
 
+/// `sys.walk(path)` — recursively yields every file and directory under
+/// `path`. Returns newline-separated relative paths, with directories
+/// ending with `/`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_sys_walk(path: i64) -> i64 {
+    let path = registry::get_string(path).unwrap_or_default();
+    let root = Path::new(&path);
+    if !root.is_dir() {
+        return fail("walk", format!("'{path}' is not a directory"));
+    }
+    let mut results = Vec::new();
+    walk_recursive(root, root, &mut results);
+    registry::put_string(results.join("\n"))
+}
+
+fn walk_recursive(base: &Path, dir: &Path, results: &mut Vec<String>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    sorted.sort_by_key(|e| e.file_name());
+    for entry in sorted {
+        let path = entry.path();
+        let relative = path.strip_prefix(base).unwrap_or(&path);
+        let rel_str = relative.to_string_lossy().to_string();
+        if path.is_dir() {
+            results.push(format!("{}/", rel_str));
+            walk_recursive(base, &path, results);
+        } else {
+            results.push(rel_str);
+        }
+    }
+}
+
+/// `sys.symlink(target, link)` — create a symbolic link at `link` pointing
+/// to `target`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_sys_symlink(target: i64, link: i64) -> i8 {
+    let target = registry::get_string(target).unwrap_or_default();
+    let link = registry::get_string(link).unwrap_or_default();
+    match std::os::unix::fs::symlink(&target, &link) {
+        Ok(_) => 1,
+        Err(e) => {
+            let _ = fail(
+                "symlink",
+                format!("cannot create symlink '{link}' -> '{target}': {e}"),
+            );
+            0
+        }
+    }
+}
+
+/// `sys.readlink(path)` — read the target of a symbolic link.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_sys_readlink(path: i64) -> i64 {
+    let path = registry::get_string(path).unwrap_or_default();
+    match fs::read_link(&path) {
+        Ok(target) => registry::put_string(target.to_string_lossy().to_string()),
+        Err(e) => fail("readlink", format!("cannot read symlink '{path}': {e}")),
+    }
+}
+
+/// `sys.is_symlink(path)` — returns 1 if the path is a symbolic link.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_sys_is_symlink(path: i64) -> i8 {
+    let path = registry::get_string(path).unwrap_or_default();
+    if std::path::Path::new(&path).is_symlink() {
+        1
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

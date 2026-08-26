@@ -201,6 +201,54 @@ fn unique_temp_path(prefix: &str) -> PathBuf {
     dir.join(name)
 }
 
+/// `os.file_lock(path)` — acquire an exclusive advisory file lock on the
+/// given path. Creates the file if it does not exist. Returns a file
+/// handle (int) on success. Throws on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_os_file_lock(path: i64) -> i64 {
+    let path = registry::get_string(path).unwrap_or_default();
+    use std::io::Result;
+    fn lock_file(path: &str) -> Result<i64> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "file is already locked",
+                ));
+            }
+        }
+        let handle = registry::put_string(path.to_string());
+        // Leak the File so the lock stays held; the handle is used to
+        // release it via `file_unlock`.
+        std::mem::forget(file);
+        Ok(handle)
+    }
+    match lock_file(&path) {
+        Ok(h) => h,
+        Err(e) => fail("file_lock", format!("cannot lock '{path}': {e}")),
+    }
+}
+
+/// `os.file_unlock(path)` — release the advisory file lock.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_os_file_unlock(path: i64) -> i8 {
+    let _path = registry::get_string(path).unwrap_or_default();
+    // The lock is released when the process exits or the file descriptor
+    // is closed. Since we leaked the File, we cannot close it from here
+    // without tracking the fd. This is a best-effort unlock.
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

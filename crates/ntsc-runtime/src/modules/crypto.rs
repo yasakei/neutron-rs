@@ -157,6 +157,156 @@ pub extern "C" fn ntsc_crypto_xor_cipher(data: i64, key: i64) -> i64 {
     registry::put_string(result)
 }
 
+/// `crypto.sha512(str)` — the SHA-512 digest as a lowercase hex string.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_sha512(s: i64) -> i64 {
+    let s = registry::get_string(s).unwrap_or_default();
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
+    hasher.update(s.as_bytes());
+    let result = hasher.finalize();
+    registry::put_string(format!("{:x}", result))
+}
+
+/// `crypto.sha384(str)` — the SHA-384 digest as a lowercase hex string.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_sha384(s: i64) -> i64 {
+    let s = registry::get_string(s).unwrap_or_default();
+    use sha2::{Digest, Sha384};
+    let mut hasher = Sha384::new();
+    hasher.update(s.as_bytes());
+    let result = hasher.finalize();
+    registry::put_string(format!("{:x}", result))
+}
+
+/// `crypto.sha224(str)` — the SHA-224 digest as a lowercase hex string.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_sha224(s: i64) -> i64 {
+    let s = registry::get_string(s).unwrap_or_default();
+    use sha2::{Digest, Sha224};
+    let mut hasher = Sha224::new();
+    hasher.update(s.as_bytes());
+    let result = hasher.finalize();
+    registry::put_string(format!("{:x}", result))
+}
+
+/// `crypto.md5(str)` — the MD5 digest as a lowercase hex string.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_md5(s: i64) -> i64 {
+    let s = registry::get_string(s).unwrap_or_default();
+    use md5;
+    let result = md5::compute(s.as_bytes());
+    registry::put_string(format!("{:x}", result))
+}
+
+/// `crypto.hmac_sha256(key, message)` — HMAC-SHA256 as a lowercase hex
+/// string.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_hmac_sha256(key: i64, message: i64) -> i64 {
+    let key = registry::get_string(key).unwrap_or_default();
+    let message = registry::get_string(message).unwrap_or_default();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mac =
+        HmacSha256::new_from_slice(key.as_bytes()).map_err(|e| format!("HMAC key error: {e}"));
+    match mac {
+        Ok(mut m) => {
+            m.update(message.as_bytes());
+            let result = m.finalize().into_bytes();
+            registry::put_string(format!("{:x}", result))
+        }
+        Err(e) => super::throw_str(format!("crypto.hmac_sha256: {e}")),
+    }
+}
+
+/// `crypto.hmac_sha512(key, message)` — HMAC-SHA512 as a lowercase hex
+/// string.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_hmac_sha512(key: i64, message: i64) -> i64 {
+    let key = registry::get_string(key).unwrap_or_default();
+    let message = registry::get_string(message).unwrap_or_default();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha512;
+    type HmacSha512 = Hmac<Sha512>;
+    let mac =
+        HmacSha512::new_from_slice(key.as_bytes()).map_err(|e| format!("HMAC key error: {e}"));
+    match mac {
+        Ok(mut m) => {
+            m.update(message.as_bytes());
+            let result = m.finalize().into_bytes();
+            registry::put_string(format!("{:x}", result))
+        }
+        Err(e) => super::throw_str(format!("crypto.hmac_sha512: {e}")),
+    }
+}
+
+/// `crypto.verify_sha256(data, expected_hash)` — returns 1 if the SHA-256
+/// hash of `data` matches `expected_hash` (case-insensitive).
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_verify_sha256(data: i64, expected_hash: i64) -> i8 {
+    let data = registry::get_string(data).unwrap_or_default();
+    let expected = registry::get_string(expected_hash).unwrap_or_default();
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data.as_bytes());
+    let actual = format!("{:x}", hasher.finalize());
+    if actual.eq_ignore_ascii_case(&expected) {
+        1
+    } else {
+        0
+    }
+}
+
+/// `crypto.verify_sha512(data, expected_hash)` — returns 1 if the SHA-512
+/// hash of `data` matches `expected_hash` (case-insensitive).
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_verify_sha512(data: i64, expected_hash: i64) -> i8 {
+    let data = registry::get_string(data).unwrap_or_default();
+    let expected = registry::get_string(expected_hash).unwrap_or_default();
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
+    hasher.update(data.as_bytes());
+    let actual = format!("{:x}", hasher.finalize());
+    if actual.eq_ignore_ascii_case(&expected) {
+        1
+    } else {
+        0
+    }
+}
+
+/// `crypto.file_sha256(path)` — SHA-256 of a file's contents as hex.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_file_sha256(path: i64) -> i64 {
+    let path = registry::get_string(path).unwrap_or_default();
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            return super::throw_str(format!("crypto.file_sha256: cannot read '{path}': {e}"));
+        }
+    };
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    registry::put_string(format!("{:x}", hasher.finalize()))
+}
+
+/// `crypto.file_sha512(path)` — SHA-512 of a file's contents as hex.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_crypto_file_sha512(path: i64) -> i64 {
+    let path = registry::get_string(path).unwrap_or_default();
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            return super::throw_str(format!("crypto.file_sha512: cannot read '{path}': {e}"));
+        }
+    };
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
+    hasher.update(&data);
+    registry::put_string(format!("{:x}", hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

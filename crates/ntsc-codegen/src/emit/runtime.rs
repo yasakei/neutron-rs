@@ -245,9 +245,19 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
     declare!("ntsc_crypto_hex_encode", i64_ty, i64_ty);
     declare!("ntsc_crypto_hex_decode", i64_ty, i64_ty);
     declare!("ntsc_crypto_sha256", i64_ty, i64_ty);
+    declare!("ntsc_crypto_sha512", i64_ty, i64_ty);
+    declare!("ntsc_crypto_sha384", i64_ty, i64_ty);
+    declare!("ntsc_crypto_sha224", i64_ty, i64_ty);
+    declare!("ntsc_crypto_md5", i64_ty, i64_ty);
+    declare!("ntsc_crypto_hmac_sha256", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_crypto_hmac_sha512", i64_ty, i64_ty, i64_ty);
     declare!("ntsc_crypto_xor_cipher", i64_ty, i64_ty, i64_ty);
     declare!("ntsc_crypto_random_bytes", i64_ty, i64_ty);
     declare!("ntsc_crypto_random_string", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_crypto_verify_sha256", i8_ty, i64_ty, i64_ty);
+    declare!("ntsc_crypto_verify_sha512", i8_ty, i64_ty, i64_ty);
+    declare!("ntsc_crypto_file_sha256", i64_ty, i64_ty);
+    declare!("ntsc_crypto_file_sha512", i64_ty, i64_ty);
 
     // ── encoding module ──────────────────────────────────────────────────
 
@@ -286,6 +296,22 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
     declare!("ntsc_http_patch", i64_ty, i64_ty, i64_ty);
     declare!("ntsc_http_request", i64_ty, i64_ty, i64_ty, i64_ty);
     declare!("ntsc_http_status_code", i64_ty, i64_ty);
+    declare!("ntsc_http_get_range", i64_ty, i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_http_get_file", i64_ty, i64_ty, i64_ty);
+    declare!(
+        "ntsc_http_download_with_progress",
+        i64_ty,
+        i64_ty,
+        i64_ty,
+        i64_ty
+    );
+    declare!(
+        "ntsc_http_concurrent_download",
+        i64_ty,
+        i64_ty,
+        i64_ty,
+        i64_ty
+    );
 
     // ── io module ────────────────────────────────────────────────────────
 
@@ -397,6 +423,8 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
     declare!("ntsc_os_temp_dir", i64_ty);
     declare!("ntsc_os_temp_file", i64_ty, i64_ty);
     declare!("ntsc_os_temp_path", i64_ty, i64_ty);
+    declare!("ntsc_os_file_lock", i64_ty, i64_ty);
+    declare!("ntsc_os_file_unlock", i8_ty, i64_ty);
 
     // ── process module ───────────────────────────────────────────────────
 
@@ -496,6 +524,38 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
     declare!("ntsc_sys_rm", i8_ty, i64_ty);
     declare!("ntsc_sys_cp", i8_ty, i64_ty, i64_ty);
     declare!("ntsc_sys_sleep", void_ty, f64_ty);
+    declare!("ntsc_sys_walk", i64_ty, i64_ty);
+    declare!("ntsc_sys_symlink", i8_ty, i64_ty, i64_ty);
+    declare!("ntsc_sys_readlink", i64_ty, i64_ty);
+    declare!("ntsc_sys_is_symlink", i8_ty, i64_ty);
+
+    // ── paths module ─────────────────────────────────────────────────────
+
+    declare!("ntsc_paths_join", i64_ty, i64_ty);
+    declare!("ntsc_paths_parent", i64_ty, i64_ty);
+    declare!("ntsc_paths_file_name", i64_ty, i64_ty);
+    declare!("ntsc_paths_extension", i64_ty, i64_ty);
+    declare!("ntsc_paths_with_extension", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_paths_stem", i64_ty, i64_ty);
+    declare!("ntsc_paths_absolute", i64_ty, i64_ty);
+    declare!("ntsc_paths_relative", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_paths_is_absolute", i8_ty, i64_ty);
+    declare!("ntsc_paths_components", i64_ty, i64_ty);
+    declare!("ntsc_paths_normalize", i64_ty, i64_ty);
+
+    // ── glob module ──────────────────────────────────────────────────────
+
+    declare!("ntsc_glob_matches", i8_ty, i64_ty, i64_ty);
+    declare!("ntsc_glob_find", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_glob_is_match", i8_ty, i64_ty, i64_ty);
+
+    // ── archive module ───────────────────────────────────────────────────
+
+    declare!("ntsc_archive_extract_tar_gz", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_archive_extract_tar", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_archive_extract_zip", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_archive_list_tar", i64_ty, i64_ty);
+    declare!("ntsc_archive_list_zip", i64_ty, i64_ty);
 
     // ── testing module ───────────────────────────────────────────────────
 

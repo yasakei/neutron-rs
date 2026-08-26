@@ -19,6 +19,7 @@ pub struct ResolveError {
 /// Names of the builtin stdlib modules that can be referenced without a
 /// `use`.
 pub const BUILTIN_MODULES: &[&str] = &[
+    "archive",
     "arrays",
     "async",
     "collections",
@@ -26,12 +27,14 @@ pub const BUILTIN_MODULES: &[&str] = &[
     "crypto",
     "encoding",
     "fmt",
+    "glob",
     "hash",
     "http",
     "io",
     "json",
     "math",
     "memory",
+    "paths",
     "slices",
     "net",
     "os",

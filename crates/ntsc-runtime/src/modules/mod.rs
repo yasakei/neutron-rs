@@ -2,12 +2,14 @@
 //! Stdlib modules are compiled into `libntsc_runtime.a`; `ntsc-codegen`
 //! forward-declares their extern "C" functions and the linker resolves them.
 
+pub mod archive;
 pub mod arrays;
 pub mod collections;
 pub mod crypto;
 pub mod csv;
 pub mod encoding;
 pub mod fmt;
+pub mod glob;
 pub mod hash;
 pub mod http;
 pub mod io;
@@ -16,6 +18,7 @@ pub mod math;
 pub mod memory;
 pub mod net;
 pub mod os;
+pub mod paths;
 pub mod process;
 pub mod random;
 pub mod regex;
