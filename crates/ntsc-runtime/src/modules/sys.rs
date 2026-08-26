@@ -203,10 +203,10 @@ fn walk_recursive(base: &Path, dir: &Path, results: &mut Vec<String>) {
 /// to `target`.
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_sys_symlink(target: i64, link: i64) -> i8 {
-    let target = registry::get_string(target).unwrap_or_default();
-    let link = registry::get_string(link).unwrap_or_default();
     #[cfg(unix)]
     {
+        let target = registry::get_string(target).unwrap_or_default();
+        let link = registry::get_string(link).unwrap_or_default();
         match std::os::unix::fs::symlink(&target, &link) {
             Ok(_) => 1,
             Err(e) => {
