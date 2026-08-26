@@ -564,7 +564,9 @@ fn try_emit_operator_method<'ctx>(
     // future-proofed by iterating the declared parameter types.
     for param_ty in &method_param_tys {
         let val = match param_ty {
-            Ty::View(..) => TypedValue::new(rhs.value, Ty::View(Box::new(rhs.ntsc_type.clone()), false)),
+            Ty::View(..) => {
+                TypedValue::new(rhs.value, Ty::View(Box::new(rhs.ntsc_type.clone()), false))
+            }
             _ => rhs.clone(),
         };
         llvm_args.push(val.value.into());

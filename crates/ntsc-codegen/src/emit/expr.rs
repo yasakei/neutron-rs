@@ -1431,9 +1431,7 @@ pub(crate) fn emit_unary<'ctx>(
                 Ok(TypedValue::new(result.into(), Ty::Float))
             }
             // Unary operator overloading for class types.
-            ty @ Ty::Class(_) => {
-                emit_unary_operator_method(fn_ctx, "-", &operand, ty)
-            }
+            ty @ Ty::Class(_) => emit_unary_operator_method(fn_ctx, "-", &operand, ty),
             _ => Ok(TypedValue::new(
                 default_llvm_value(&Ty::Any, fn_ctx.context),
                 Ty::Any,
@@ -1442,8 +1440,7 @@ pub(crate) fn emit_unary<'ctx>(
         TokenKind::Bang => {
             // Unary operator overloading for class types.
             if let Ty::Class(_) = &operand.ntsc_type
-                && let Some(result) =
-                    try_emit_unary_operator_method(fn_ctx, "!", &operand)?
+                && let Some(result) = try_emit_unary_operator_method(fn_ctx, "!", &operand)?
             {
                 return Ok(result);
             }

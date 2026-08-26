@@ -398,9 +398,7 @@ impl TypeChecker {
                         let lexeme = method.lexeme().to_string();
                         info.methods.insert(lexeme.clone());
                         if is_operator_name(&lexeme) {
-                            let ret = self.resolve_annotation(
-                                return_type.as_ref().map(|r| &r.ty),
-                            );
+                            let ret = self.resolve_annotation(return_type.as_ref().map(|r| &r.ty));
                             info.operator_returns.insert(lexeme, ret);
                         }
                     }
@@ -2437,12 +2435,10 @@ impl TypeChecker {
             // class types with custom operators are intercepted first.
             (op_tok, Some(l), Some(r))
                 if binary_op_method_name(op_tok).is_some()
-                    && (base_class_name(l).is_some()
-                        || base_class_name(r).is_some()) =>
+                    && (base_class_name(l).is_some() || base_class_name(r).is_some()) =>
             {
                 if let Some(method_name) = binary_op_method_name(op_tok) {
-                    let class_name = base_class_name(l)
-                        .or_else(|| base_class_name(r));
+                    let class_name = base_class_name(l).or_else(|| base_class_name(r));
                     if let Some(class) = class_name {
                         if let Some(ret) = self.lookup_operator_return(class, method_name) {
                             return Some(ret);
