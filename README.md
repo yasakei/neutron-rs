@@ -88,10 +88,10 @@ $ ntsc run --release     # optimized build
 $ ntsc test              # run the unit tests
 ```
 
-`ntsc init` scaffolds a project with exactly two files: a `build.ntbl` manifest and `src/main.nt`.
+`ntsc init` scaffolds a project with exactly two files: a `neutron.toml` manifest and `src/main.nt`.
 
 ```console
-$ cat build.ntbl
+$ cat neutron.toml
 target "x86_64-unknown-linux-gnu"
 entry "src/main.nt"
 output "hello"
@@ -138,7 +138,7 @@ rewrite/
 │   ├── ntsc-typeck         Name resolution, type checking, linting, ownership
 │   ├── ntsc-codegen        LLVM IR codegen and linking (inkwell / LLVM 22)
 │   ├── ntsc-runtime        Runtime static library
-│   ├── ntsc-build          build.ntbl parsing and module loading
+│   ├── ntsc-build          neutron.toml parsing and module loading
 │   ├── ntsc-cli            The `ntsc` binary
 │   └── ntsc-diag           Diagnostic rendering
 ├── benchmarks/             NTSC vs Rust benchmark suite

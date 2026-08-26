@@ -72,7 +72,7 @@ ntsc run
 
 ```
 hello/
-  build.ntbl
+  neutron.toml
   src/main.nt
 ```
 
@@ -91,13 +91,13 @@ fun main() {
 
 ```
 project/
-  build.ntbl      Manifest: target triple, entry point, output name
+  neutron.toml      Manifest: target triple, entry point, output name
   src/            Source files (.nt)
   build/          Generated output; debug/ and release/ subdirectories
 ```
 
 Source files are plain UTF-8 text with the `.nt` extension. The entry file is
-declared in `build.ntbl`; additional files are pulled in with `use` (see
+declared in `neutron.toml`; additional files are pulled in with `use` (see
 [Modules and imports](modules.md)).
 
 ## Build, test, run, watch

@@ -112,8 +112,8 @@ def compile_ntsc(ntsc_bin, src_file, out_dir):
     src_tmp = os.path.join(bench_tmp, "src")
     os.makedirs(src_tmp, exist_ok=True)
 
-    # Write build.ntbl
-    with open(os.path.join(bench_tmp, "build.ntbl"), "w") as f:
+    # Write neutron.toml
+    with open(os.path.join(bench_tmp, "neutron.toml"), "w") as f:
         f.write(f'target "{host_triple()}"\n')
         f.write(f'entry "src/main.nt"\n')
         f.write(f'output "{out_bin}"\n')

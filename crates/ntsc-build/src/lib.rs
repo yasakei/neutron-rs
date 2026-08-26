@@ -1,10 +1,11 @@
-//! Parser for `build.ntbl` — the Neutron Build Language configuration file.
+//! Parser for `neutron.toml` — the Neutron project configuration file.
 //!
-//! Format is a simple key-value DSL:
-//! ```text
-//! target "x86_64-unknown-linux-gnu"
-//! entry "src/main.nt"
-//! output "my-project"
+//! Format is TOML with a `[package]` section:
+//! ```toml
+//! [package]
+//! target = "x86_64-unknown-linux-gnu"
+//! entry = "src/main.nt"
+//! output = "my-project"
 //! ```
 
 use std::fmt;
@@ -23,7 +24,7 @@ pub struct BuildConfig {
     pub output: String,
 }
 
-/// A single error encountered while parsing `build.ntbl`.
+/// A single error encountered while parsing `neutron.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildError {
     pub message: String,
@@ -35,7 +36,7 @@ impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "build.ntbl:{}:{}: {}",
+            "neutron.toml:{}:{}: {}",
             self.line, self.column, self.message
         )
     }
@@ -43,109 +44,39 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-/// Parse a `build.ntbl` source string into a [`BuildConfig`].
+/// Parse a `neutron.toml` source string into a [`BuildConfig`].
 ///
 /// Returns all errors found during parsing (not just the first).
 pub fn parse(source: &str) -> Result<BuildConfig, Vec<BuildError>> {
-    let mut target = None;
-    let mut entry = None;
-    let mut output = None;
     let mut errors = Vec::new();
 
-    for (line_idx, line) in source.lines().enumerate() {
-        let line_num = (line_idx + 1) as u32;
-        let trimmed = line.trim();
-
-        // Blank lines and comments are allowed.
-        if trimmed.is_empty() || trimmed.starts_with("//") {
-            continue;
-        }
-
-        let Some((key_part, value_part)) = trimmed.split_once(char::is_whitespace) else {
+    let table: toml::Value = match source.parse() {
+        Ok(v) => v,
+        Err(e) => {
             errors.push(BuildError {
-                message: format!("expected `key \"value\"`, got `{trimmed}`"),
-                line: line_num,
-                column: 1,
+                message: format!("TOML syntax error: {e}"),
+                line: 0,
+                column: 0,
             });
-            continue;
-        };
+            return Err(errors);
+        }
+    };
 
-        let value_part = value_part.trim();
-        if !value_part.starts_with('"') || !value_part.ends_with('"') || value_part.len() < 2 {
+    let package = match table.get("package") {
+        Some(toml::Value::Table(t)) => t,
+        _ => {
             errors.push(BuildError {
-                message: format!("expected quoted string, got `{value_part}`"),
-                line: line_num,
-                column: (key_part.len() + 1) as u32,
+                message: "missing `[package]` section".to_string(),
+                line: 0,
+                column: 0,
             });
-            continue;
+            return Err(errors);
         }
+    };
 
-        // Take everything between the delimiters so quotes inside the value
-        // survive.
-        let value = &value_part[1..value_part.len() - 1];
-
-        match key_part {
-            "target" => {
-                if target.is_some() {
-                    errors.push(BuildError {
-                        message: "`target` specified more than once".to_string(),
-                        line: line_num,
-                        column: 1,
-                    });
-                }
-                target = Some(value.to_string());
-            }
-            "entry" => {
-                if entry.is_some() {
-                    errors.push(BuildError {
-                        message: "`entry` specified more than once".to_string(),
-                        line: line_num,
-                        column: 1,
-                    });
-                }
-                entry = Some(value.to_string());
-            }
-            "output" => {
-                if output.is_some() {
-                    errors.push(BuildError {
-                        message: "`output` specified more than once".to_string(),
-                        line: line_num,
-                        column: 1,
-                    });
-                }
-                output = Some(value.to_string());
-            }
-            other => {
-                errors.push(BuildError {
-                    message: format!("unknown key `{other}`"),
-                    line: line_num,
-                    column: 1,
-                });
-            }
-        }
-    }
-
-    if target.is_none() {
-        errors.push(BuildError {
-            message: "missing required key `target`".to_string(),
-            line: 0,
-            column: 0,
-        });
-    }
-    if entry.is_none() {
-        errors.push(BuildError {
-            message: "missing required key `entry`".to_string(),
-            line: 0,
-            column: 0,
-        });
-    }
-    if output.is_none() {
-        errors.push(BuildError {
-            message: "missing required key `output`".to_string(),
-            line: 0,
-            column: 0,
-        });
-    }
+    let target = extract_string(package, "target", &mut errors);
+    let entry = extract_string(package, "entry", &mut errors);
+    let output = extract_string(package, "output", &mut errors);
 
     if errors.is_empty() {
         Ok(BuildConfig {
@@ -158,14 +89,44 @@ pub fn parse(source: &str) -> Result<BuildConfig, Vec<BuildError>> {
     }
 }
 
+fn extract_string(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    errors: &mut Vec<BuildError>,
+) -> Option<String> {
+    match table.get(key) {
+        Some(toml::Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            errors.push(BuildError {
+                message: format!("`{key}` must be a string"),
+                line: 0,
+                column: 0,
+            });
+            None
+        }
+        None => {
+            errors.push(BuildError {
+                message: format!("missing required key `{key}` in [package]"),
+                line: 0,
+                column: 0,
+            });
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn valid_config() {
-        let src =
-            "target \"x86_64-unknown-linux-gnu\"\nentry \"src/main.nt\"\noutput \"my-project\"\n";
+        let src = r#"
+[package]
+target = "x86_64-unknown-linux-gnu"
+entry = "src/main.nt"
+output = "my-project"
+"#;
         let config = parse(src).expect("should parse successfully");
         assert_eq!(config.target, "x86_64-unknown-linux-gnu");
         assert_eq!(config.entry, "src/main.nt");
@@ -173,8 +134,14 @@ mod tests {
     }
 
     #[test]
-    fn valid_with_comments_and_blank_lines() {
-        let src = "// Build configuration\ntarget \"aarch64-apple-darwin\"\n\nentry \"src/main.nt\"\n// output name\noutput \"cool-app\"\n";
+    fn valid_with_comments() {
+        let src = r#"
+# Build configuration
+[package]
+target = "aarch64-apple-darwin"
+entry = "src/main.nt"
+output = "cool-app"
+"#;
         let config = parse(src).expect("should parse successfully");
         assert_eq!(config.target, "aarch64-apple-darwin");
         assert_eq!(config.entry, "src/main.nt");
@@ -182,8 +149,18 @@ mod tests {
     }
 
     #[test]
+    fn missing_package_section() {
+        let src = "target = \"x86_64-unknown-linux-gnu\"\n";
+        let errs = parse(src).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("missing `[package]`"))
+        );
+    }
+
+    #[test]
     fn missing_target() {
-        let src = "entry \"src/main.nt\"\noutput \"my-project\"\n";
+        let src = "[package]\nentry = \"src/main.nt\"\noutput = \"my-project\"\n";
         let errs = parse(src).unwrap_err();
         assert!(
             errs.iter()
@@ -193,7 +170,7 @@ mod tests {
 
     #[test]
     fn missing_entry() {
-        let src = "target \"x86_64-unknown-linux-gnu\"\noutput \"my-project\"\n";
+        let src = "[package]\ntarget = \"x86_64-unknown-linux-gnu\"\noutput = \"my-project\"\n";
         let errs = parse(src).unwrap_err();
         assert!(
             errs.iter()
@@ -203,7 +180,7 @@ mod tests {
 
     #[test]
     fn missing_output() {
-        let src = "target \"x86_64-unknown-linux-gnu\"\nentry \"src/main.nt\"\n";
+        let src = "[package]\ntarget = \"x86_64-unknown-linux-gnu\"\nentry = \"src/main.nt\"\n";
         let errs = parse(src).unwrap_err();
         assert!(
             errs.iter()
@@ -213,66 +190,22 @@ mod tests {
 
     #[test]
     fn all_missing() {
-        let src = "";
+        let src = "[package]\n";
         let errs = parse(src).unwrap_err();
         assert_eq!(errs.len(), 3);
     }
 
     #[test]
-    fn unknown_key() {
-        let src = "target \"x86_64-unknown-linux-gnu\"\nentry \"src/main.nt\"\noutput \"p\"\nfoo \"bar\"\n";
+    fn invalid_toml() {
+        let src = "not valid toml {{{";
         let errs = parse(src).unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("unknown key `foo`")));
+        assert!(errs.iter().any(|e| e.message.contains("TOML syntax error")));
     }
 
     #[test]
-    fn duplicate_key() {
-        let src = "target \"x86_64-unknown-linux-gnu\"\ntarget \"aarch64-apple-darwin\"\nentry \"src/main.nt\"\noutput \"p\"\n";
+    fn wrong_type() {
+        let src = "[package]\ntarget = 123\nentry = \"src/main.nt\"\noutput = \"p\"\n";
         let errs = parse(src).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| e.message.contains("specified more than once"))
-        );
-    }
-
-    #[test]
-    fn unquoted_value() {
-        let src = "target x86_64-unknown-linux-gnu\nentry \"src/main.nt\"\noutput \"p\"\n";
-        let errs = parse(src).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| e.message.contains("expected quoted string"))
-        );
-    }
-
-    #[test]
-    fn garbage_line() {
-        let src = "not-a-valid-line\ntarget \"x86_64-unknown-linux-gnu\"\nentry \"src/main.nt\"\noutput \"p\"\n";
-        let errs = parse(src).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| e.message.contains("expected `key \"value\"`"))
-        );
-    }
-
-    /// Garbage line, unknown key, plus the three missing required keys:
-    /// at least four errors.
-    #[test]
-    fn multiple_errors_collected() {
-        let src = "not-a-valid-line\nfoo \"bar\"\nmissing everything\n";
-        let errs = parse(src).unwrap_err();
-
-        assert!(errs.len() >= 4);
-    }
-
-    #[test]
-    fn line_numbers_are_correct() {
-        let src = "target \"x86_64-unknown-linux-gnu\"\nentry \"src/main.nt\"\nnotavalidline\noutput \"p\"\n";
-        let errs = parse(src).unwrap_err();
-        let garbage_err = errs
-            .iter()
-            .find(|e| e.message.contains("expected `key \"value\"`"))
-            .unwrap();
-        assert_eq!(garbage_err.line, 3);
+        assert!(errs.iter().any(|e| e.message.contains("must be a string")));
     }
 }

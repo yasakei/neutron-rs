@@ -6,7 +6,7 @@ introduction, see the [guide](../guide/syntax-and-control-flow.md).
 ## Program structure
 
 A program is one or more UTF-8 `.nt` files. The entry file is given in
-`build.ntbl`; other files are loaded with `use "file.nt"`. The compiler merges all
+`neutron.toml`; other files are loaded with `use "file.nt"`. The compiler merges all
 files into a single program and resolves names across the whole closure.
 
 Top-level declarations:

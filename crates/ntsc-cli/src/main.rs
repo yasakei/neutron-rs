@@ -314,7 +314,7 @@ impl BuildMode {
     }
 }
 
-/// Scaffold a new project with exactly two files: `build.ntbl` and
+/// Scaffold a new project with exactly two files: `neutron.toml` and
 /// `src/main.nt`.
 fn cmd_init(project_name: Option<&str>) -> Result<(), CliError> {
     let name = match project_name {
@@ -332,26 +332,27 @@ fn cmd_init(project_name: Option<&str>) -> Result<(), CliError> {
     let src_dir = project_dir.join("src");
     fs::create_dir_all(&src_dir)?;
 
-    let build_ntbl = format!(
-        "target \"{}\"\n\
-         entry \"src/main.nt\"\n\
-         output \"{}\"\n",
+    let neutron_toml = format!(
+        "[package]\n\
+         target = \"{}\"\n\
+         entry = \"src/main.nt\"\n\
+         output = \"{}\"\n",
         ntsc_codegen::host_triple(),
         ntsc_codegen::with_executable_extension(&name),
     );
-    fs::write(project_dir.join("build.ntbl"), &build_ntbl)?;
+    fs::write(project_dir.join("neutron.toml"), &neutron_toml)?;
 
     let main_nt = "fun main() {\n    say(\"Hello, World!\")\n}\n";
     fs::write(src_dir.join("main.nt"), main_nt)?;
 
     println!("Created project `{name}`:");
-    println!("  {name}/build.ntbl");
+    println!("  {name}/neutron.toml");
     println!("  {name}/src/main.nt");
 
     Ok(())
 }
 
-/// Build the current project: read `build.ntbl`, load modules, compile,
+/// Build the current project: read `neutron.toml`, load modules, compile,
 /// link.
 ///
 /// In test mode the user `main` is replaced by the test harness.
@@ -617,7 +618,7 @@ fn cmd_clean() -> Result<(), CliError> {
     Ok(())
 }
 
-/// Rebuild whenever the entry, an imported module, or `build.ntbl`
+/// Rebuild whenever the entry, an imported module, or `neutron.toml`
 /// changes.
 fn cmd_watch(release: bool, json: bool) -> Result<(), CliError> {
     let (cwd, config) = load_project()?;
@@ -667,7 +668,7 @@ fn cmd_graph() -> Result<(), CliError> {
 }
 
 /// Snapshot the modification times of every file in the module closure
-/// plus `build.ntbl`. Used by watch to detect changes (including new
+/// plus `neutron.toml`. Used by watch to detect changes (including new
 /// imports).
 fn project_signature(
     cwd: &Path,
@@ -679,22 +680,22 @@ fn project_signature(
         let mtime = fs::metadata(path)?.modified()?;
         signature.push((path.clone(), mtime));
     }
-    let build_ntbl = cwd.join("build.ntbl");
-    let mtime = fs::metadata(&build_ntbl)?.modified()?;
-    signature.push((build_ntbl, mtime));
+    let neutron_toml = cwd.join("neutron.toml");
+    let mtime = fs::metadata(&neutron_toml)?.modified()?;
+    signature.push((neutron_toml, mtime));
     Ok(signature)
 }
 
-/// Read `build.ntbl` from the current directory.
+/// Read `neutron.toml` from the current directory.
 fn load_project() -> Result<(PathBuf, ntsc_build::BuildConfig), CliError> {
     let cwd = env::current_dir()?;
 
-    let build_path = cwd.join("build.ntbl");
+    let build_path = cwd.join("neutron.toml");
     let build_src = fs::read_to_string(&build_path)
-        .map_err(|e| CliError::Plain(format!("cannot read build.ntbl: {e}")))?;
+        .map_err(|e| CliError::Plain(format!("cannot read neutron.toml: {e}")))?;
     let config = ntsc_build::parse(&build_src).map_err(|errors| {
         let msgs: Vec<_> = errors.iter().map(|e| e.to_string()).collect();
-        CliError::Plain(format!("build.ntbl errors:\n  {}", msgs.join("\n  ")))
+        CliError::Plain(format!("neutron.toml errors:\n  {}", msgs.join("\n  ")))
     })?;
 
     Ok((cwd, config))

@@ -20,7 +20,7 @@ Flags may appear before or after the command.
 | `ntsc test` | Compile in test mode and run every `test` block. |
 | `ntsc run` | Build, then execute the resulting binary. |
 | `ntsc clean` | Remove the `build/` directory. |
-| `ntsc watch` | Rebuild whenever a source file or `build.ntbl` changes. |
+| `ntsc watch` | Rebuild whenever a source file or `neutron.toml` changes. |
 | `ntsc graph` | Print the module dependency graph as DOT. |
 | `ntsc version` / `--version` / `-V` | Print detailed version info (version, LLVM revision, host triple, build profile, git commit) and exit. |
 | `ntsc --help` / `-h` | Print usage. |
@@ -29,7 +29,7 @@ Flags may appear before or after the command.
 
 ```
 name/
-  build.ntbl      target/entry/output for the host platform
+  neutron.toml      target/entry/output for the host platform
   src/main.nt     fun main() { say("Hello, World!") }
 ```
 
@@ -56,7 +56,7 @@ Build complete (Debug): /path/to/build/debug/hello
 
 ## The build manifest
 
-`build.ntbl` is a line-based manifest with exactly three keys, each appearing
+`neutron.toml` is a TOML file with a `[package]` section containing three keys:
 once:
 
 ```
@@ -70,7 +70,7 @@ output "hello"
 - `output` is the output binary name (without extension; the platform
   extension is added automatically).
 
-Missing or duplicate keys are reported as `build.ntbl errors`.
+Missing or duplicate keys are reported as `neutron.toml errors`.
 
 ## Diagnostics
 
@@ -126,6 +126,6 @@ test failed. See [Testing](../guide/testing.md).
 ## Watch mode
 
 `ntsc watch` snapshots the modification times of every file in the module
-closure plus `build.ntbl`, rebuilds, and polls every 400 ms. When any file
+closure plus `neutron.toml`, rebuilds, and polls every 400 ms. When any file
 changes it prints `Change detected, rebuilding...` and rebuilds. New imports
 are detected because the snapshot includes the discovery result.

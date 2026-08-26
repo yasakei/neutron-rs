@@ -9,3 +9,4 @@ ntsc-ast = { path = "../ntsc-ast" }
 ntsc-lexer = { path = "../ntsc-lexer" }
 ntsc-parser = { path = "../ntsc-parser" }
 ntsc-diag = { path = "../ntsc-diag" }
+toml = "0.8"

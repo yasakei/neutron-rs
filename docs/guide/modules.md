@@ -1,7 +1,7 @@
 # Modules and imports
 
 A program is made of one or more `.nt` source files. The entry file is named
-in `build.ntbl`; every other file is pulled in explicitly.
+in `neutron.toml`; every other file is pulled in explicitly.
 
 ## The standard library
 
@@ -91,7 +91,7 @@ Each node is a source file; each edge is a file import.
 
 ## Build manifest
 
-The project manifest `build.ntbl` declares three keys:
+The project manifest `neutron.toml` declares three keys:
 
 ```
 target "x86_64-unknown-linux-gnu"

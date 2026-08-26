@@ -64,7 +64,7 @@ crates/
     ntsc-typeck    name resolution, type checking, ownership, linting
     ntsc-codegen   LLVM IR generation, optimization, linking
     ntsc-runtime   the runtime static library linked into every binary
-    ntsc-build     build.ntbl parsing, multi-file module loading
+    ntsc-build     neutron.toml parsing, multi-file module loading
     ntsc-diag      diagnostic rendering and JSON output
     ntsc-cli       the `ntsc` binary (commands, install/runtime lookup)
   docs/            guide + reference, including internals.md

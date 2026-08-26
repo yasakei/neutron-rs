@@ -40,7 +40,7 @@ The reference is exhaustive and aimed at lookup rather than learning.
 | --- | --- |
 | [Language reference](reference/language.md) | Every type, statement, expression, and grammar rule. |
 | [Standard library](reference/stdlib.md) | Every module and function exposed to NTSC source. |
-| [CLI reference](reference/cli.md) | The `ntsc` command, the `build.ntbl` manifest, and environment variables. |
+| [CLI reference](reference/cli.md) | The `ntsc` command, the `neutron.toml` manifest, and environment variables. |
 | [Internals](reference/internals.md) | ABI, memory model, LLVM pipeline, leak detection, and platform support. |
 | [Contributing](reference/contributing.md) | Building, testing, layout, conventions, and end-to-end change workflows. |
 
@@ -56,7 +56,7 @@ The compiler lives in the workspace root as a set of crates:
 | `ntsc-typeck` | Name resolution, type checking, ownership checking, and linting. |
 | `ntsc-codegen` | LLVM IR generation, optimization, and linking. |
 | `ntsc-runtime` | The runtime static library linked into every binary. |
-| `ntsc-build` | `build.ntbl` parsing and multi-file module loading. |
+| `ntsc-build` | `neutron.toml` parsing and multi-file module loading. |
 | `ntsc-diag` | Diagnostic rendering and JSON error output. |
 | `ntsc-cli` | The `ntsc` command-line binary. |
 
