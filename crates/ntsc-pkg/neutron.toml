@@ -1,4 +1,3 @@
 [package]
-target = "x86_64-unknown-linux-gnu"
 entry = "src/main.nt"
 output = "ntsc-pkg"

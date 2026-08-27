@@ -1,3 +1,7 @@
+use strings
+use arrays
+use fmt
+
 fun parse_version(view string s) -> string {
     var trimmed = strings.trim(s)
     if (strings.is_empty(trimmed)) {

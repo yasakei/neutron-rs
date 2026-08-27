@@ -1,9 +1,17 @@
-use "toml_utils"
-use "registry"
-use "semver"
+use "toml_utils" as toml_utils
+use "registry" as registry
+
+use arrays
+use collections
+use json
+use strings
+use os
+use paths
+use process
+use sys
 
 fun resolve(view string toml_json) -> result[array[string], string] {
-    var deps = get_dependencies(toml_json)
+    var deps = toml_utils.get_dependencies(toml_json)
     if (deps == "{}") {
         return Ok([])
     }
@@ -47,8 +55,8 @@ fun resolve(view string toml_json) -> result[array[string], string] {
 
         collections.set_add(resolving, name)
 
-        var version = find_best_version(name, spec)?
-        var source_result = get_repo(name)?
+        var version = registry.find_best_version(name, spec)?
+        var source_result = registry.get_repo(name)?
         var source = "git+" + source_result + "#v" + version
 
         arrays.push(resolved, copy(name) + "@" + version + "|" + source)
@@ -70,7 +78,7 @@ fun resolve(view string toml_json) -> result[array[string], string] {
 }
 
 fun get_sub_deps(view string name, view string version) -> array[string] {
-    var repo = get_repo(name)
+    var result[string, string] repo = registry.get_repo(name)
     match (repo) {
         case Err(_) => return []
         case Ok(repo_url) => {
@@ -88,10 +96,10 @@ fun get_sub_deps(view string name, view string version) -> array[string] {
                 return []
             }
 
-            var pkg_toml = read_toml(pkg_toml_path)
+            var result[string, string] pkg_toml = toml_utils.read_toml(pkg_toml_path)
             match (pkg_toml) {
                 case Ok(toml_json) => {
-                    var sub_deps = get_dependencies(toml_json)
+                    var sub_deps = toml_utils.get_dependencies(toml_json)
                     var keys = json.keys(sub_deps)
                     if (strings.is_empty(keys)) {
                         return []

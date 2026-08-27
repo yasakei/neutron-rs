@@ -92,9 +92,9 @@ $ ntsc test              # run the unit tests
 
 ```console
 $ cat neutron.toml
-target "x86_64-unknown-linux-gnu"
-entry "src/main.nt"
-output "hello"
+[package]
+entry = "src/main.nt"
+output = "hello"
 ```
 
 ## Command-line interface
@@ -107,6 +107,7 @@ output "hello"
 | `ntsc run [--release]` | Build and execute |
 | `ntsc clean` | Remove the `build/` directory |
 | `ntsc watch [--release]` | Rebuild when sources change |
+| `ntsc pkg [args]` | Run the package manager |
 | `ntsc graph` | Print the module dependency graph as DOT |
 | `ntsc --version` | Print the compiler version |
 

@@ -1,7 +1,14 @@
-use "modules/install"
-use "modules/registry"
-use "modules/lockfile"
-use "modules/toml_utils"
+use "modules/install" as installer
+use "modules/registry" as registry
+use "modules/toml_utils" as toml_utils
+use "modules/semver" as semver
+
+use sys
+use strings
+use arrays
+use json
+use fmt
+use paths
 
 fun main() -> int {
     var args = sys.args()
@@ -19,7 +26,7 @@ fun main() -> int {
     match (command) {
         case "install" => {
             if (strings.is_empty(extra)) {
-                var res = install(sys.cwd())
+                var result[bool, string] res = installer.install(sys.cwd())
                 match (res) {
                     case Ok(_) => return 0
                     case Err(e) => {
@@ -37,7 +44,7 @@ fun main() -> int {
                 say("usage: ntsc pkg remove <name>")
                 return 1
             }
-            var res = remove(sys.cwd(), extra)
+            var result[bool, string] res = installer.remove(sys.cwd(), extra)
             match (res) {
                 case Ok(_) => return 0
                 case Err(e) => {
@@ -47,7 +54,7 @@ fun main() -> int {
             }
         }
         case "update" => {
-            var res = update(sys.cwd())
+            var result[bool, string] res = installer.update(sys.cwd())
             match (res) {
                 case Ok(_) => return 0
                 case Err(e) => {
@@ -57,7 +64,7 @@ fun main() -> int {
             }
         }
         case "list" => {
-            var res = list_installed(sys.cwd())
+            var result[bool, string] res = installer.list_installed(sys.cwd())
             match (res) {
                 case Ok(_) => return 0
                 case Err(e) => {
@@ -92,18 +99,18 @@ fun usage() {
 
 fun add_dep(string name) {
     var toml_path = paths.join(sys.cwd(), "neutron.toml")
-    var toml_json = read_toml(toml_path)
+    var result[string, string] toml_json = toml_utils.read_toml(toml_path)
     match (toml_json) {
         case Err(e) => {
             say("error: " + e)
             return
         }
         case Ok(json) => {
-            var deps = get_dependencies(json)
-            var version = find_best_version(name, "*")
+            var deps = toml_utils.get_dependencies(json)
+            var result[string, string] version = registry.find_best_version(name, "*")
             match (version) {
                 case Ok(v) => {
-                    var next_major = version_major(v) + 1
+                    var next_major = semver.version_major(v) + 1
                     var spec = ">=" + v + ", <" + fmt.i64_to_str(next_major) + ".0.0"
                     var updates = arrays.new()
                     var keys = json.keys(deps)
@@ -119,11 +126,11 @@ fun add_dep(string name) {
                         }
                     }
                     arrays.push(updates, name + "=" + spec)
-                    var new_deps = rebuild_deps_from_updates(updates)
-                    var new_toml = rebuild_toml(json, new_deps)
+                    var new_deps = installer.rebuild_deps_from_updates(updates)
+                    var new_toml = installer.rebuild_toml(json, new_deps)
                     sys.write(toml_path, new_toml)
                     say("added " + name + " " + spec)
-                    install(sys.cwd())
+                    installer.install(sys.cwd())
                 }
                 case Err(e) => {
                     say("error: " + e)
@@ -139,7 +146,7 @@ fun search(string query) {
         return
     }
 
-    var reg = fetch()
+    var result[string, string] reg = registry.fetch()
     match (reg) {
         case Err(e) => {
             say("error: " + e)

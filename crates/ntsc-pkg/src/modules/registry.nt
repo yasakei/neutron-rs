@@ -1,6 +1,13 @@
-use "semver"
+use "semver" as semver
 
-static const var string REGISTRY_URL = "https://registry.neutron-lang.dev/packages.toml"
+use http
+use fmt
+use toml
+use json
+use strings
+use arrays
+
+static const var string REGISTRY_URL = "https://registry.example.invalid/packages.toml"
 
 fun fetch() -> result[string, string] {
     try {
@@ -61,7 +68,7 @@ fun get_repo(view string name) -> result[string, string] {
 
 fun find_best_version(view string name, view string spec) -> result[string, string] {
     var versions = get_versions(name)?
-    return best_match(versions, spec)
+    return semver.best_match(versions, spec)
 }
 
 fun parse_version_array(view string json_array) -> array[string] {

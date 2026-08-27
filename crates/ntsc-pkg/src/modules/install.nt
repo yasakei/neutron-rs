@@ -1,16 +1,27 @@
-use "toml_utils"
-use "lockfile"
-use "registry"
-use "resolve"
+use "toml_utils" as toml_utils
+use "lockfile" as lockfile
+use "registry" as registry
+use "resolve" as resolver
+use "semver" as semver
+
+use paths
+use arrays
+use strings
+use sys
+use os
+use crypto
+use json
+use toml
+use fmt
 
 fun install(string project_dir) -> result[bool, string] {
     var toml_path = paths.join(project_dir, "neutron.toml")
-    var toml_json = read_toml(toml_path)?
+    var toml_json = toml_utils.read_toml(toml_path)?
 
     var lockfile_path = paths.join(project_dir, "neutron.lock")
-    var lockfile_json = read_lockfile(lockfile_path)?
+    var lockfile_json = lockfile.read_lockfile(lockfile_path)?
 
-    var resolved = resolve(toml_json)?
+    var resolved = resolver.resolve(toml_json)?
 
     var count = arrays.length(resolved)
     for (var i = 0; i < count; i = i + 1) {
@@ -30,7 +41,7 @@ fun install(string project_dir) -> result[bool, string] {
         install_package(pkg_name, version, source, copy(lockfile_json))?
     }
 
-    write_lockfile(lockfile_path, lockfile_json)?
+    lockfile.write_lockfile(lockfile_path, lockfile_json)?
     say("installed " + fmt.i64_to_str(count) + " packages")
     return Ok(true)
 }
@@ -46,7 +57,7 @@ fun install_package(view string pkg_name, view string version, view string sourc
 
     say("  " + copy(pkg_name) + "@" + copy(version) + " downloading...")
 
-    var repo = get_repo(pkg_name)?
+    var repo = registry.get_repo(pkg_name)?
 
     try {
         sys.mkdir(cache_dir)
@@ -57,7 +68,7 @@ fun install_package(view string pkg_name, view string version, view string sourc
 
     var integrity = compute_integrity(pkg_dir)
 
-    set_package(lockfile_json, pkg_name, version, source, integrity)?
+    lockfile.set_package(lockfile_json, pkg_name, version, source, integrity)?
 
     say("  " + copy(pkg_name) + "@" + copy(version) + " installed")
     return Ok(true)
@@ -93,9 +104,9 @@ fun compute_integrity(view string dir) -> string {
 
 fun remove(string project_dir, view string name) -> result[bool, string] {
     var toml_path = paths.join(project_dir, "neutron.toml")
-    var toml_json = read_toml(toml_path)?
+    var toml_json = toml_utils.read_toml(toml_path)?
 
-    var deps = get_dependencies(toml_json)
+    var deps = toml_utils.get_dependencies(toml_json)
     var keys = json.keys(deps)
     if (strings.is_empty(keys)) {
         return Err("remove: no dependencies found")
@@ -132,9 +143,9 @@ fun rebuild_json_without(view string json_str, view string skip_key) -> string {
 
 fun update(string project_dir) -> result[bool, string] {
     var toml_path = paths.join(project_dir, "neutron.toml")
-    var toml_json = read_toml(toml_path)?
+    var toml_json = toml_utils.read_toml(toml_path)?
 
-    var deps = get_dependencies(toml_json)
+    var deps = toml_utils.get_dependencies(toml_json)
     var keys = json.keys(deps)
     if (strings.is_empty(keys)) {
         say("no dependencies to update")
@@ -151,10 +162,10 @@ fun update(string project_dir) -> result[bool, string] {
         var spec = json.get(deps, dep_name)
         if (strings.is_empty(spec) || spec == "nil") { spec = "*" }
 
-        var version = find_best_version(dep_name, spec)
+        var result[string, string] version = registry.find_best_version(dep_name, spec)
         match (version) {
             case Ok(v) => {
-                var next_major = version_major(v) + 1
+                var next_major = semver.version_major(v) + 1
                 var new_spec = ">=" + v + ", <" + fmt.i64_to_str(next_major) + ".0.0"
                 arrays.push(updates, dep_name + "=" + new_spec)
             }
@@ -194,8 +205,8 @@ fun list_installed(string project_dir) -> result[bool, string] {
         return Ok(true)
     }
 
-    var lockfile_json = read_lockfile(lockfile_path)?
-    var packages = list_packages(lockfile_json)
+    var lockfile_json = lockfile.read_lockfile(lockfile_path)?
+    var packages = lockfile.list_packages(lockfile_json)
     var count = arrays.length(packages)
 
     if (count == 0) {
@@ -205,7 +216,7 @@ fun list_installed(string project_dir) -> result[bool, string] {
 
     for (var i = 0; i < count; i = i + 1) {
         var pkg_name = arrays.get(packages, i)
-        var pkg = get_package(lockfile_json, pkg_name)
+        var pkg = lockfile.get_package(lockfile_json, pkg_name)
         var version = json.get(pkg, "version")
         say("  " + pkg_name + " " + version)
     }

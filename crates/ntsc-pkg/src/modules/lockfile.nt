@@ -1,3 +1,9 @@
+use sys
+use toml
+use json
+use strings
+use arrays
+
 fun read_lockfile(view string path) -> result[string, string] {
     if (!sys.exists(path)) {
         return Ok("{}")
