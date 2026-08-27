@@ -1,0 +1,217 @@
+//! Core state types of the ntroutine substrate: the global scheduling and
+//! parking registry, channels, goroutines, and reactor interests.
+//!
+//! All blocking coordination (which goroutine is parked on which channel, the
+//! channel buffers, timers, and file-descriptor interests) lives under a single
+//! [`Mutex`] guarded [`Global`] state, so a block/unblock decision and the
+//! registration of a waiter are one atomic critical section — there is no lost
+//! wakeup. Runnable goroutines are handed to per-worker local queues (see
+//! [`crate::ntask::scheduler`]), so CPU-bound work spreads across the OS-thread
+//! pool while I/O-bound goroutines park without tying up a thread.
+
+use std::collections::VecDeque;
+use std::sync::{LazyLock, Mutex};
+
+use crate::registry;
+
+/// A poll function for one async future. Returns `1` when the future
+/// completed, `0` when it is still pending. See [`crate::AsyncPollFn`].
+pub(crate) type PollFn = crate::AsyncPollFn;
+
+/// A per-goroutine wait target set by generated code before a poll returns
+/// `0`. The worker's driver reads it after the poll to decide whether to
+/// requeue, park on a channel, park on a timer, or park on a descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Park {
+    /// No explicit wait: a cooperative yield. The goroutine is requeued.
+    None,
+    /// Wait on a channel core, performing the given operation.
+    Chan { core: i64, op: ChanOp },
+    /// Wait until the given wall-clock deadline.
+    Timer { at: i64 },
+    /// Wait for readiness on a descriptor, for the given operation.
+    Fd { io: i64, read: bool },
+    /// Wait until a sibling goroutine completes.
+    Join { target: i64 },
+}
+
+/// Direction of a channel operation a parked goroutine wants to perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChanOp {
+    Send,
+    Recv,
+}
+
+/// A goroutine: one stackless future scheduled onto the worker pool. It does
+/// not rely on any worker thread-local async stack, so a torn-out goroutine is
+/// migratable between workers.
+#[derive(Debug)]
+pub(crate) struct Goroutine {
+    /// Nested async task stack. It moves with the goroutine between workers.
+    pub(crate) tasks: Vec<(PollFn, i64)>,
+    /// The pending wait target, set by the last park call.
+    pub(crate) park: Park,
+    /// The value a blocked sender is handing off, or `NULL`.
+    pub(crate) pending_send: i64,
+    /// The value a receiver picked up (or the zero value on close), or `NULL`.
+    pub(crate) recv_result: i64,
+    /// `1` once the future has completed (its result is in `result`).
+    pub(crate) done: bool,
+    /// The result handle of a completed goroutine.
+    pub(crate) result: i64,
+    /// Message of an uncaught exception that ended this goroutine's future,
+    /// or `NULL`. Ownership transfers to the thread that joins it, which
+    /// re-raises it so the caller observes the pending exception.
+    pub(crate) pending_exception: i64,
+    /// Sibling goroutines parked waiting for this one to complete.
+    pub(crate) joiners: Vec<i64>,
+}
+
+/// A channel: an optional bounded ring buffer of `i64` slots plus the parked
+/// senders and receivers. Slots store raw scalar values or owned handles
+/// (for heap element types); ownership of a handle slot transfers to the
+/// receiver when it is received out, and back to the runtime when the channel
+/// is dropped.
+#[derive(Debug)]
+pub(crate) struct Chan {
+    pub(crate) buf: VecDeque<i64>,
+    pub(crate) cap: usize,
+    pub(crate) owns_elements: bool,
+    pub(crate) closed: bool,
+    pub(crate) senders: VecDeque<i64>,
+    pub(crate) receivers: VecDeque<i64>,
+}
+
+impl Chan {
+    pub(crate) fn new(cap: usize, owns_elements: bool) -> Self {
+        Chan {
+            buf: VecDeque::with_capacity(cap),
+            cap,
+            owns_elements,
+            closed: false,
+            senders: VecDeque::new(),
+            receivers: VecDeque::new(),
+        }
+    }
+}
+
+/// A reactor registration: a timer or a file-descriptor readiness interest
+/// that can be polled from a goroutine.
+#[derive(Debug)]
+pub(crate) struct AsyncIo {
+    /// `0` = timer, non-zero = the raw file descriptor interest.
+    pub(crate) fd: i64,
+    /// Poll the readiness without blocking.
+    pub(crate) ready: bool,
+    /// Whether a goroutine is currently parked on this interest.
+    pub(crate) parked: bool,
+    /// Goroutines parked waiting for this descriptor to become ready.
+    pub(crate) waiters: Vec<i64>,
+}
+
+/// The global scheduling + parking state, guarded by one mutex.
+pub(crate) struct Global {
+    pub(crate) next_core: i64,
+    /// Ready goroutine ids, shared queue consumed by workers. A global queue
+    /// keeps the block/unblock path deadlock-free and still lets many workers
+    /// run CPU-bound goroutines in parallel.
+    pub(crate) ready: VecDeque<i64>,
+    pub(crate) goroutines: std::collections::HashMap<i64, Goroutine>,
+    pub(crate) chans: std::collections::HashMap<i64, Chan>,
+    pub(crate) ios: std::collections::HashMap<i64, AsyncIo>,
+    /// wall-clock ms deadline -> woken goroutine ids.
+    pub(crate) timers: std::collections::BTreeMap<i64, Vec<i64>>,
+}
+
+pub(crate) static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| {
+    Mutex::new(Global {
+        next_core: 1,
+        ready: VecDeque::new(),
+        goroutines: std::collections::HashMap::new(),
+        chans: std::collections::HashMap::new(),
+        ios: std::collections::HashMap::new(),
+        timers: std::collections::BTreeMap::new(),
+    })
+});
+
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// Reserve a fresh core id.
+pub(crate) fn alloc_core() -> i64 {
+    let mut g = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let id = g.next_core;
+    g.next_core = g.next_core.saturating_add(1);
+    id
+}
+
+/// Register a new goroutine and return its core id. The goroutine is not
+/// scheduled until [`crate::ntask::scheduler::make_runnable`] is called for it.
+pub(crate) fn register_goroutine(g: Goroutine) -> i64 {
+    let id = alloc_core();
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    guard.goroutines.insert(id, g);
+    id
+}
+
+/// Register a new channel and return its core id.
+pub(crate) fn register_chan(cap: usize, owns_elements: bool) -> i64 {
+    let id = alloc_core();
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    guard.chans.insert(id, Chan::new(cap, owns_elements));
+    id
+}
+
+/// Register a new reactor interest and return its core id.
+pub(crate) fn register_io() -> i64 {
+    let id = alloc_core();
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    guard.ios.insert(
+        id,
+        AsyncIo {
+            fd: 0,
+            ready: false,
+            parked: false,
+            waiters: Vec::new(),
+        },
+    );
+    id
+}
+
+/// Drop a goroutine core.
+pub(crate) fn drop_goroutine(core: i64) {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    guard.goroutines.remove(&core);
+}
+
+/// Drop a channel core, reclaiming any buffered element handles.
+pub(crate) fn drop_chan(core: i64) {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(chan) = guard.chans.remove(&core) {
+        for slot in chan.buf {
+            // Slots hold owned handles for heap element types; release them.
+            // For scalar slots the value is dropped by value with no effect.
+            if chan.owns_elements {
+                let _ = registry::remove(slot);
+            }
+        }
+    }
+}
+
+/// Drop a reactor-interest core.
+pub(crate) fn drop_io(core: i64) {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    guard.ios.remove(&core);
+}
+
+pub(crate) fn io_ready(core: i64) -> bool {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(io) = guard.ios.get_mut(&core) else {
+        return false;
+    };
+    std::mem::take(&mut io.ready)
+}

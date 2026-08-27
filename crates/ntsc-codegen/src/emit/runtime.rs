@@ -184,6 +184,26 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
         i64_ty
     );
 
+    // ── Virtual tasks / reactor ─────────────────────────────────────────
+    declare!("ntask_go", i64_ty, async_poll_fn, i64_ty);
+    declare!("ntask_join", i64_ty, i64_ty);
+    declare!("ntask_join_park", i8_ty, i64_ty);
+    declare!("ntask_goroutine_drop", void_ty, i64_ty);
+    declare!("ntask_chan_new", i64_ty, i64_ty, i8_ty);
+    declare!("ntask_chan_send", i8_ty, i64_ty, i64_ty);
+    declare!("ntask_chan_recv", i8_ty, i64_ty);
+    declare!("ntask_chan_recv_result", i64_ty);
+    declare!("ntask_chan_close", void_ty, i64_ty);
+    declare!("ntask_chan_drop", void_ty, i64_ty);
+    declare!("ntask_timer_new", i64_ty);
+    declare!("ntask_timer_park", i8_ty, i64_ty, i64_ty);
+    declare!("ntask_reactor_drop", void_ty, i64_ty);
+    declare!("ntask_io_new", i64_ty);
+    declare!("ntask_io_attach", void_ty, i64_ty, i64_ty, i8_ty);
+    declare!("ntask_io_park", i8_ty, i64_ty, i8_ty);
+    declare!("ntask_io_ready", i8_ty, i64_ty);
+    declare!("ntask_io_drop", void_ty, i64_ty);
+
     // ── arrays module ────────────────────────────────────────────────────
 
     declare!("ntsc_arrays_new", i64_ty);

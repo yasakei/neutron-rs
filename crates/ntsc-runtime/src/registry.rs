@@ -112,6 +112,18 @@ pub(crate) enum Handle {
     /// The state machine of an `async.sleep(ms)` future.
     AsyncSleep { state: i32, ms: i64, deadline: i64 },
 
+    /// A scheduled virtual goroutine owned by the task scheduler.
+    Goroutine { core: i64 },
+
+    /// A channel core owned by the task scheduler.
+    Chan { core: i64 },
+
+    /// A reactor registration for timers or descriptor readiness.
+    ReactorReg { core: i64 },
+
+    /// An asynchronous I/O future associated with a reactor core.
+    AsyncIo { core: i64 },
+
     /// An opaque value owned by a stdlib module (files, sockets,
     /// channels...).
     Opaque(Box<dyn Any + Send>),
@@ -537,6 +549,10 @@ pub(crate) fn live_entries() -> Vec<LeakEntry> {
                 Handle::Array(_) => "array",
                 Handle::Shared(_) => "shared",
                 Handle::AsyncSleep { .. } => "async future",
+                Handle::Goroutine { .. } => "goroutine",
+                Handle::Chan { .. } => "channel",
+                Handle::ReactorReg { .. } => "reactor registration",
+                Handle::AsyncIo { .. } => "async io future",
                 Handle::Opaque(_) => "opaque",
                 Handle::Memory(_) => "pointer capability",
                 Handle::Slice(_) => "slice",
@@ -1237,22 +1253,27 @@ pub(crate) fn async_sleep_poll(id: i64) -> i8 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let now_ms = now.as_millis() as i64;
-    match *sleep.0 {
+    let (result, park_until) = match *sleep.0 {
         0 => {
             *sleep.2 = now_ms.saturating_add(*sleep.1);
             *sleep.0 = 1;
-            0
+            (0, Some(*sleep.2))
         }
         1 => {
             if now_ms >= *sleep.2 {
                 *sleep.0 = 2;
-                1
+                (1, None)
             } else {
-                0
+                (0, Some(*sleep.2))
             }
         }
-        _ => 1,
+        _ => (1, None),
+    };
+    drop(guard);
+    if let Some(deadline) = park_until {
+        crate::ntask::scheduler::park_timer(deadline);
     }
+    result
 }
 
 /// Drop an `async.sleep(ms)` future.
@@ -1272,6 +1293,68 @@ pub(crate) fn async_sleep_drop(id: i64) {
     if guard.remove(&id).is_some() {
         LIVE.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+fn remove_kind(id: i64, predicate: impl FnOnce(&Handle) -> bool) -> Option<Handle> {
+    if id == NULL {
+        return None;
+    }
+    if borrow(id, predicate).unwrap_or(false) {
+        remove(id)
+    } else {
+        None
+    }
+}
+
+/// Drop a scheduled goroutine handle and its task core.
+pub(crate) fn goroutine_drop(id: i64) {
+    let Some(Handle::Goroutine { core }) =
+        remove_kind(id, |handle| matches!(handle, Handle::Goroutine { .. }))
+    else {
+        return;
+    };
+    crate::ntask::scheduler::drop_goroutine(core);
+}
+
+/// Drop a channel handle and reclaim its buffered elements.
+pub(crate) fn chan_drop(id: i64) {
+    let Some(Handle::Chan { core }) =
+        remove_kind(id, |handle| matches!(handle, Handle::Chan { .. }))
+    else {
+        return;
+    };
+    crate::ntask::scheduler::chan_close(core);
+    crate::ntask::scheduler::drop_chan(core);
+}
+
+/// Drop a reactor registration handle.
+pub(crate) fn reactor_reg_drop(id: i64) {
+    let Some(Handle::ReactorReg { core }) =
+        remove_kind(id, |handle| matches!(handle, Handle::ReactorReg { .. }))
+    else {
+        return;
+    };
+    crate::ntask::scheduler::drop_io(core);
+}
+
+/// Drop an asynchronous I/O future handle.
+pub(crate) fn async_io_drop(id: i64) {
+    let Some(Handle::AsyncIo { core }) =
+        remove_kind(id, |handle| matches!(handle, Handle::AsyncIo { .. }))
+    else {
+        return;
+    };
+    crate::ntask::scheduler::drop_io(core);
+}
+
+pub(crate) fn task_core(id: i64) -> Option<i64> {
+    borrow(id, |handle| match handle {
+        Handle::Goroutine { core }
+        | Handle::Chan { core }
+        | Handle::ReactorReg { core }
+        | Handle::AsyncIo { core } => Some(*core),
+        _ => None,
+    })?
 }
 
 // ── Opaque module values ───────────────────────────────────────────────────
