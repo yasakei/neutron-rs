@@ -1,0 +1,134 @@
+fun parse_version(view string s) -> string {
+    var trimmed = strings.trim(s)
+    if (strings.is_empty(trimmed)) {
+        return ""
+    }
+    var parts = strings.split(trimmed, ".")
+    var count = arrays.length(parts)
+    if (count < 1 || count > 3) {
+        return ""
+    }
+    var major = parse_int_component(arrays.get(parts, 0))
+    var minor = 0
+    var patch = 0
+    if (count >= 2) { minor = parse_int_component(arrays.get(parts, 1)) }
+    if (count >= 3) { patch = parse_int_component(arrays.get(parts, 2)) }
+    return fmt.i64_to_str(major) + "." + fmt.i64_to_str(minor) + "." + fmt.i64_to_str(patch)
+}
+
+fun parse_int_component(view string s) -> int {
+    try {
+        var num = strings.trim(s)
+        if (strings.is_empty(num)) {
+            return 0
+        }
+        return fmt.to_int(num)
+    } catch (_) {
+        return 0
+    }
+}
+
+fun version_to_parts(view string v) -> array[string] {
+    return strings.split(v, ".")
+}
+
+fun version_major(view string v) -> int {
+    var parts = strings.split(v, ".")
+    if (arrays.length(parts) >= 1) {
+        return parse_int_component(arrays.get(parts, 0))
+    }
+    return 0
+}
+
+fun version_minor(view string v) -> int {
+    var parts = strings.split(v, ".")
+    if (arrays.length(parts) >= 2) {
+        return parse_int_component(arrays.get(parts, 1))
+    }
+    return 0
+}
+
+fun version_patch(view string v) -> int {
+    var parts = strings.split(v, ".")
+    if (arrays.length(parts) >= 3) {
+        return parse_int_component(arrays.get(parts, 2))
+    }
+    return 0
+}
+
+fun compare_versions(view string a, view string b) -> int {
+    var a_maj = version_major(a)
+    var b_maj = version_major(b)
+    if (a_maj != b_maj) { return a_maj - b_maj }
+    var a_min = version_minor(a)
+    var b_min = version_minor(b)
+    if (a_min != b_min) { return a_min - b_min }
+    var a_pat = version_patch(a)
+    var b_pat = version_patch(b)
+    return a_pat - b_pat
+}
+
+fun satisfies(view string version, view string spec) -> bool {
+    var parts = strings.split(strings.trim(spec), ",")
+    var count = arrays.length(parts)
+    for (var i = 0; i < count; i = i + 1) {
+        if (!single_satisfies(version, strings.trim(arrays.get(parts, i)))) {
+            return false
+        }
+    }
+    return true
+}
+
+fun single_satisfies(view string version, view string spec) -> bool {
+    if (strings.is_empty(spec)) { return true }
+
+    if (strings.starts_with(spec, ">=")) {
+        var target = parse_version(strings.substring(spec, 2, strings.length(spec)))
+        if (strings.is_empty(target)) { return false }
+        return compare_versions(version, target) >= 0
+    }
+    if (strings.starts_with(spec, ">")) {
+        var target = parse_version(strings.substring(spec, 1, strings.length(spec)))
+        if (strings.is_empty(target)) { return false }
+        return compare_versions(version, target) > 0
+    }
+    if (strings.starts_with(spec, "<=")) {
+        var target = parse_version(strings.substring(spec, 2, strings.length(spec)))
+        if (strings.is_empty(target)) { return false }
+        return compare_versions(version, target) <= 0
+    }
+    if (strings.starts_with(spec, "<")) {
+        var target = parse_version(strings.substring(spec, 1, strings.length(spec)))
+        if (strings.is_empty(target)) { return false }
+        return compare_versions(version, target) < 0
+    }
+
+    var target = parse_version(spec)
+    if (strings.is_empty(target)) { return false }
+    return compare_versions(version, target) == 0
+}
+
+fun best_match(array[string] versions, view string spec) -> result[string, string] {
+    var has_best = false
+    var best = ""
+    var count = arrays.length(versions)
+    for (var i = 0; i < count; i = i + 1) {
+        var v = parse_version(arrays.get(versions, i))
+        if (strings.is_empty(v)) { continue }
+        if (satisfies(v, spec)) {
+            if (!has_best) {
+                has_best = true
+                best = v
+            } else {
+                if (compare_versions(v, best) > 0) {
+                    best = v
+                }
+            }
+        }
+    }
+
+    if (has_best) {
+        return Ok(best)
+    }
+    return Err("semver: no version satisfies '" + copy(spec) + "'")
+}

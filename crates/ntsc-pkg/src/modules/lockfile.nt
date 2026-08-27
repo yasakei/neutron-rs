@@ -1,0 +1,105 @@
+fun read_lockfile(view string path) -> result[string, string] {
+    if (!sys.exists(path)) {
+        return Ok("{}")
+    }
+    try {
+        var content = sys.read(path)
+        return Ok(toml.parse(content))
+    } catch (err) {
+        return Err("lockfile.read: " + err)
+    }
+}
+
+fun write_lockfile(view string path, view string json_data) -> result[bool, string] {
+    try {
+        sys.write(path, toml.stringify(json_data))
+        return Ok(true)
+    } catch (err) {
+        return Err("lockfile.write: " + err)
+    }
+}
+
+fun get_package(view string lockfile_json, view string name) -> string {
+    try {
+        var pkgs = json.get(lockfile_json, "package")
+        if (strings.is_empty(pkgs) || pkgs == "nil") {
+            return "{}"
+        }
+        var pkg = json.get(pkgs, name)
+        if (strings.is_empty(pkg) || pkg == "nil") {
+            return "{}"
+        }
+        return pkg
+    } catch (_) {
+        return "{}"
+    }
+}
+
+fun set_package(view string lockfile_json, view string name, view string version, view string source, view string integrity) -> result[string, string] {
+    try {
+        var pkg_json = "{\"name\":\"" + copy(name) + "\",\"version\":\"" + copy(version) + "\",\"source\":\"" + copy(source) + "\",\"integrity\":\"" + copy(integrity) + "\"}"
+        var existing = json.get(lockfile_json, "package")
+        if (strings.is_empty(existing) || existing == "nil") {
+            existing = "{}"
+        }
+        var updated = set_json_key(existing, name, pkg_json)
+        var result_json = set_json_key(lockfile_json, "package", updated)
+        return Ok(result_json)
+    } catch (err) {
+        return Err("lockfile.set_package: " + err)
+    }
+}
+
+fun set_json_key(view string json_str, view string key, view string value) -> string {
+    var keys = json.keys(json_str)
+    var has_key = false
+    if (!strings.is_empty(keys)) {
+        has_key = strings.contains(keys, key)
+    }
+    var parts = arrays.new()
+    if (!strings.is_empty(keys)) {
+        var key_list = strings.split(keys, "\n")
+        var count = arrays.length(key_list)
+        for (var i = 0; i < count; i = i + 1) {
+            var k = strings.trim(arrays.get(key_list, i))
+            if (strings.is_empty(k)) { continue }
+            if (k == key) {
+                arrays.push(parts, quote_str(k) + ": " + quote_str(value))
+            } else {
+                var v = json.get(json_str, k)
+                arrays.push(parts, quote_str(k) + ": " + quote_str(v))
+            }
+        }
+    }
+    if (!has_key) {
+        arrays.push(parts, quote_str(key) + ": " + quote_str(value))
+    }
+    return "{" + arrays.join(parts, ", ") + "}"
+}
+
+fun quote_str(view string s) -> string {
+    return "\"" + strings.replace(s, "\"", "\\\"") + "\""
+}
+
+fun list_packages(view string lockfile_json) -> array[string] {
+    var names = arrays.new()
+    try {
+        var pkgs = json.get(lockfile_json, "package")
+        if (strings.is_empty(pkgs) || pkgs == "nil") {
+            return names
+        }
+        var keys = json.keys(pkgs)
+        if (strings.is_empty(keys)) {
+            return names
+        }
+        var key_list = strings.split(keys, "\n")
+        var count = arrays.length(key_list)
+        for (var i = 0; i < count; i = i + 1) {
+            var key = strings.trim(arrays.get(key_list, i))
+            if (!strings.is_empty(key)) {
+                arrays.push(names, key)
+            }
+        }
+    } catch (_) {}
+    return names
+}

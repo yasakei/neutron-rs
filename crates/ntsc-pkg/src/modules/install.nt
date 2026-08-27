@@ -1,0 +1,252 @@
+use "toml_utils"
+use "lockfile"
+use "registry"
+use "resolve"
+
+fun install(string project_dir) -> result[bool, string] {
+    var toml_path = paths.join(project_dir, "neutron.toml")
+    var toml_json = read_toml(toml_path)?
+
+    var lockfile_path = paths.join(project_dir, "neutron.lock")
+    var lockfile_json = read_lockfile(lockfile_path)?
+
+    var resolved = resolve(toml_json)?
+
+    var count = arrays.length(resolved)
+    for (var i = 0; i < count; i = i + 1) {
+        var entry = arrays.get(resolved, i)
+        var parts = strings.split(entry, "|")
+        var name_version = arrays.get(parts, 0)
+        var source = ""
+        if (arrays.length(parts) >= 2) {
+            source = arrays.get(parts, 1)
+        }
+        var nv_parts = strings.split(name_version, "@")
+        var pkg_name = arrays.get(nv_parts, 0)
+        var version = ""
+        if (arrays.length(nv_parts) >= 2) {
+            version = arrays.get(nv_parts, 1)
+        }
+        install_package(pkg_name, version, source, copy(lockfile_json))?
+    }
+
+    write_lockfile(lockfile_path, lockfile_json)?
+    say("installed " + fmt.i64_to_str(count) + " packages")
+    return Ok(true)
+}
+
+fun install_package(view string pkg_name, view string version, view string source, string lockfile_json) -> result[bool, string] {
+    var cache_dir = get_cache_dir()
+    var pkg_dir = paths.join(cache_dir, copy(pkg_name) + "@" + copy(version))
+
+    if (sys.exists(pkg_dir)) {
+        say("  " + copy(pkg_name) + "@" + copy(version) + " (cached)")
+        return Ok(true)
+    }
+
+    say("  " + copy(pkg_name) + "@" + copy(version) + " downloading...")
+
+    var repo = get_repo(pkg_name)?
+
+    try {
+        sys.mkdir(cache_dir)
+        process.exec("git clone --quiet --branch v" + copy(version) + " --depth 1 " + repo + " " + pkg_dir)
+    } catch (err) {
+        return Err("install: failed to clone " + copy(pkg_name) + ": " + err)
+    }
+
+    var integrity = compute_integrity(pkg_dir)
+
+    set_package(lockfile_json, pkg_name, version, source, integrity)?
+
+    say("  " + copy(pkg_name) + "@" + copy(version) + " installed")
+    return Ok(true)
+}
+
+fun get_cache_dir() -> string {
+    var home = os.getenv("HOME")
+    if (strings.is_empty(home)) {
+        home = os.getenv("USERPROFILE")
+    }
+    if (strings.is_empty(home)) {
+        home = os.temp_dir()
+    }
+    return paths.join(home, ".ntsc/packages")
+}
+
+fun compute_integrity(view string dir) -> string {
+    var hash_input = ""
+    var files = sys.walk(dir)
+    var file_list = strings.split(strings.trim(files), "\n")
+    var count = arrays.length(file_list)
+    for (var i = 0; i < count; i = i + 1) {
+        var file = strings.trim(arrays.get(file_list, i))
+        if (strings.is_empty(file)) { continue }
+        if (strings.contains(file, ".git")) { continue }
+        try {
+            var content = sys.read(paths.join(dir, file))
+            hash_input = hash_input + file + content
+        } catch (_) {}
+    }
+    return crypto.sha256(hash_input)
+}
+
+fun remove(string project_dir, view string name) -> result[bool, string] {
+    var toml_path = paths.join(project_dir, "neutron.toml")
+    var toml_json = read_toml(toml_path)?
+
+    var deps = get_dependencies(toml_json)
+    var keys = json.keys(deps)
+    if (strings.is_empty(keys)) {
+        return Err("remove: no dependencies found")
+    }
+
+    if (!strings.contains(keys, name)) {
+        return Err("remove: package '" + copy(name) + "' not in dependencies")
+    }
+
+    var new_deps = rebuild_json_without(deps, name)
+    var new_toml = rebuild_toml(toml_json, new_deps)
+    sys.write(toml_path, new_toml)
+
+    say("removed " + copy(name))
+    return Ok(true)
+}
+
+fun rebuild_json_without(view string json_str, view string skip_key) -> string {
+    var keys = json.keys(json_str)
+    if (strings.is_empty(keys)) { return "{}" }
+    var key_list = strings.split(keys, "\n")
+    var count = arrays.length(key_list)
+    var parts = arrays.new()
+    for (var i = 0; i < count; i = i + 1) {
+        var k = strings.trim(arrays.get(key_list, i))
+        if (strings.is_empty(k)) { continue }
+        if (k == skip_key) { continue }
+        var v = json.get(json_str, k)
+        arrays.push(parts, quote(k) + ": " + quote(v))
+    }
+    if (arrays.length(parts) == 0) { return "{}" }
+    return "{" + arrays.join(parts, ", ") + "}"
+}
+
+fun update(string project_dir) -> result[bool, string] {
+    var toml_path = paths.join(project_dir, "neutron.toml")
+    var toml_json = read_toml(toml_path)?
+
+    var deps = get_dependencies(toml_json)
+    var keys = json.keys(deps)
+    if (strings.is_empty(keys)) {
+        say("no dependencies to update")
+        return Ok(true)
+    }
+
+    var updates = arrays.new()
+    var key_list = strings.split(keys, "\n")
+    var count = arrays.length(key_list)
+    for (var i = 0; i < count; i = i + 1) {
+        var dep_name = strings.trim(arrays.get(key_list, i))
+        if (strings.is_empty(dep_name)) { continue }
+
+        var spec = json.get(deps, dep_name)
+        if (strings.is_empty(spec) || spec == "nil") { spec = "*" }
+
+        var version = find_best_version(dep_name, spec)
+        match (version) {
+            case Ok(v) => {
+                var next_major = version_major(v) + 1
+                var new_spec = ">=" + v + ", <" + fmt.i64_to_str(next_major) + ".0.0"
+                arrays.push(updates, dep_name + "=" + new_spec)
+            }
+            case Err(_) => {
+                arrays.push(updates, dep_name + "=" + spec)
+            }
+        }
+    }
+
+    var new_deps = rebuild_deps_from_updates(updates)
+    var new_toml = rebuild_toml(toml_json, new_deps)
+    sys.write(toml_path, new_toml)
+
+    install(project_dir)?
+    return Ok(true)
+}
+
+fun rebuild_deps_from_updates(array[string] updates) -> string {
+    var count = arrays.length(updates)
+    var parts = arrays.new()
+    for (var i = 0; i < count; i = i + 1) {
+        var entry = arrays.get(updates, i)
+        var eq = strings.index_of(entry, "=", 0)
+        if (eq < 0) { continue }
+        var k = strings.substring(entry, 0, eq)
+        var v = strings.substring(entry, eq + 1, strings.length(entry))
+        arrays.push(parts, quote(k) + ": " + quote(v))
+    }
+    if (arrays.length(parts) == 0) { return "{}" }
+    return "{" + arrays.join(parts, ", ") + "}"
+}
+
+fun list_installed(string project_dir) -> result[bool, string] {
+    var lockfile_path = paths.join(project_dir, "neutron.lock")
+    if (!sys.exists(lockfile_path)) {
+        say("no packages installed (no neutron.lock)")
+        return Ok(true)
+    }
+
+    var lockfile_json = read_lockfile(lockfile_path)?
+    var packages = list_packages(lockfile_json)
+    var count = arrays.length(packages)
+
+    if (count == 0) {
+        say("no packages installed")
+        return Ok(true)
+    }
+
+    for (var i = 0; i < count; i = i + 1) {
+        var pkg_name = arrays.get(packages, i)
+        var pkg = get_package(lockfile_json, pkg_name)
+        var version = json.get(pkg, "version")
+        say("  " + pkg_name + " " + version)
+    }
+    say(fmt.i64_to_str(count) + " packages installed")
+    return Ok(true)
+}
+
+fun rebuild_toml(view string toml_json, view string new_deps) -> string {
+    try {
+        var pkg = json.get(toml_json, "package")
+        var name = json.get(pkg, "name")
+        var target = json.get(pkg, "target")
+        var entry = json.get(pkg, "entry")
+        var output = json.get(pkg, "output")
+
+        var out = "[package]\n"
+        if (!strings.is_empty(name) && name != "nil") { out = out + "name = " + quote(name) + "\n" }
+        if (!strings.is_empty(target) && target != "nil") { out = out + "target = " + quote(target) + "\n" }
+        if (!strings.is_empty(entry) && entry != "nil") { out = out + "entry = " + quote(entry) + "\n" }
+        if (!strings.is_empty(output) && output != "nil") { out = out + "output = " + quote(output) + "\n" }
+
+        var dep_keys = json.keys(new_deps)
+        if (!strings.is_empty(dep_keys)) {
+            out = out + "\n[dependencies]\n"
+            var key_list = strings.split(dep_keys, "\n")
+            var count = arrays.length(key_list)
+            for (var i = 0; i < count; i = i + 1) {
+                var key = strings.trim(arrays.get(key_list, i))
+                if (!strings.is_empty(key)) {
+                    var val = json.get(new_deps, key)
+                    out = out + key + " = " + quote(val) + "\n"
+                }
+            }
+        }
+
+        return out
+    } catch (_) {
+        return toml.stringify(toml_json)
+    }
+}
+
+fun quote(view string s) -> string {
+    return "\"" + strings.replace(s, "\"", "\\\"") + "\""
+}

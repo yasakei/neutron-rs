@@ -1,0 +1,177 @@
+use "modules/install"
+use "modules/registry"
+use "modules/lockfile"
+use "modules/toml_utils"
+
+fun main() -> int {
+    var args = sys.args()
+    var parts = strings.split(args, " ")
+    var command = ""
+    var extra = ""
+
+    if (arrays.length(parts) >= 2) {
+        command = arrays.get(parts, 1)
+    }
+    if (arrays.length(parts) >= 3) {
+        extra = arrays.get(parts, 2)
+    }
+
+    match (command) {
+        case "install" => {
+            if (strings.is_empty(extra)) {
+                var res = install(sys.cwd())
+                match (res) {
+                    case Ok(_) => return 0
+                    case Err(e) => {
+                        say("error: " + e)
+                        return 1
+                    }
+                }
+            } else {
+                add_dep(extra)
+                return 0
+            }
+        }
+        case "remove" => {
+            if (strings.is_empty(extra)) {
+                say("usage: ntsc pkg remove <name>")
+                return 1
+            }
+            var res = remove(sys.cwd(), extra)
+            match (res) {
+                case Ok(_) => return 0
+                case Err(e) => {
+                    say("error: " + e)
+                    return 1
+                }
+            }
+        }
+        case "update" => {
+            var res = update(sys.cwd())
+            match (res) {
+                case Ok(_) => return 0
+                case Err(e) => {
+                    say("error: " + e)
+                    return 1
+                }
+            }
+        }
+        case "list" => {
+            var res = list_installed(sys.cwd())
+            match (res) {
+                case Ok(_) => return 0
+                case Err(e) => {
+                    say("error: " + e)
+                    return 1
+                }
+            }
+        }
+        case "search" => {
+            search(extra)
+            return 0
+        }
+        default => {
+            usage()
+            return 0
+        }
+    }
+}
+
+fun usage() {
+    say("ntsc pkg - Neutron package manager")
+    say("")
+    say("commands:")
+    say("  install              install all dependencies")
+    say("  install <name>       add and install a package")
+    say("  remove <name>        remove a dependency")
+    say("  update               update all dependencies")
+    say("  list                 list installed packages")
+    say("  search <query>       search for packages")
+    say("  help                 show this help")
+}
+
+fun add_dep(string name) {
+    var toml_path = paths.join(sys.cwd(), "neutron.toml")
+    var toml_json = read_toml(toml_path)
+    match (toml_json) {
+        case Err(e) => {
+            say("error: " + e)
+            return
+        }
+        case Ok(json) => {
+            var deps = get_dependencies(json)
+            var version = find_best_version(name, "*")
+            match (version) {
+                case Ok(v) => {
+                    var next_major = version_major(v) + 1
+                    var spec = ">=" + v + ", <" + fmt.i64_to_str(next_major) + ".0.0"
+                    var updates = arrays.new()
+                    var keys = json.keys(deps)
+                    if (!strings.is_empty(keys)) {
+                        var key_list = strings.split(keys, "\n")
+                        var count = arrays.length(key_list)
+                        for (var i = 0; i < count; i = i + 1) {
+                            var k = strings.trim(arrays.get(key_list, i))
+                            if (!strings.is_empty(k)) {
+                                var v2 = json.get(deps, k)
+                                arrays.push(updates, k + "=" + v2)
+                            }
+                        }
+                    }
+                    arrays.push(updates, name + "=" + spec)
+                    var new_deps = rebuild_deps_from_updates(updates)
+                    var new_toml = rebuild_toml(json, new_deps)
+                    sys.write(toml_path, new_toml)
+                    say("added " + name + " " + spec)
+                    install(sys.cwd())
+                }
+                case Err(e) => {
+                    say("error: " + e)
+                }
+            }
+        }
+    }
+}
+
+fun search(string query) {
+    if (strings.is_empty(query)) {
+        say("usage: ntsc pkg search <query>")
+        return
+    }
+
+    var reg = fetch()
+    match (reg) {
+        case Err(e) => {
+            say("error: " + e)
+            return
+        }
+        case Ok(json) => {
+            var packages = json.get(json, "package")
+            if (strings.is_empty(packages) || packages == "nil") {
+                say("no packages found")
+                return
+            }
+            var keys = json.keys(packages)
+            if (strings.is_empty(keys)) {
+                say("no packages found")
+                return
+            }
+            var key_list = strings.split(keys, "\n")
+            var count = arrays.length(key_list)
+            var found = 0
+            for (var i = 0; i < count; i = i + 1) {
+                var pkg_name = strings.trim(arrays.get(key_list, i))
+                if (strings.is_empty(pkg_name)) { continue }
+                if (strings.contains(strings.lower(pkg_name), strings.lower(query))) {
+                    var pkg = json.get(packages, pkg_name)
+                    var desc = json.get(pkg, "description")
+                    say("  " + pkg_name + " - " + desc)
+                    found++
+                }
+            }
+            if (found == 0) {
+                say("no packages matching '" + query + "'")
+            }
+        }
+    }
+}

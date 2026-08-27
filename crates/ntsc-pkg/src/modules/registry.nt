@@ -1,0 +1,96 @@
+use "semver"
+
+static const var string REGISTRY_URL = "https://registry.neutron-lang.dev/packages.toml"
+
+fun fetch() -> result[string, string] {
+    try {
+        var response = http.get(REGISTRY_URL)
+        var status = http.status_code(response)
+        if (status != 200) {
+            return Err("registry: HTTP " + fmt.i64_to_str(status))
+        }
+        var parsed = toml.parse(response)
+        return Ok(parsed)
+    } catch (err) {
+        return Err("registry.fetch: " + err)
+    }
+}
+
+fun lookup(view string name) -> result[string, string] {
+    var reg = fetch()?
+    try {
+        var packages = json.get(reg, "package")
+        if (strings.is_empty(packages) || packages == "nil") {
+            return Err("registry: no packages in registry")
+        }
+        var pkg = json.get(packages, name)
+        if (strings.is_empty(pkg) || pkg == "nil") {
+            return Err("registry: package '" + copy(name) + "' not found")
+        }
+        return Ok(pkg)
+    } catch (err) {
+        return Err("registry.lookup: " + err)
+    }
+}
+
+fun get_versions(view string name) -> result[array[string], string] {
+    var pkg = lookup(name)?
+    try {
+        var versions = json.get(pkg, "versions")
+        if (strings.is_empty(versions) || versions == "nil") {
+            return Err("registry: no versions for '" + copy(name) + "'")
+        }
+        return Ok(parse_version_array(versions))
+    } catch (err) {
+        return Err("registry.get_versions: " + err)
+    }
+}
+
+fun get_repo(view string name) -> result[string, string] {
+    var pkg = lookup(name)?
+    try {
+        var repo = json.get(pkg, "repo")
+        if (strings.is_empty(repo) || repo == "nil") {
+            return Err("registry: no repo for '" + copy(name) + "'")
+        }
+        return Ok(repo)
+    } catch (err) {
+        return Err("registry.get_repo: " + err)
+    }
+}
+
+fun find_best_version(view string name, view string spec) -> result[string, string] {
+    var versions = get_versions(name)?
+    return best_match(versions, spec)
+}
+
+fun parse_version_array(view string json_array) -> array[string] {
+    var items = arrays.new()
+    try {
+        var inner = strings.trim(json_array)
+        if (strings.starts_with(inner, "[")) {
+            inner = strings.substring(inner, 1, strings.length(inner))
+        }
+        if (strings.ends_with(inner, "]")) {
+            inner = strings.substring(inner, 0, strings.length(inner) - 1)
+        }
+        if (strings.is_empty(strings.trim(inner))) {
+            return items
+        }
+        var parts = strings.split(inner, ",")
+        var count = arrays.length(parts)
+        for (var i = 0; i < count; i = i + 1) {
+            var part = strings.trim(arrays.get(parts, i))
+            if (strings.starts_with(part, "\"")) {
+                part = strings.substring(part, 1, strings.length(part))
+            }
+            if (strings.ends_with(part, "\"")) {
+                part = strings.substring(part, 0, strings.length(part) - 1)
+            }
+            if (!strings.is_empty(part)) {
+                arrays.push(items, part)
+            }
+        }
+    } catch (_) {}
+    return items
+}

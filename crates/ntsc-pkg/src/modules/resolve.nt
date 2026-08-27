@@ -1,0 +1,114 @@
+use "toml_utils"
+use "registry"
+use "semver"
+
+fun resolve(view string toml_json) -> result[array[string], string] {
+    var deps = get_dependencies(toml_json)
+    if (deps == "{}") {
+        return Ok([])
+    }
+
+    var resolved = arrays.new()
+    var visited = collections.set_new()
+    var resolving = collections.set_new()
+    var queue = arrays.new()
+
+    var keys = json.keys(deps)
+    if (strings.is_empty(keys)) {
+        return Ok(resolved)
+    }
+
+    var key_list = strings.split(keys, "\n")
+    var count = arrays.length(key_list)
+    for (var i = 0; i < count; i = i + 1) {
+        var name = strings.trim(arrays.get(key_list, i))
+        if (strings.is_empty(name)) { continue }
+        var spec = json.get(deps, name)
+        if (strings.is_empty(spec) || spec == "nil") {
+            spec = "*"
+        }
+        arrays.push(queue, name + "\t" + spec)
+    }
+
+    while (arrays.length(queue) > 0) {
+        var entry = arrays.get(queue, 0)
+        arrays.remove(queue, 0)
+        var parts = strings.split(entry, "\t")
+        var name = arrays.get(parts, 0)
+        var spec = "*"
+        if (arrays.length(parts) >= 2) {
+            spec = arrays.get(parts, 1)
+        }
+
+        if (collections.set_has(visited, name)) { continue }
+        if (collections.set_has(resolving, name)) {
+            return Err("resolve: circular dependency: " + copy(name))
+        }
+
+        collections.set_add(resolving, name)
+
+        var version = find_best_version(name, spec)?
+        var source_result = get_repo(name)?
+        var source = "git+" + source_result + "#v" + version
+
+        arrays.push(resolved, copy(name) + "@" + version + "|" + source)
+
+        collections.set_add(visited, name)
+        collections.set_remove(resolving, name)
+
+        var sub_deps = get_sub_deps(name, version)
+        var dep_count = arrays.length(sub_deps)
+        for (var j = 0; j < dep_count; j = j + 1) {
+            var sub_name = arrays.get(sub_deps, j)
+            if (!collections.set_has(visited, sub_name)) {
+                arrays.push(queue, sub_name + "\t*")
+            }
+        }
+    }
+
+    return Ok(resolved)
+}
+
+fun get_sub_deps(view string name, view string version) -> array[string] {
+    var repo = get_repo(name)
+    match (repo) {
+        case Err(_) => return []
+        case Ok(repo_url) => {
+            var temp_dir = os.temp_dir()
+            var clone_path = paths.join(temp_dir, "ntsc-pkg-" + copy(name))
+
+            try {
+                process.exec("git clone --quiet --branch v" + copy(version) + " --depth 1 " + repo_url + " " + clone_path)
+            } catch (_) {
+                return []
+            }
+
+            var pkg_toml_path = paths.join(clone_path, "neutron.toml")
+            if (!sys.exists(pkg_toml_path)) {
+                return []
+            }
+
+            var pkg_toml = read_toml(pkg_toml_path)
+            match (pkg_toml) {
+                case Ok(toml_json) => {
+                    var sub_deps = get_dependencies(toml_json)
+                    var keys = json.keys(sub_deps)
+                    if (strings.is_empty(keys)) {
+                        return []
+                    }
+                    var items = arrays.new()
+                    var key_list = strings.split(keys, "\n")
+                    var count = arrays.length(key_list)
+                    for (var i = 0; i < count; i = i + 1) {
+                        var key = strings.trim(arrays.get(key_list, i))
+                        if (!strings.is_empty(key)) {
+                            arrays.push(items, key)
+                        }
+                    }
+                    return items
+                }
+                case Err(_) => return []
+            }
+        }
+    }
+}
