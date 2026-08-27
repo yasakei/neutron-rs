@@ -202,11 +202,11 @@ fn walk_recursive(base: &Path, dir: &Path, results: &mut Vec<String>) {
 /// `sys.symlink(target, link)` — create a symbolic link at `link` pointing
 /// to `target`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ntsc_sys_symlink(target: i64, link: i64) -> i8 {
+pub extern "C" fn ntsc_sys_symlink(_target: i64, _link: i64) -> i8 {
     #[cfg(unix)]
     {
-        let target = registry::get_string(target).unwrap_or_default();
-        let link = registry::get_string(link).unwrap_or_default();
+        let target = registry::get_string(_target).unwrap_or_default();
+        let link = registry::get_string(_link).unwrap_or_default();
         match std::os::unix::fs::symlink(&target, &link) {
             Ok(_) => 1,
             Err(e) => {
@@ -218,11 +218,11 @@ pub extern "C" fn ntsc_sys_symlink(target: i64, link: i64) -> i8 {
             }
         }
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
         let _ = fail(
             "symlink",
-            "symlink creation is not supported on Windows (requires elevated privileges)",
+            "symlink creation is not supported on this platform",
         );
         0
     }
