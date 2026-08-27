@@ -16,8 +16,8 @@ pub struct ResolveError {
     pub suggestion: Option<String>,
 }
 
-/// Names of the builtin stdlib modules that can be referenced without a
-/// `use`.
+/// Names of the builtin stdlib modules available via explicit `use`.
+#[allow(dead_code)]
 pub const BUILTIN_MODULES: &[&str] = &[
     "archive",
     "arrays",
@@ -81,10 +81,10 @@ impl Resolver {
         // The wildcard pattern `_` is always in scope in match cases.
         global.insert("_".into());
 
-        // Builtin stdlib modules (see ntsc-runtime/src/modules).
-        for module in BUILTIN_MODULES {
-            global.insert(module.to_string());
-        }
+        // `async` is a reserved keyword and cannot be imported with `use`, so
+        // it stays always in scope.
+        global.insert("async".into());
+
         Self {
             scopes: vec![global],
             errors: Vec::new(),
@@ -315,11 +315,39 @@ impl Resolver {
             Stmt::Quiet { body, .. } => self.resolve_statement(body),
             Stmt::Break { .. }
             | Stmt::Continue { .. }
-            | Stmt::Use { .. }
             | Stmt::Enum { .. }
             | Stmt::TypeAlias { .. }
             | Stmt::Trait { .. }
             | Stmt::Impl { .. } => {}
+            Stmt::Use {
+                library,
+                is_file_path: false,
+                alias,
+                ..
+            } => {
+                // Stdlib imports are idempotent: crossing file boundaries, the
+                // same module may be re-imported without conflicting. `use
+                // strings as s` binds the alias `s` instead of the module name.
+                let name = alias
+                    .as_ref()
+                    .map_or_else(|| library.lexeme(), |a| a.lexeme());
+                if !self.scopes.iter().any(|scope| scope.contains(name)) {
+                    self.define(name, library.span);
+                }
+            }
+            // `use "file.nt" as arm` binds the namespace name `arm`; the
+            // module's symbols are referenced through `arm.name`.
+            Stmt::Use {
+                is_file_path: true,
+                alias: Some(alias),
+                ..
+            } => {
+                let name = alias.lexeme();
+                if !self.scopes.iter().any(|scope| scope.contains(name)) {
+                    self.define(name, alias.span);
+                }
+            }
+            Stmt::Use { .. } => {}
         }
     }
 

@@ -1,7 +1,15 @@
-// builtins — standard library modules available without `use`.
+// builtins — standard library modules, imported explicitly with `use`.
 //
 // The stdlib modules (`strings`, `math`, `arrays`, `encoding`, `hash`,
-// `os`, ...) are predeclared in every program.
+// `os`, ...) must be imported before use.
+
+use strings
+use math
+use arrays
+use sort
+use encoding
+use hash
+use os
 
 fun main() {
     // strings

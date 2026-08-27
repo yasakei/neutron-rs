@@ -67,6 +67,7 @@ fn main() {
         Command::Clean => cmd_clean(),
         Command::Watch => cmd_watch(opts.release, opts.json),
         Command::Graph => cmd_graph().map(|_| ()),
+        Command::Pkg(args) => cmd_pkg(&args),
     };
 
     if let Err(e) = result {
@@ -155,6 +156,7 @@ enum Command {
     Clean,
     Watch,
     Graph,
+    Pkg(Vec<String>),
 }
 
 /// Parse the command line, accepting flags (`--release`, `--debug`,
@@ -164,8 +166,13 @@ fn parse_args() -> Result<(Command, CliOptions), String> {
     let mut opts = CliOptions::default();
     let mut command = None;
     let mut init_name = None;
+    let mut pkg_args = Vec::new();
 
     for arg in args {
+        if command.as_deref() == Some("pkg") {
+            pkg_args.push(arg);
+            continue;
+        }
         match arg.as_str() {
             "--release" => opts.release = true,
             "--debug" => opts.release = false,
@@ -173,7 +180,7 @@ fn parse_args() -> Result<(Command, CliOptions), String> {
             "--help" | "-h" => return Ok((Command::Help, opts)),
             "--version" | "-V" => return Ok((Command::Version, opts)),
             "version" => return Ok((Command::Version, opts)),
-            "init" | "build" | "test" | "run" | "clean" | "watch" | "graph" => {
+            "init" | "build" | "test" | "run" | "clean" | "watch" | "graph" | "pkg" => {
                 if command.is_some() {
                     return Err(format!("unexpected argument `{arg}`"));
                 }
@@ -198,6 +205,7 @@ fn parse_args() -> Result<(Command, CliOptions), String> {
         "clean" => Command::Clean,
         "watch" => Command::Watch,
         "graph" => Command::Graph,
+        "pkg" => Command::Pkg(pkg_args),
         _ => unreachable!("validated above"),
     };
     Ok((command, opts))
@@ -226,6 +234,7 @@ fn print_usage() {
     eprintln!("{}", row("run", "Build and execute"));
     eprintln!("{}", row("clean", "Remove the build/ directory"));
     eprintln!("{}", row("watch", "Rebuild when sources change"));
+    eprintln!("{}", row("pkg [args]", "Run the package manager"));
     eprintln!(
         "{}",
         row("graph", "Print the module dependency graph as DOT")
@@ -334,10 +343,8 @@ fn cmd_init(project_name: Option<&str>) -> Result<(), CliError> {
 
     let neutron_toml = format!(
         "[package]\n\
-         target = \"{}\"\n\
          entry = \"src/main.nt\"\n\
          output = \"{}\"\n",
-        ntsc_codegen::host_triple(),
         ntsc_codegen::with_executable_extension(&name),
     );
     fs::write(project_dir.join("neutron.toml"), &neutron_toml)?;
@@ -665,6 +672,30 @@ fn cmd_graph() -> Result<(), CliError> {
     }
     println!("}}");
     Ok(())
+}
+
+/// Run the package-manager executable installed beside `ntsc`.
+fn cmd_pkg(args: &[String]) -> Result<(), CliError> {
+    let current_exe = env::current_exe()?;
+    let exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| CliError::Plain("cannot locate the ntsc executable directory".into()))?;
+    let pkg_name = ntsc_codegen::with_executable_extension("ntsc-pkg");
+    let pkg = exe_dir.join(&pkg_name);
+
+    if !pkg.is_file() {
+        return Err(CliError::Plain(format!(
+            "cannot find the package manager beside ntsc: {}",
+            pkg.display()
+        )));
+    }
+
+    let status = std::process::Command::new(&pkg).args(args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 /// Snapshot the modification times of every file in the module closure

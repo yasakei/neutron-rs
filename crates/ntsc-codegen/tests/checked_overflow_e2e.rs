@@ -244,7 +244,8 @@ fn an_overflow_throw_reclaims_live_values() {
     // on the throw edge like any other exception.
     assert_same_in_both_builds(
         "cleanup",
-        r#"fun main() {
+        r#"use arrays
+fun main() {
     var max = 9223372036854775807
     try {
         var kept = "one" + "two"

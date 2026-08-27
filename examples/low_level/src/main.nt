@@ -11,6 +11,10 @@
 //     pointers reached only inside `unsafe`
 //   - slices: bounds-checked windows over an array
 
+use arrays
+use slices
+use memory
+
 class Register {
     var int value
 

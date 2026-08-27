@@ -713,7 +713,14 @@ pub(crate) fn emit_call<'ctx>(
         if let Expr::Variable { name } = object.as_ref() {
             let module_name = name.lexeme();
 
-            if module_name == "arrays" {
+            // A stdlib alias (`use strings as s`) dispatches against the real
+            // module name: native functions are `ntsc_strings_*` and the
+            // routed opcodes key off the module name.
+            let dispatch_module = super::STDLIB_ALIASES
+                .with(|m| m.borrow().get(module_name).cloned())
+                .unwrap_or_else(|| module_name.to_string());
+
+            if dispatch_module == "arrays" {
                 let mut arg_values = emit_call_arguments(fn_ctx, &arguments)?;
 
                 if let Some(first) = arg_values.first().cloned()
@@ -728,9 +735,9 @@ pub(crate) fn emit_call<'ctx>(
                 return Ok(result);
             }
 
-            if matches!(module_name, "sort" | "testing")
-                || (module_name == "random" && matches!(prop_name, "shuffle" | "weighted"))
-                || (module_name == "process" && prop_name == "spawn_thread")
+            if matches!(dispatch_module.as_str(), "sort" | "testing")
+                || (dispatch_module == "random" && matches!(prop_name, "shuffle" | "weighted"))
+                || (dispatch_module == "process" && prop_name == "spawn_thread")
             {
                 let mut arg_values = emit_call_arguments(fn_ctx, &arguments)?;
                 if let Some(first) = arg_values.first().cloned()
@@ -738,13 +745,65 @@ pub(crate) fn emit_call<'ctx>(
                 {
                     arg_values[0] = deref_shared(fn_ctx, first)?;
                 }
-                let result = emit_routed_module_op(fn_ctx, module_name, prop_name, &arg_values)?;
+                let result =
+                    emit_routed_module_op(fn_ctx, &dispatch_module, prop_name, &arg_values)?;
                 emit_drop_borrowed_fresh_args(fn_ctx, &arguments, &arg_values, &[])?;
                 fn_ctx.emit_pending_exception_check()?;
                 return Ok(result);
             }
 
-            let abi_fn_name = format!("ntsc_{module_name}_{prop_name}");
+            // A file-import namespace (`use "file.nt" as arm` -> `arm.func()`)
+            // dispatches to the module's own function, whose global name is
+            // the namespaced `arm::func`. A namespaced class is constructed
+            // through the alias as well (`arm.Counter(...)`).
+            let namespaced_fn = format!("{module_name}::{prop_name}");
+            if let Some(fn_val) = fn_ctx.module.get_function(&namespaced_fn) {
+                let arg_values = emit_call_arguments(fn_ctx, &arguments)?;
+                let param_tys = fn_val.get_type().get_param_types();
+                let declared_param_tys = function_declared_param_types(&namespaced_fn);
+                let prepared =
+                    prepare_call_args(fn_ctx, &arguments, &arg_values, &declared_param_tys)?;
+                let mut llvm_args: Vec<BasicMetadataValueEnum<'ctx>> = Vec::new();
+                for (arg_val, param_ty) in prepared.iter().zip(param_tys.iter()) {
+                    llvm_args.push(coerce_value_to_llvm(fn_ctx, arg_val.clone(), param_ty)?);
+                }
+                let result = fn_ctx
+                    .builder
+                    .build_call(fn_val, &llvm_args, "alias_call")?;
+                let result_val = call_result_to_value(fn_ctx, &result);
+                emit_drop_borrowed_fresh_args(
+                    fn_ctx,
+                    &arguments,
+                    &arg_values,
+                    &declared_param_tys,
+                )?;
+                let ret_ty = function_declared_ret_ty(&namespaced_fn).unwrap_or_else(|| {
+                    fn_val
+                        .get_type()
+                        .get_return_type()
+                        .map(llvm_ret_ty_to_ty)
+                        .unwrap_or(Ty::Void)
+                });
+                fn_ctx.emit_pending_exception_check()?;
+                return Ok(TypedValue::new(result_val, ret_ty));
+            }
+            if let Some(struct_ty) = fn_ctx.module.get_struct_type(&namespaced_fn) {
+                let arg_values = emit_call_arguments(fn_ctx, &arguments)?;
+                let result = emit_class_constructor(
+                    fn_ctx,
+                    struct_ty,
+                    &namespaced_fn,
+                    &arguments,
+                    &arg_values,
+                    None,
+                )?;
+                fn_ctx.emit_pending_exception_check()?;
+                return Ok(result);
+            }
+
+            // A stdlib alias (`use strings as s`) was already resolved to the
+            // real module name above; emit the native ABI call against it.
+            let abi_fn_name = format!("ntsc_{dispatch_module}_{prop_name}");
             if let Some(fn_val) = fn_ctx.module.get_function(&abi_fn_name) {
                 let arg_values = emit_call_arguments(fn_ctx, &arguments)?;
 

@@ -11,6 +11,10 @@
 //   - A spawned thread sends frames through a bounded channel; every handle is
 //     closed and the worker is joined before the function returns.
 
+use arrays
+use collections
+use process
+
 fun total_mass(view array[float] xs) -> float {
     var t = 0.0
     for (var m in xs) {

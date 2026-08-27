@@ -40,7 +40,8 @@ fn compile_run(name: &str, source: &str) -> (bool, String, String) {
 
 #[test]
 fn pointer_capabilities_are_bounds_checked_and_reclaimed() {
-    let source = r#"fun main() {
+    let source = r#"use memory
+fun main() {
     var pointer base = memory.alloc(16)
     memory.store64(base, 72623859790382856)
     var pointer next = memory.offset(base, 8)
@@ -58,7 +59,8 @@ fn pointer_capabilities_are_bounds_checked_and_reclaimed() {
 
 #[test]
 fn out_of_bounds_pointer_access_throws_without_touching_memory() {
-    let source = r#"fun main() {
+    let source = r#"use memory
+fun main() {
     var pointer base = memory.alloc(4)
     try {
         var pointer outside = memory.offset(base, 5)

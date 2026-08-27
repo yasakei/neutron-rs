@@ -126,6 +126,10 @@ pub struct ModuleGraph {
 
     /// Edges `(importer, importee)`, all canonical.
     pub edges: Vec<(PathBuf, PathBuf)>,
+
+    /// Namespace alias of each file that is imported with `use "F" as name`.
+    /// Files imported bare (or the entry) are absent.
+    pub aliases: HashMap<PathBuf, String>,
 }
 
 /// Information about one compiled module.
@@ -278,6 +282,7 @@ pub fn load_program(entry: &Path) -> Result<ModuleLoadResult, ModuleLoadError> {
 pub fn discover(entry: &Path) -> Result<ModuleGraph, ModuleLoadError> {
     let mut files = Vec::new();
     let mut edges = Vec::new();
+    let mut aliases = HashMap::new();
     let mut seen = HashSet::new();
     let mut stack = Vec::new();
 
@@ -291,6 +296,7 @@ pub fn discover(entry: &Path) -> Result<ModuleGraph, ModuleLoadError> {
         &root,
         &mut files,
         &mut edges,
+        &mut aliases,
         &mut seen,
         &mut stack,
     )?;
@@ -299,6 +305,7 @@ pub fn discover(entry: &Path) -> Result<ModuleGraph, ModuleLoadError> {
         entry: entry_canon,
         files,
         edges,
+        aliases,
     })
 }
 
@@ -307,6 +314,7 @@ fn visit(
     root: &Path,
     files: &mut Vec<PathBuf>,
     edges: &mut Vec<(PathBuf, PathBuf)>,
+    aliases: &mut HashMap<PathBuf, String>,
     seen: &mut HashSet<PathBuf>,
     stack: &mut Vec<PathBuf>,
 ) -> Result<(), ModuleLoadError> {
@@ -315,8 +323,11 @@ fn visit(
     }
     stack.push(path.to_path_buf());
 
-    for import in file_imports(path, root)? {
+    for (import, alias) in file_imports(path, root)? {
         edges.push((path.to_path_buf(), import.clone()));
+        if let Some(alias) = alias {
+            aliases.insert(import.clone(), alias);
+        }
         if stack.contains(&import) {
             let mut chain: Vec<String> = stack.iter().map(|p| p.display().to_string()).collect();
             chain.push(import.display().to_string());
@@ -325,7 +336,7 @@ fn visit(
                 chain,
             });
         }
-        visit(&import, root, files, edges, seen, stack)?;
+        visit(&import, root, files, edges, aliases, seen, stack)?;
     }
 
     stack.pop();
@@ -341,12 +352,15 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ModuleLoadError> {
 }
 
 /// Lex a file and return the canonical paths of every `use "<path>"`
-/// import.
+/// import, along with the namespace alias if the import names one with
+/// `... as X`.
 ///
 /// A string literal after `use` (or after `from` in a selective import)
-/// names a file; everything else on the statement is irrelevant to
-/// discovery.
-fn file_imports(path: &Path, root: &Path) -> Result<Vec<PathBuf>, ModuleLoadError> {
+/// names a file; an `as` immediately after it names the import alias.
+fn file_imports(
+    path: &Path,
+    root: &Path,
+) -> Result<Vec<(PathBuf, Option<String>)>, ModuleLoadError> {
     let source = fs::read_to_string(path).map_err(|e| ModuleLoadError::Io {
         path: path.to_path_buf(),
         source: e,
@@ -363,20 +377,25 @@ fn file_imports(path: &Path, root: &Path) -> Result<Vec<PathBuf>, ModuleLoadErro
         // Find the first string literal on this statement; there is
         // exactly one, and it is the file path. Stop at the terminator so
         // a string on a later statement is never misread as this import.
-        let import = loop {
+        let mut import: Option<String> = None;
+        let mut alias: Option<String> = None;
+        loop {
             match tokens.next() {
                 Some(t) if matches!(t.kind, TokenKind::StringLiteral(_)) => {
-                    break Some(t.lexeme().to_string());
+                    import = Some(t.lexeme().to_string());
                 }
-                Some(t) if t.kind == TokenKind::Semicolon || t.kind == TokenKind::Newline => {
-                    break None;
+                Some(t) if t.kind == TokenKind::As => {
+                    if let Some(a) = tokens.next() {
+                        alias = Some(a.lexeme().to_string());
+                    }
                 }
+                Some(t) if t.kind == TokenKind::Semicolon || t.kind == TokenKind::Newline => break,
                 Some(_) => {}
-                None => break None,
+                None => break,
             }
-        };
+        }
         if let Some(import) = import {
-            imports.push(resolve_import(root, parent, &import)?);
+            imports.push((resolve_import(root, parent, &import)?, alias));
         }
     }
     Ok(imports)
@@ -454,14 +473,34 @@ fn merge(
             ))
         })?;
         module.program.shift_spans(base);
+
+        // A file imported with `use "F" as arm` has its own symbols namespaced
+        // under `arm::`; bare imports keep their global names.
+        if let Some(alias) = graph.aliases.get(path) {
+            let own = crate::aliases::top_level_names(&module.program.statements);
+            module.program.statements = crate::aliases::namespaced(
+                std::mem::take(&mut module.program.statements),
+                alias,
+                &own,
+            );
+        }
+
         for stmt in &module.program.statements {
-            if !matches!(
-                stmt,
+            // Bare file imports are dropped (their content is already part of
+            // the flat program); aliased imports are preserved so the resolver
+            // learns the namespace name.
+            let keep = match stmt {
                 Stmt::Use {
                     is_file_path: true,
+                    alias: Some(_),
                     ..
-                }
-            ) {
+                } => true,
+                Stmt::Use {
+                    is_file_path: true, ..
+                } => false,
+                _ => true,
+            };
+            if keep {
                 statements.push(stmt.clone());
                 origins.push(path.clone());
                 bases.push(base);

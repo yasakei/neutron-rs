@@ -58,7 +58,8 @@ fn compile_and_run(source: &str, test_id: &str) -> String {
 
 #[test]
 fn class_array_literal_and_field_reads() {
-    let source = r#"class Astro {
+    let source = r#"use arrays
+class Astro {
     var string name
 
     fun init(string n) {
@@ -83,7 +84,8 @@ fun main() {
 
 #[test]
 fn class_array_field_push_and_iterate() {
-    let source = r#"class Astro {
+    let source = r#"use arrays
+class Astro {
     var string name
     var float mass
 

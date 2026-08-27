@@ -10,6 +10,9 @@
 //   - Recursion and string byte iteration are stack-safe for the sizes used
 //     here and are deterministic.
 
+use math
+use strings
+
 // Standard gravitational parameter for Earth (km^3/s^2) and its mean radius.
 fun orbital_velocity(float gm, float radius_km, float altitude_km) -> float {
     return math.sqrt(gm / (radius_km + altitude_km)) * 1000.0

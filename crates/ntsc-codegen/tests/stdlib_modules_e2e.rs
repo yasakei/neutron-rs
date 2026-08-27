@@ -37,7 +37,17 @@ fn stdlib_modules_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun main() {
+    let source = r#"use arrays
+use encoding
+use hash
+use io
+use net
+use os
+use random
+use sort
+use strings
+use testing
+fun main() {
     // ── os ────────────────────────────────────────────────────────────────
     os.setenv("NTSC_E2E_VAR", "hello");
     say("os0: " + os.getenv("NTSC_E2E_VAR"));
@@ -332,7 +342,9 @@ fn io_input_reads_stdin_without_leaking() {
         .expect("failed to build ntsc-runtime");
     assert!(status.success(), "failed to build ntsc-runtime");
 
-    let source = r#"fun main() {
+    let source = r#"use io
+use strings
+fun main() {
     var input = io.stdin();
     var output = io.stdout();
     var errors = io.stderr();

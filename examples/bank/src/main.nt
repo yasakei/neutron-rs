@@ -5,6 +5,8 @@
 //   ntsc build
 //   ./build/debug/bank
 
+use arrays
+
 class Account {
     var string owner
     var float balance

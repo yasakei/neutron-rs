@@ -32,7 +32,8 @@ fn checked_arithmetic_semantics_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     // Division by zero throws a catchable exception.
     try {
         var q = 10 / 0;

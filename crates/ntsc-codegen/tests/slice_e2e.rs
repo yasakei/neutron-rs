@@ -55,7 +55,8 @@ fn compile_error(name: &str, source: &str) -> String {
 
 #[test]
 fn a_slice_reads_writes_and_subslices_within_bounds() {
-    let source = r#"fun main() {
+    let source = r#"use slices
+fun main() {
     var array[int] xs = [10, 20, 30, 40, 50]
     var slice[int] window = slices.of(xs, 1, 4)
 
@@ -82,7 +83,8 @@ fn a_slice_reads_writes_and_subslices_within_bounds() {
 
 #[test]
 fn slice_bulk_operations_are_length_checked() {
-    let source = r#"fun main() {
+    let source = r#"use slices
+fun main() {
     var array[int] xs = [1, 2, 3, 4]
     var array[int] ys = [9, 9, 9, 9]
     var slice[int] left = slices.of(xs, 0, 2)
@@ -111,7 +113,8 @@ fn slice_bulk_operations_are_length_checked() {
 
 #[test]
 fn an_out_of_range_window_throws() {
-    let source = r#"fun main() {
+    let source = r#"use slices
+fun main() {
     var array[int] xs = [1, 2, 3]
     try {
         var slice[int] bad = slices.of(xs, 1, 9)
@@ -132,7 +135,8 @@ fn an_out_of_range_window_throws() {
 
 #[test]
 fn indexing_past_the_window_throws_even_when_the_array_is_longer() {
-    let source = r#"fun main() {
+    let source = r#"use slices
+fun main() {
     var array[int] xs = [1, 2, 3, 4, 5]
     var slice[int] window = slices.of(xs, 0, 2)
     try {
@@ -153,7 +157,8 @@ fn indexing_past_the_window_throws_even_when_the_array_is_longer() {
 
 #[test]
 fn a_subslice_cannot_widen_its_parent() {
-    let source = r#"fun main() {
+    let source = r#"use slices
+fun main() {
     var array[int] xs = [1, 2, 3, 4, 5]
     var slice[int] window = slices.of(xs, 1, 3)
     try {
@@ -175,7 +180,8 @@ fn a_subslice_cannot_widen_its_parent() {
 
 #[test]
 fn copying_a_slice_produces_an_owned_array() {
-    let source = r#"fun main() {
+    let source = r#"use slices
+fun main() {
     var array[int] xs = [1, 2, 3]
     var slice[int] window = slices.of(xs, 0, 2)
     var array[int] owned = copy(window)
@@ -194,7 +200,7 @@ fn copying_a_slice_produces_an_owned_array() {
 fn a_slice_cannot_cross_a_thread_boundary() {
     let err = compile_error(
         "slice_thread",
-        "fun main() {\n    var array[int] xs = [1, 2]\n    var slice[int] w = slices.of(xs, 0, 2)\n    var t = process.spawn_thread(fun(int x) { say(x) }, w)\n}\n",
+        "use slices\nuse process\nfun main() {\n    var array[int] xs = [1, 2]\n    var slice[int] w = slices.of(xs, 0, 2)\n    var t = process.spawn_thread(fun(int x) { say(x) }, w)\n}\n",
     );
     assert!(
         err.contains("spawn_thread") || err.contains("cannot cross"),
@@ -206,7 +212,7 @@ fn a_slice_cannot_cross_a_thread_boundary() {
 fn an_unknown_slices_function_is_rejected() {
     let err = compile_error(
         "slice_unknown",
-        "fun main() {\n    var array[int] xs = [1]\n    var n = slices.nope(xs)\n}\n",
+        "use slices\nfun main() {\n    var array[int] xs = [1]\n    var n = slices.nope(xs)\n}\n",
     );
     assert!(
         err.contains("unknown function `slices.nope`"),

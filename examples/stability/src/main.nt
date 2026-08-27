@@ -20,6 +20,9 @@
 // none.
 
 use testing
+use arrays
+use fmt
+use time
 
 use "flight.nt"
 use "systems.nt"

@@ -28,7 +28,8 @@ fn typed_float_and_bool_array_elements_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     var fs = [1.5, 2.5, 3.5];
     say("f0: " + fs[0]);
     say("f1: " + arrays.at(fs, 1));

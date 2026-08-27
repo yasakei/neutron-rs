@@ -98,7 +98,8 @@ fn assert_runs(name: &str, source: &str, expected: &str) {
 fn a_block_declaration_does_not_outlive_its_block() {
     assert_runs(
         "block_scope",
-        r#"fun main() {
+        r#"use arrays
+fun main() {
     var n = 1
     {
         var n = 99
@@ -156,7 +157,9 @@ fn a_view_does_not_suppress_the_scope_exit_drop_of_owned_fields() {
     // string field.
     assert_runs(
         "view_field_drops",
-        r#"class Bag {
+        r#"use arrays
+use strings
+class Bag {
     var xs = ["a", "b", "c"]
     var name = "bag"
 }
@@ -222,7 +225,8 @@ fn a_named_function_can_be_a_spawn_thread_worker() {
     // like the lambda form.
     assert_runs(
         "named_worker",
-        r#"fun worker(int n) {
+        r#"use process
+fun worker(int n) {
     say("worker " + n)
 }
 
@@ -243,7 +247,8 @@ fn declared_field_initializers_run_at_construction() {
     // the field owns what it holds either way.
     assert_runs(
         "field_inits",
-        r#"class Base {
+        r#"use arrays
+class Base {
     var int level = 1
     var tags = ["x"]
 }
@@ -285,7 +290,8 @@ fn an_array_field_initializer_keeps_its_element_type() {
     // yields that type instead of an opaque `any` that prints as nothing.
     assert_runs(
         "field_init_elem_types",
-        r#"class Bag {
+        r#"use arrays
+class Bag {
     var xs = [1, 2, 3]
     var names = ["a", "b"]
     var fs = [1.5, 2.5]

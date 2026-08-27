@@ -85,6 +85,7 @@ fun main() -> int {
 #[test]
 fn slices_function_typo_gets_did_you_mean_suggestion() {
     let source = r#"
+use slices
 fun main() -> int {
     var array[int] data = [1, 2, 3]
     say("" + slices.lenght(data))

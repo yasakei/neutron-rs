@@ -64,7 +64,8 @@ fn compile_and_run(source: &str, name: &str) -> String {
 
 #[test]
 fn result_e2e() {
-    let source = r#"fun double_it(int x) -> int {
+    let source = r#"use fmt
+fun double_it(int x) -> int {
     return x * 2
 }
 
@@ -178,7 +179,8 @@ fn result_match_e2e() {
     // Destructuring match over results: variant binders, `_` payload skip,
     // guards reading the bound payload, default fallback, and a fresh call
     // scrutinee (which must not leak its cell).
-    let source = r#"fun parse(int n) -> result[int, string] {
+    let source = r#"use fmt
+fun parse(int n) -> result[int, string] {
     if (n < 0) { return Err("negative") }
     return Ok(n * 2)
 }

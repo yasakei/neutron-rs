@@ -84,7 +84,8 @@ fn workspace_root() -> std::path::PathBuf {
 /// shared variable never moves the value, and both handles alias it.
 #[test]
 fn shared_values_alias_and_are_never_moved() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     shared array[int] a = [1, 2, 3];
     shared array[int] b = a;
     arrays.push(b, 4);
@@ -109,7 +110,8 @@ fn shared_values_alias_and_are_never_moved() {
 /// the wrapped array and functional ops read it without consuming it.
 #[test]
 fn shared_array_works_with_arrays_module() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     shared array[int] s = [5, 1, 3];
     arrays.push(s, 9);
     say("len: " + arrays.length(s));
@@ -139,7 +141,8 @@ fn shared_array_works_with_arrays_module() {
 /// through the shared handle and does not own anything.
 #[test]
 fn view_of_shared_borrows_the_pointee() {
-    let source = r#"fun read(view array[int] v) {
+    let source = r#"use arrays
+fun read(view array[int] v) {
     say("v0: " + v[0])
 }
 fun main() {
@@ -165,7 +168,8 @@ fun main() {
 /// copy is independent of the shared handle.
 #[test]
 fn copy_of_shared_deep_copies_to_owned() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     shared array[int] s = [1, 2];
     var c = copy(s);
     arrays.push(c, 99);
@@ -190,7 +194,8 @@ fn copy_of_shared_deep_copies_to_owned() {
 /// usable after the call, and a shared return is safe to drop.
 #[test]
 fn shared_parameters_and_returns_retain() {
-    let source = r#"fun bump(shared array[int] a) {
+    let source = r#"use arrays
+fun bump(shared array[int] a) {
     arrays.push(a, 7)
 }
 fun make() -> shared array[int] {
@@ -221,7 +226,8 @@ fun main() {
 /// copy of the literal.
 #[test]
 fn owned_values_are_adopted_into_shared() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     var arr = [1, 2];
     shared array[int] s = arr;
     arrays.push(s, 3);
@@ -260,7 +266,8 @@ fn shared_of_scalar_is_rejected() {
 /// frees the box exactly once.
 #[test]
 fn shared_arrays_retain_on_insert_and_release_on_drop() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     shared string s1 = "a";
     shared string s2 = "bb";
     var a = [s1, s2];
@@ -291,7 +298,8 @@ fn shared_arrays_retain_on_insert_and_release_on_drop() {
 /// corrupt the cells.
 #[test]
 fn option_arrays_copy_cells_in_on_insert() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     var o1 = 5;
     var o2 = 7;
     var oa = [o1, o2];

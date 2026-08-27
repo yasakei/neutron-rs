@@ -82,8 +82,11 @@ impl Linter {
     }
 
     /// Register a local variable declaration, honoring the current
-    /// suppression level.
+    /// suppression level. `_` is conventionally ignored and never warned about.
     fn declare(&mut self, name: &str, span: Span) {
+        if name == "_" {
+            return;
+        }
         let scope = self
             .scopes
             .last_mut()

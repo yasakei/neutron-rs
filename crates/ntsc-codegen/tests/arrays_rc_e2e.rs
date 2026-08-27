@@ -32,7 +32,8 @@ fn arrays_rc_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun fill(view array[int] arr, int n) -> int {
+    let source = r#"use arrays
+fun fill(view array[int] arr, int n) -> int {
     for (var i = 0; i < n; i = i + 1) {
         arrays.push(arr, i * 10);
     }
@@ -131,7 +132,8 @@ fn arrays_rc_full_ops_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     var a = arrays.new();
     say("a0: " + arrays.length(a));
     arrays.push(a, 10);
@@ -253,7 +255,8 @@ fn arrays_rc_untyped_and_param_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun double_all(array[int] xs) -> array[int] {
+    let source = r#"use arrays
+fun double_all(array[int] xs) -> array[int] {
     // The declared `-> array[int]` return type is honored at the call site, so
     // the output array must actually store raw int elements. An untyped `[]`
     // array stores string pointers and would not match the declared type.
@@ -352,7 +355,9 @@ fn string_array_ownership_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun main() {
+    let source = r#"use arrays
+use strings
+fun main() {
     // Push a runtime-built string, then overwrite the source: the array must
     // hold its own deep copy (the old source string is freed by reassignment).
     var a = [];

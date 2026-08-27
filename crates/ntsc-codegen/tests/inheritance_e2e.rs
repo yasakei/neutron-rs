@@ -34,7 +34,8 @@ fn inheritance_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"class Creature {
+    let source = r#"use arrays
+class Creature {
     var level = 1;
     fun base() -> int { return this.level; }
 }

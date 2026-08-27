@@ -149,7 +149,8 @@ fn break_and_continue_reclaim_locals() {
 fn shadowed_slot_is_reclaimed() {
     assert_clean(
         "shadowed_slot",
-        r#"fun main() -> int {
+        r#"use arrays
+fun main() -> int {
     var xs = [1]
     say("outer " + arrays.length(xs))
     {
@@ -227,7 +228,8 @@ fun main() -> int {
 fn retry_reclaims_every_attempt() {
     assert_clean(
         "retry_attempts",
-        r#"fun main() -> int {
+        r#"use arrays
+fun main() -> int {
     var attempts = 0
     retry 3 {
         var xs = [1, 2]
@@ -249,7 +251,8 @@ fn retry_reclaims_every_attempt() {
 fn destructuring_reclaims_the_temporary() {
     assert_clean(
         "destructuring",
-        r#"fun main() -> int {
+        r#"use arrays
+fun main() -> int {
     var [a, b] = [[1, 2], [3]]
     say("" + arrays.length(a) + arrays.length(b))
     var {name, age} = {name: "ada", age: 3}
@@ -267,7 +270,8 @@ fn destructuring_reclaims_the_temporary() {
 fn constructor_arguments_are_constructed_once() {
     assert_clean(
         "ctor_arguments",
-        r#"class Bag {
+        r#"use arrays
+class Bag {
     var array[int] items
     var string tag
 
@@ -293,7 +297,8 @@ fun main() -> int {
 fn nested_and_loop_instances_are_reclaimed() {
     assert_clean(
         "nested_instances",
-        r#"class Counter {
+        r#"use arrays
+class Counter {
     var int n
     var array[int] seen
 
@@ -386,7 +391,8 @@ fun main() -> int {
 fn object_literals_reclaim_their_intermediates() {
     assert_clean(
         "object_literals",
-        r#"fun main() -> int {
+        r#"use json
+fun main() -> int {
     var o = {name: "ada", age: 3}
     say(json.get(o, "age"))
     for (var i = 0; i < 3; i = i + 1) {
@@ -416,7 +422,8 @@ fn object_literals_reclaim_their_intermediates() {
 fn objects_crossing_function_boundaries_are_reclaimed() {
     assert_clean(
         "object_boundaries",
-        r#"fun tag(object o) -> string { return json.get(o, "t") }
+        r#"use json
+fun tag(object o) -> string { return json.get(o, "t") }
 
 fun make() -> object { return {t: "5"} }
 
@@ -437,7 +444,8 @@ fun main() -> int {
 fn field_self_assignment_keeps_the_value() {
     assert_clean(
         "field_self_assignment",
-        r#"class Bag {
+        r#"use arrays
+class Bag {
     var array[int] items
     var string tag
 
@@ -465,7 +473,8 @@ fun main() -> int {
 fn field_overwrite_reclaims_the_previous_value() {
     assert_clean(
         "field_overwrite",
-        r#"class Box {
+        r#"use arrays
+class Box {
     var array[int] data
     var string label
 }
@@ -498,7 +507,8 @@ fun main() -> int {
 fn a_class_slot_is_null_before_its_first_store() {
     assert_clean(
         "class_slot_init",
-        r#"class Bag {
+        r#"use arrays
+class Bag {
     var array[int] items
     var string tag
 

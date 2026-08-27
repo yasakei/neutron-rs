@@ -27,6 +27,24 @@ pub fn emit_module(
         *map.borrow_mut() = ntsc_typeck::take_const_values();
     });
 
+    // `use strings as s` binds `s` in the source; codegen translates the
+    // alias back to the real stdlib module when dispatching `s.func()`.
+    STDLIB_ALIASES.with(|map| {
+        let mut m = map.borrow_mut();
+        m.clear();
+        for stmt in &program.statements {
+            if let ntsc_ast::stmt::Stmt::Use {
+                library,
+                is_file_path: false,
+                alias: Some(alias),
+                ..
+            } = stmt
+            {
+                m.insert(alias.lexeme().to_string(), library.lexeme().to_string());
+            }
+        }
+    });
+
     let module = context.create_module("ntsc_main");
 
     // Anchor the module to the target machine's ABI. The optimization pass

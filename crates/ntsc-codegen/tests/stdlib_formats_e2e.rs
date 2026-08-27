@@ -72,7 +72,7 @@ fn build_and_run_tests(
 
 #[test]
 fn csv_parse_and_stringify() {
-    let source = "fun main() {\n    var csv_input = \"name,age,city\\nAlice,30,NYC\\nBob,25,LA\";\n    var parsed = csv.parse(csv_input);\n    say(\"csv0: \" + parsed);\n\n    var output = csv.stringify(parsed);\n    say(\"csv1: \" + output);\n\n    var empty = csv.parse(\"\");\n    say(\"csv2: \" + empty);\n\n    try {\n        var bad = csv.stringify(\"{\\\"a\\\":1}\");\n        say(\"unreached-csv-stringify\");\n    } catch (err) {\n        say(\"csv3: \" + err);\n    }\n\n    say(\"done\")\n}\n";
+    let source = "use csv\nfun main() {\n    var csv_input = \"name,age,city\\nAlice,30,NYC\\nBob,25,LA\";\n    var parsed = csv.parse(csv_input);\n    say(\"csv0: \" + parsed);\n\n    var output = csv.stringify(parsed);\n    say(\"csv1: \" + output);\n\n    var empty = csv.parse(\"\");\n    say(\"csv2: \" + empty);\n\n    try {\n        var bad = csv.stringify(\"{\\\"a\\\":1}\");\n        say(\"unreached-csv-stringify\");\n    } catch (err) {\n        say(\"csv3: \" + err);\n    }\n\n    say(\"done\")\n}\n";
 
     let dir = std::env::temp_dir().join("ntsc_csv_e2e_test");
     std::fs::create_dir_all(&dir).unwrap();
@@ -102,7 +102,7 @@ fn csv_parse_and_stringify() {
 
 #[test]
 fn csv_roundtrip() {
-    let source = "fun main() {\n    var input = \"name,age\\nAlice,30\\nBob,25\";\n    var data = csv.parse(input);\n    var output = csv.stringify(data);\n    say(\"rt0: \" + output);\n\n    var reparsed = csv.parse(output);\n    say(\"rt1: \" + reparsed);\n\n    say(\"done\")\n}\n";
+    let source = "use csv\nfun main() {\n    var input = \"name,age\\nAlice,30\\nBob,25\";\n    var data = csv.parse(input);\n    var output = csv.stringify(data);\n    say(\"rt0: \" + output);\n\n    var reparsed = csv.parse(output);\n    say(\"rt1: \" + reparsed);\n\n    say(\"done\")\n}\n";
 
     let dir = std::env::temp_dir().join("ntsc_csv_roundtrip_e2e");
     std::fs::create_dir_all(&dir).unwrap();
@@ -122,7 +122,7 @@ fn csv_roundtrip() {
 
 #[test]
 fn toml_parse_and_stringify() {
-    let source = "fun main() {\n    var toml_input = \"name = \\\"Alice\\\"\\nage = 30\\nactive = true\";\n    var parsed = toml.parse(toml_input);\n    say(\"t0: \" + parsed);\n\n    var output = toml.stringify(parsed);\n    say(\"t1: \" + output);\n\n    var empty = toml.parse(\"\");\n    say(\"t2: \" + empty);\n\n    try {\n        var bad = toml.stringify(\"[1,2,3]\");\n        say(\"unreached-toml-stringify\");\n    } catch (err) {\n        say(\"t4: \" + err);\n    }\n\n    say(\"done\")\n}\n";
+    let source = "use toml\nfun main() {\n    var toml_input = \"name = \\\"Alice\\\"\\nage = 30\\nactive = true\";\n    var parsed = toml.parse(toml_input);\n    say(\"t0: \" + parsed);\n\n    var output = toml.stringify(parsed);\n    say(\"t1: \" + output);\n\n    var empty = toml.parse(\"\");\n    say(\"t2: \" + empty);\n\n    try {\n        var bad = toml.stringify(\"[1,2,3]\");\n        say(\"unreached-toml-stringify\");\n    } catch (err) {\n        say(\"t4: \" + err);\n    }\n\n    say(\"done\")\n}\n";
 
     let dir = std::env::temp_dir().join("ntsc_toml_e2e_test");
     std::fs::create_dir_all(&dir).unwrap();
@@ -155,7 +155,7 @@ fn toml_parse_and_stringify() {
 
 #[test]
 fn yaml_parse_and_stringify() {
-    let source = "fun main() {\n    var yaml_input = \"name: Alice\\nage: 30\\nactive: true\";\n    var parsed = yaml.parse(yaml_input);\n    say(\"y0: \" + parsed);\n\n    var output = yaml.stringify(parsed);\n    say(\"y1: \" + output);\n\n    var empty = yaml.parse(\"\");\n    say(\"y2: \" + empty);\n\n    try {\n        var bad = yaml.stringify(\"[1,2,3]\");\n        say(\"unreached-yaml-stringify\");\n    } catch (err) {\n        say(\"y4: \" + err);\n    }\n\n    say(\"done\")\n}\n";
+    let source = "use yaml\nfun main() {\n    var yaml_input = \"name: Alice\\nage: 30\\nactive: true\";\n    var parsed = yaml.parse(yaml_input);\n    say(\"y0: \" + parsed);\n\n    var output = yaml.stringify(parsed);\n    say(\"y1: \" + output);\n\n    var empty = yaml.parse(\"\");\n    say(\"y2: \" + empty);\n\n    try {\n        var bad = yaml.stringify(\"[1,2,3]\");\n        say(\"unreached-yaml-stringify\");\n    } catch (err) {\n        say(\"y4: \" + err);\n    }\n\n    say(\"done\")\n}\n";
 
     let dir = std::env::temp_dir().join("ntsc_yaml_e2e_test");
     std::fs::create_dir_all(&dir).unwrap();
@@ -188,7 +188,7 @@ fn yaml_parse_and_stringify() {
 
 #[test]
 fn yaml_roundtrip() {
-    let source = "fun main() {\n    var input = \"name: Alice\\nage: 30\\ncity: NYC\";\n    var data = yaml.parse(input);\n    var output = yaml.stringify(data);\n    say(\"yrt0: \" + output);\n\n    var reparsed = yaml.parse(output);\n    say(\"yrt1: \" + reparsed);\n\n    say(\"done\")\n}\n";
+    let source = "use yaml\nfun main() {\n    var input = \"name: Alice\\nage: 30\\ncity: NYC\";\n    var data = yaml.parse(input);\n    var output = yaml.stringify(data);\n    say(\"yrt0: \" + output);\n\n    var reparsed = yaml.parse(output);\n    say(\"yrt1: \" + reparsed);\n\n    say(\"done\")\n}\n";
 
     let dir = std::env::temp_dir().join("ntsc_yaml_roundtrip_e2e");
     std::fs::create_dir_all(&dir).unwrap();
@@ -208,7 +208,7 @@ fn yaml_roundtrip() {
 
 #[test]
 fn toml_roundtrip() {
-    let source = "fun main() {\n    var input = \"name = \\\"Bob\\\"\\nage = 25\\nactive = false\";\n    var data = toml.parse(input);\n    say(\"trt0: \" + data);\n\n    var parsed_name = json.get(data, \"name\");\n    say(\"trt1: \" + parsed_name);\n\n    var parsed_age = json.get(data, \"age\");\n    say(\"trt2: \" + parsed_age);\n\n    say(\"done\")\n}\n";
+    let source = "use toml\nuse json\nfun main() {\n    var input = \"name = \\\"Bob\\\"\\nage = 25\\nactive = false\";\n    var data = toml.parse(input);\n    say(\"trt0: \" + data);\n\n    var parsed_name = json.get(data, \"name\");\n    say(\"trt1: \" + parsed_name);\n\n    var parsed_age = json.get(data, \"age\");\n    say(\"trt2: \" + parsed_age);\n\n    say(\"done\")\n}\n";
 
     let dir = std::env::temp_dir().join("ntsc_toml_roundtrip_e2e");
     std::fs::create_dir_all(&dir).unwrap();

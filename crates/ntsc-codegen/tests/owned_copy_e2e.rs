@@ -174,7 +174,8 @@ fn copying_an_array_option_deep_copies_the_payload() {
 /// cell and its inner payload leaked.
 #[test]
 fn class_with_string_option_and_array_fields_is_reclaimed() {
-    let source = r#"class Record {
+    let source = r#"use arrays
+class Record {
     var string label
     var option[string] note
     var array[int] values
@@ -234,7 +235,8 @@ fun main() -> int {
 /// copy leaves the source untouched and both are reclaimed independently.
 #[test]
 fn copying_a_class_instance_deep_copies_owned_fields() {
-    let source = r#"class Record {
+    let source = r#"use arrays
+class Record {
     var string label
     var array[int] values
 
@@ -274,7 +276,8 @@ fun main() -> int {
 /// class's own field order would write the wrong slots.
 #[test]
 fn copying_a_derived_class_uses_flattened_field_indices() {
-    let source = r#"class Base {
+    let source = r#"use arrays
+class Base {
     var string name
     var array[int] tags
 

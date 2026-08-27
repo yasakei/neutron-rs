@@ -6,6 +6,7 @@
 // The harness runs every `test` block, replacing `main` with the test runner.
 
 use testing
+use strings
 
 fun add(int a, int b) -> int {
     return a + b;

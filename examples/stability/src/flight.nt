@@ -10,6 +10,9 @@
 //   - Class elements are stored in arrays by constructing them inline; the
 //     array owns the instance and the loop variables read back its fields.
 
+use strings
+use arrays
+
 class Astronaut {
     var string name
     var float mass

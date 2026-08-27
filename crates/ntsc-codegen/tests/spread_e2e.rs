@@ -33,7 +33,8 @@ fn spread_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun sum4(int a, int b, int c, int d) -> int {
+    let source = r#"use arrays
+fun sum4(int a, int b, int c, int d) -> int {
     return a + b + c + d;
 }
 

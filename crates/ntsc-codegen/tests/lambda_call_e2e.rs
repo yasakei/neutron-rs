@@ -28,7 +28,8 @@ fn lambda_call_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun main() {
+    let source = r#"use fmt
+fun main() {
     var f = fun(int x) -> int { return x * 2 };
     var r = f(21);
     say("lambda: " + fmt.i64_to_str(r));

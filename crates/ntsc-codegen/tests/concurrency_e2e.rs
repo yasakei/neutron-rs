@@ -32,7 +32,9 @@ fn concurrency_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun main() {
+    let source = r#"use collections
+use process
+fun main() {
     // ── Producer thread → main receives ───────────────────────────────────
     var rx = collections.channel(4);
     var tx = collections.channel_sender(rx);

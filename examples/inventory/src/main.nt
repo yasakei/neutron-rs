@@ -19,6 +19,8 @@
 //   ntsc test
 
 use testing
+use arrays
+use fmt
 
 class Product {
     var string sku

@@ -220,21 +220,7 @@ pub fn runtime_lib_name() -> &'static str {
 /// will consume the emitted object; hardcoding a Linux triple on a macOS or
 /// Windows host would emit ELF/COFF objects no local linker can consume.
 pub fn host_triple() -> &'static str {
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "x86_64-unknown-linux-gnu"
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "aarch64-unknown-linux-gnu"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "x86_64-apple-darwin"
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "aarch64-apple-darwin"
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "x86_64-pc-windows-msvc"
-    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        "aarch64-pc-windows-msvc"
-    } else {
-        "unknown-unknown-unknown"
-    }
+    ntsc_build::host_triple()
 }
 
 pub fn llvm_version() -> String {

@@ -64,7 +64,8 @@ fn compile_error(name: &str, source: &str) -> String {
 /// and a raw pointer taken from a `&mut` field reference writes through it.
 #[test]
 fn own_reference_and_raw_pointer_round_trip() {
-    let source = r#"class Packet {
+    let source = r#"use memory
+class Packet {
     var int id
 
     fun init(int id) {
@@ -96,7 +97,8 @@ fun main() {
 /// through it is observable in the original variable.
 #[test]
 fn raw_write_through_a_scalar_reference_is_observable() {
-    let source = r#"fun main() {
+    let source = r#"use memory
+fun main() {
     var int value = 5
     unsafe {
         var *mut int raw = memory.raw_address(&mut value)
@@ -115,7 +117,8 @@ fn raw_write_through_a_scalar_reference_is_observable() {
 /// A boxed scalar allocation is reclaimed when its owner leaves scope.
 #[test]
 fn boxed_scalar_allocation_is_reclaimed() {
-    let source = r#"fun main() {
+    let source = r#"use memory
+fun main() {
     var own int boxed = alloc(11)
     unsafe {
         var *const int p = memory.raw_address(&boxed)
@@ -135,7 +138,7 @@ fn boxed_scalar_allocation_is_reclaimed() {
 fn raw_dereference_outside_unsafe_is_rejected() {
     let err = compile_error(
         "raw_outside_unsafe",
-        "fun main() {\n    var int v = 1\n    var *mut int p = memory.raw_address(&mut v)\n    *p = 2\n}\n",
+        "use memory\nfun main() {\n    var int v = 1\n    var *mut int p = memory.raw_address(&mut v)\n    *p = 2\n}\n",
     );
     assert!(
         err.contains("requires an `unsafe` block"),
@@ -149,7 +152,7 @@ fn raw_dereference_outside_unsafe_is_rejected() {
 fn raw_pointer_pointee_type_is_enforced() {
     let err = compile_error(
         "raw_pointee_type",
-        "class Packet {\n    var int id\n}\nfun main() {\n    var own Packet p = alloc(Packet())\n    unsafe {\n        var *mut int raw = memory.raw_address(&mut p)\n    }\n}\n",
+        "use memory\nclass Packet {\n    var int id\n}\nfun main() {\n    var own Packet p = alloc(Packet())\n    unsafe {\n        var *mut int raw = memory.raw_address(&mut p)\n    }\n}\n",
     );
     assert!(
         err.contains("type mismatch"),
@@ -162,7 +165,7 @@ fn raw_pointer_pointee_type_is_enforced() {
 fn writing_through_a_const_raw_pointer_is_rejected() {
     let err = compile_error(
         "raw_const_write",
-        "fun main() {\n    var int v = 1\n    unsafe {\n        var *const int p = memory.raw_address(&v)\n        *p = 2\n    }\n}\n",
+        "use memory\nfun main() {\n    var int v = 1\n    unsafe {\n        var *const int p = memory.raw_address(&v)\n        *p = 2\n    }\n}\n",
     );
     assert!(
         err.contains("cannot write through `*const` pointer"),

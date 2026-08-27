@@ -86,7 +86,8 @@ fn workspace_root() -> std::path::PathBuf {
 /// and the array is never moved.
 #[test]
 fn arrays_push_is_in_place_and_returns_void() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     var a = [1];
     arrays.push(a, 2);
     arrays.push(a, 3);
@@ -107,7 +108,8 @@ fn arrays_push_is_in_place_and_returns_void() {
 /// `arrays.pop` mutates in place and returns the removed element.
 #[test]
 fn arrays_pop_mutates_in_place_and_returns_element() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     var p = [5, 6, 7];
     var last = arrays.pop(p);
     say("last: " + last);
@@ -128,7 +130,8 @@ fn arrays_pop_mutates_in_place_and_returns_element() {
 /// consumed and a new owned array is returned.
 #[test]
 fn functional_arrays_ops_do_not_consume_input() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     var nums = [3, 1, 2];
     var sorted = arrays.sort(nums);
     say("sorted: " + sorted[0] + sorted[1] + sorted[2]);
@@ -154,7 +157,7 @@ fn push_while_viewed_is_an_error() {
     let err = compile_error(
         &workspace_root(),
         "err_push_viewed",
-        "fun main() {\n    var a = [1, 2]\n    view var r = a\n    arrays.push(a, 3)\n    say(\"r: \" + r[0])\n}\n",
+        "use arrays\nfun main() {\n    var a = [1, 2]\n    view var r = a\n    arrays.push(a, 3)\n    say(\"r: \" + r[0])\n}\n",
     );
     assert!(
         err.contains("already viewed"),
@@ -166,7 +169,8 @@ fn push_while_viewed_is_an_error() {
 /// final use, so pushing afterwards is legal.
 #[test]
 fn push_after_views_last_use_is_allowed() {
-    let source = r#"fun main() {
+    let source = r#"use arrays
+fun main() {
     var a = [1, 2];
     view var r = a;
     say("r: " + r[0]);
@@ -190,7 +194,7 @@ fn views_cannot_cross_threads() {
     let err = compile_error(
         &workspace_root(),
         "err_thread_view",
-        "fun worker(int ch) { }\nfun main() {\n    var xs = [1, 2]\n    view var r = xs\n    process.spawn_thread(worker, r)\n}\n",
+        "use process\nfun worker(int ch) { }\nfun main() {\n    var xs = [1, 2]\n    view var r = xs\n    process.spawn_thread(worker, r)\n}\n",
     );
     assert!(
         err.contains("views cannot cross threads"),
@@ -211,7 +215,7 @@ fn owned_heap_values_cannot_cross_threads() {
             &workspace_root(),
             name,
             &format!(
-                "fun worker(int ch) {{ }}\nfun main() {{\n    {decl}\n    process.spawn_thread(worker, {payload})\n}}\n"
+                "use process\nfun worker(int ch) {{ }}\nfun main() {{\n    {decl}\n    process.spawn_thread(worker, {payload})\n}}\n"
             ),
         );
         assert!(
@@ -240,7 +244,7 @@ fn shared_values_cannot_cross_threads() {
             &workspace_root(),
             name,
             &format!(
-                "fun worker(int ch) {{ }}\nfun main() {{\n    shared array[int] s = [1, 2]\n    {call}\n}}\n"
+                "use process\nuse collections\nfun worker(int ch) {{ }}\nfun main() {{\n    shared array[int] s = [1, 2]\n    {call}\n}}\n"
             ),
         );
         assert!(
@@ -254,7 +258,9 @@ fn shared_values_cannot_cross_threads() {
 /// to the worker, and the data itself travels through the channel.
 #[test]
 fn channel_handles_and_scalars_cross_threads() {
-    let source = r#"fun main() {
+    let source = r#"use collections
+use process
+fun main() {
     var rx = collections.channel(2);
     var tx = collections.channel_sender(rx);
     var n = 7;

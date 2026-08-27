@@ -63,6 +63,15 @@ thread_local! {
 }
 
 thread_local! {
+    /// Stdlib import alias → real module name, from `use strings as s`.
+    ///
+    /// The alias is bound as an object in the source, but native stdlib
+    /// functions are named `ntsc_{module}_{fn}`, so codegen translates an
+    /// aliased member call back to the real module name.
+    static STDLIB_ALIASES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+thread_local! {
     /// Enum name → member name → i32 value. Enums are lowered to int
     /// constants; `Color.RED` resolves through this table.
     static ENUM_VALUES: RefCell<HashMap<String, HashMap<String, i32>>> =

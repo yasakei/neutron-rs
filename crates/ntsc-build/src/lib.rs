@@ -3,13 +3,13 @@
 //! Format is TOML with a `[package]` section:
 //! ```toml
 //! [package]
-//! target = "x86_64-unknown-linux-gnu"
 //! entry = "src/main.nt"
 //! output = "my-project"
 //! ```
 
 use std::fmt;
 
+pub mod aliases;
 pub mod modules;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +74,10 @@ pub fn parse(source: &str) -> Result<BuildConfig, Vec<BuildError>> {
         }
     };
 
-    let target = extract_string(package, "target", &mut errors);
+    let target = package
+        .get("target")
+        .map(|_| extract_string(package, "target", &mut errors))
+        .unwrap_or_else(|| Some(host_triple().to_string()));
     let entry = extract_string(package, "entry", &mut errors);
     let output = extract_string(package, "output", &mut errors);
 
@@ -86,6 +89,26 @@ pub fn parse(source: &str) -> Result<BuildConfig, Vec<BuildError>> {
         })
     } else {
         Err(errors)
+    }
+}
+
+/// LLVM target triple for the host platform used when a project omits
+/// `[package].target`.
+pub fn host_triple() -> &'static str {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "x86_64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "aarch64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        "aarch64-pc-windows-msvc"
+    } else {
+        "unknown-unknown-unknown"
     }
 }
 
@@ -159,13 +182,10 @@ output = "cool-app"
     }
 
     #[test]
-    fn missing_target() {
+    fn omitted_target_defaults_to_host() {
         let src = "[package]\nentry = \"src/main.nt\"\noutput = \"my-project\"\n";
-        let errs = parse(src).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| e.message.contains("missing required key `target`"))
-        );
+        let config = parse(src).expect("target should default to host");
+        assert_eq!(config.target, host_triple());
     }
 
     #[test]
@@ -192,7 +212,7 @@ output = "cool-app"
     fn all_missing() {
         let src = "[package]\n";
         let errs = parse(src).unwrap_err();
-        assert_eq!(errs.len(), 3);
+        assert_eq!(errs.len(), 2);
     }
 
     #[test]

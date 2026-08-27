@@ -184,10 +184,12 @@ impl TypeChecker {
                 .expect("global scope should be empty");
         }
 
-        // Pre-declare builtin stdlib module names.
-        for module in crate::names::BUILTIN_MODULES {
-            symbols.define(module, Ty::Object).ok();
-        }
+        // `async` is a reserved keyword and cannot be imported with `use`, so
+        // it stays always in scope.
+        symbols
+            .define("async", Ty::Object)
+            .expect("global scope should be empty");
+
         Self {
             symbols,
             errors: Vec::new(),
@@ -1012,6 +1014,33 @@ impl TypeChecker {
                             span: name.span,
                         });
                     }
+                }
+            }
+            Stmt::Use {
+                library,
+                is_file_path: false,
+                alias,
+                ..
+            } => {
+                // `use strings as s` binds the alias `s`; bare imports bind the
+                // module name itself. Either way it is an object namespace.
+                let name = alias
+                    .as_ref()
+                    .map_or_else(|| library.lexeme(), |a| a.lexeme());
+                if self.symbols.lookup(name).is_none() {
+                    self.symbols.define(name, Ty::Object).ok();
+                }
+            }
+            // `use "file.nt" as arm` binds `arm` as an object-like namespace
+            // whose members (`arm.func`) type as unknowns, like stdlib.
+            Stmt::Use {
+                is_file_path: true,
+                alias: Some(alias),
+                ..
+            } => {
+                let name = alias.lexeme();
+                if self.symbols.lookup(name).is_none() {
+                    self.symbols.define(name, Ty::Object).ok();
                 }
             }
             Stmt::Use { .. } => {}
@@ -3570,7 +3599,7 @@ mod tests {
     #[test]
     fn raw_pointer_deref_is_allowed_inside_unsafe() {
         assert!(check_source(
-            "fun f() { var int x = 1\n var &mut int w = &mut x\n unsafe { var *mut int p = memory.raw_address(w)\n *p = 2 } }"
+            "use memory\nfun f() { var int x = 1\n var &mut int w = &mut x\n unsafe { var *mut int p = memory.raw_address(w)\n *p = 2 } }"
         )
         .is_ok());
     }
@@ -3578,7 +3607,7 @@ mod tests {
     #[test]
     fn raw_address_preserves_pointee_type() {
         let errs = check_source(
-            "class Packet { var int id }\nfun f() { var own Packet packet = alloc(Packet())\n var &mut Packet write = &mut packet\n unsafe { var *mut int raw = memory.raw_address(write) } }",
+            "use memory\nclass Packet { var int id }\nfun f() { var own Packet packet = alloc(Packet())\n var &mut Packet write = &mut packet\n unsafe { var *mut int raw = memory.raw_address(write) } }",
         )
         .unwrap_err();
         assert!(errs.iter().any(|e| e.message.contains("type mismatch")));

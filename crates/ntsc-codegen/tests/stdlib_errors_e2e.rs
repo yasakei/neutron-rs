@@ -31,7 +31,15 @@ fn stdlib_errors_e2e() {
         "runtime lib not found at {runtime_lib:?}"
     );
 
-    let source = r#"fun main() {
+    let source = r#"use crypto
+use fmt
+use http
+use json
+use math
+use process
+use regex
+use sys
+fun main() {
     try {
         var n = fmt.to_int("oops");
         say("unreached-int");

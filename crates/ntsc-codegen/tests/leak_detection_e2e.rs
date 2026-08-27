@@ -77,7 +77,8 @@ fn debug_build_warns_on_leaked_allocations() {
     // fields are deliberately leaked instead. That makes this the positive
     // control for the detector itself: a debug build must report the abandoned
     // array.
-    let source = r#"class Bag {
+    let source = r#"use arrays
+class Bag {
     var array[int] items
 
     fun init() {
@@ -105,7 +106,7 @@ fun main() -> int {
         "debug build must warn about leaked allocations, stderr was: {stderr:?}"
     );
     assert!(
-        stderr.contains("--> <source>:5:22")
+        stderr.contains("--> <source>:6:22")
             && stderr.contains("array handle")
             && stderr.contains("was allocated here"),
         "leak warning must identify the surviving registry object, stderr was: {stderr:?}"
@@ -153,7 +154,8 @@ fn heap_class_with_owned_field_is_reclaimed() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
     let rewrite_dir = workspace.parent().unwrap().parent().unwrap();
 
-    let source = r#"class Ledger {
+    let source = r#"use arrays
+class Ledger {
     var array[int] amounts
 
     fun init() {
@@ -195,7 +197,8 @@ fn initless_class_default_initializes_owned_fields() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
     let rewrite_dir = workspace.parent().unwrap().parent().unwrap();
 
-    let source = r#"class Ledger {
+    let source = r#"use arrays
+class Ledger {
     var array[int] amounts
 
     fun add(int v) {
@@ -283,7 +286,8 @@ fn reclaimed_arrays_do_not_warn() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
     let rewrite_dir = workspace.parent().unwrap().parent().unwrap();
 
-    let source = r#"fun total(array[int] xs) -> int {
+    let source = r#"use arrays
+fun total(array[int] xs) -> int {
     var sum = 0;
     for (var x in xs) {
         sum = sum + x;
@@ -384,7 +388,10 @@ fn sort_and_shuffle_do_not_warn() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
     let rewrite_dir = workspace.parent().unwrap().parent().unwrap();
 
-    let source = r#"fun main() -> int {
+    let source = r#"use arrays
+use random
+use sort
+fun main() -> int {
     var nums = [3, 1, 2];
     var sorted = sort.stable_sort(nums);
     var inline = sort.stable_sort([9, 7, 8]);
@@ -418,7 +425,10 @@ fn async_channel_workers_reclaim_reused_class_locals() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
     let rewrite_dir = workspace.parent().unwrap().parent().unwrap();
 
-    let source = r#"class Ticket {
+    let source = r#"use arrays
+use collections
+use process
+class Ticket {
     var int id
     var string requester
 
