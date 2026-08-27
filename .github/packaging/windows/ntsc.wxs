@@ -74,6 +74,9 @@
       <Component Id="ntsc.exe" Guid="*">
         <File Id="ntsc.exe" Source="$(var.SourceDir)\ntsc.exe" KeyPath="yes" />
       </Component>
+      <Component Id="ntsc-pkg.exe" Guid="*">
+        <File Id="ntsc-pkg.exe" Source="$(var.SourceDir)\ntsc-pkg.exe" KeyPath="yes" />
+      </Component>
       <ComponentGroupRef Id="Libraries" />
       <ComponentGroupRef Id="Tools" />
       <ComponentGroupRef Id="MingwLibs" />

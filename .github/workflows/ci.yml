@@ -209,3 +209,20 @@ jobs:
               }
             } finally { Pop-Location }
           } finally { Pop-Location }
+
+      - name: Smoke test package manager
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = if ($IsWindows) { "ntsc.exe" } else { "ntsc" }
+          $cli = Join-Path $pwd "target/release/$exe"
+          Push-Location "crates/ntsc-pkg"
+          try {
+            & $cli build --release
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $pkgName = if ($IsWindows) { "ntsc-pkg.exe" } else { "ntsc-pkg" }
+            $pkg = Join-Path $pwd "build/release/$pkgName"
+            if (-not (Test-Path $pkg)) { throw "ntsc-pkg binary not produced" }
+            & $pkg
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }

@@ -189,12 +189,13 @@ relocatable so the bundled libraries resolve wherever the tree is extracted:
 ## Building locally
 
 Each recipe takes the version as its first argument. The native packages and
-tarballs expect the release binary at `target/release/ntsc` (or `ntsc.exe` on
-Windows) **and** the runtime at `target/release/libntsc_runtime.a`, so build
-both crates first (`ntsc-cli` does not depend on `ntsc-runtime`):
+tarballs expect the release compiler, the package-manager binary at
+`crates/ntsc-pkg/build/release/ntsc-pkg` (or `.exe`), and the runtime at
+`target/release/libntsc_runtime.a`:
 
 ```bash
 cargo build --release -p ntsc-cli -p ntsc-runtime
+(cd crates/ntsc-pkg && ../../target/release/ntsc build --release)
 
 # Linux (.deb/.rpm require dpkg-deb/rpmbuild; the tarball requires patchelf;
 # the .pkg.tar.zst requires makepkg and so only builds on Arch):

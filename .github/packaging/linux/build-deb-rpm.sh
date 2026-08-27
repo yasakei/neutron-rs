@@ -17,18 +17,22 @@ VERSION="${1:?usage: build-deb-rpm.sh <version>}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 PACKAGING="$ROOT/.."
 BIN="target/release/ntsc"
+PKG="crates/ntsc-pkg/build/release/ntsc-pkg"
 RUNTIME="target/release/libntsc_runtime.a"
 
-if [ ! -f "$RUNTIME" ]; then
-  echo "error: $RUNTIME not found - build it with: cargo build --release -p ntsc-runtime" >&2
-  exit 1
-fi
+for f in "$BIN" "$PKG" "$RUNTIME"; do
+  if [ ! -f "$f" ]; then
+    echo "error: $f not found - build the release compiler, package manager, and runtime first" >&2
+    exit 1
+  fi
+done
 
 # ── Shared staging area ────────────────────────────────────────────────────
 STAGE="$PACKAGING/.build"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/ntsc"
+install -m 755 "$PKG" "$STAGE/ntsc-pkg"
 install -m 644 "$RUNTIME" "$STAGE/libntsc_runtime.a"
 gzip -9 -c "$ROOT/../ntsc.1" > "$STAGE/ntsc.1.gz"
 
@@ -38,6 +42,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
   mkdir -p "$DEBROOT/DEBIAN" "$DEBROOT/usr/bin" "$DEBROOT/usr/lib/ntsc" \
     "$DEBROOT/usr/share/man/man1"
   install -m 755 "$STAGE/ntsc" "$DEBROOT/usr/bin/ntsc"
+  install -m 755 "$STAGE/ntsc-pkg" "$DEBROOT/usr/bin/ntsc-pkg"
   install -m 644 "$STAGE/libntsc_runtime.a" "$DEBROOT/usr/lib/ntsc/libntsc_runtime.a"
   install -m 644 "$STAGE/ntsc.1.gz" "$DEBROOT/usr/share/man/man1/ntsc.1.gz"
   sed "s/@VERSION@/$VERSION/g" "$ROOT/debian/control" > "$DEBROOT/DEBIAN/control"

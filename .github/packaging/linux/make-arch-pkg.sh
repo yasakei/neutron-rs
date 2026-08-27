@@ -76,6 +76,7 @@ package() {
   # both resolve to /usr/lib/ntsc from /usr/bin, so LLVM and the runtime
   # archive are found with no further configuration.
   install -Dm755 bin/ntsc "$pkgdir/usr/bin/ntsc"
+  install -Dm755 bin/ntsc-pkg "$pkgdir/usr/bin/ntsc-pkg"
   install -d "$pkgdir/usr/lib/ntsc"
   cp -a lib/ntsc/. "$pkgdir/usr/lib/ntsc/"
   install -Dm644 share/man/man1/ntsc.1.gz "$pkgdir/usr/share/man/man1/ntsc.1.gz"

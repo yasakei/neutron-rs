@@ -273,6 +273,22 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo build -p ntsc-runtime --release
 
+      - name: Build host runtime library (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build -p ntsc-runtime --release
+
+      - name: Build package manager
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = if ($IsWindows) { "ntsc.exe" } else { "ntsc" }
+          $cli = Join-Path $pwd "target/release/$exe"
+          Push-Location "crates/ntsc-pkg"
+          try {
+            & $cli build --release
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+
       # ── Version ──────────────────────────────────────────────────────────
       # The tag is `v26.0.0b`; the MSI additionally needs a numeric
       # ProductVersion (26.0.0).

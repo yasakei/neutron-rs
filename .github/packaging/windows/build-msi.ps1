@@ -34,6 +34,7 @@ param(
   # MSVC runtime ntsc.exe links against cannot be consumed by ld.lld in MinGW
   # mode.
   [string]$GnuRuntimeLib = "target\x86_64-pc-windows-gnu\release\libntsc_runtime.a",
+  [string]$PackageManager = "crates\ntsc-pkg\build\release\ntsc-pkg.exe",
 
   # Where the MinGW import libraries live. Defaults to the rustc toolchain's
   # x86_64-pc-windows-gnu lib dir (created by `rustup target add
@@ -46,6 +47,9 @@ $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path (Join-Path $SourceDir "ntsc.exe"))) {
   throw "ntsc.exe not found in $SourceDir - build the release binary first"
+}
+if (-not (Test-Path $PackageManager)) {
+  throw "ntsc-pkg.exe not found at $PackageManager - build the package manager first"
 }
 if (-not (Get-Command dumpbin -ErrorAction SilentlyContinue)) {
   throw "dumpbin not found - run inside the MSVC developer environment"
@@ -99,12 +103,14 @@ function Get-Deps([string]$Path) {
 }
 
 Get-Deps (Join-Path $SourceDir "ntsc.exe")
+Get-Deps $PackageManager
 
 Write-Host "Bundling $($deps.Count) DLL(s):"
 $deps | ForEach-Object { Write-Host "  $_" }
 
 # ── Stage files ─────────────────────────────────────────────────────────────
 Copy-Item (Join-Path $SourceDir "ntsc.exe") $Dist
+Copy-Item $PackageManager (Join-Path $Dist "ntsc-pkg.exe")
 foreach ($name in $deps) {
   $full = Join-Path $LlvmBin $name
   if (Test-Path $full) {

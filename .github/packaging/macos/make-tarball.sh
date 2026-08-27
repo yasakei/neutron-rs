@@ -26,12 +26,13 @@ set -euo pipefail
 
 VERSION="${1:?usage: make-tarball.sh <version> [binary]}"
 BIN="${2:-target/release/ntsc}"
+PKG="crates/ntsc-pkg/build/release/ntsc-pkg"
 RUNTIME="target/release/libntsc_runtime.a"
 ARCH="$(uname -m)"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 MAN="$ROOT/../ntsc.1"
 
-for f in "$BIN" "$RUNTIME"; do
+for f in "$BIN" "$PKG" "$RUNTIME"; do
   if [ ! -f "$f" ]; then
     echo "error: $f not found - build it with: cargo build --release -p ntsc-cli -p ntsc-runtime" >&2
     exit 1
@@ -45,6 +46,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$LIBDIR" "$STAGE/share/man/man1"
 
 install -m 755 "$BIN" "$STAGE/bin/ntsc"
+install -m 755 "$PKG" "$STAGE/bin/ntsc-pkg"
 install -m 644 "$RUNTIME" "$LIBDIR/libntsc_runtime.a"
 gzip -9 -c "$MAN" > "$STAGE/share/man/man1/ntsc.1.gz"
 install -m 644 LICENSE "$STAGE/LICENSE"
@@ -76,10 +78,12 @@ copy_dylibs() {
 }
 
 copy_dylibs "$STAGE/bin/ntsc"
+copy_dylibs "$STAGE/bin/ntsc-pkg"
 
 # The executable resolves @rpath against lib/ntsc.
 install_name_tool -add_rpath "@executable_path/../lib/ntsc" "$STAGE/bin/ntsc"
 codesign --force --sign - "$STAGE/bin/ntsc"
+codesign --force --sign - "$STAGE/bin/ntsc-pkg"
 
 # ── Assemble the archive ───────────────────────────────────────────────────
 tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"

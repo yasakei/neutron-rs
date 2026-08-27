@@ -11,6 +11,7 @@ set -euo pipefail
 
 VERSION="${1:?usage: make-dmg.sh <version> [binary]}"
 BIN="${2:-target/release/ntsc}"
+PKG="crates/ntsc-pkg/build/release/ntsc-pkg"
 RUNTIME="target/release/libntsc_runtime.a"
 
 APP="dist/ntsc.app"
@@ -18,12 +19,20 @@ FRAMEWORKS="$APP/Contents/Frameworks"
 MACOS="$APP/Contents/MacOS"
 DMGDIR="dist/dmg"
 
+for f in "$BIN" "$PKG" "$RUNTIME"; do
+  if [ ! -f "$f" ]; then
+    echo "error: $f not found - build the release compiler, package manager, and runtime first" >&2
+    exit 1
+  fi
+done
+
 # Clean only this script's own outputs, not the whole dist/ directory, so a
 # tarball or other artifact already written to dist/ is not clobbered.
 rm -rf "$APP" "$DMGDIR" "dist/ntsc-$VERSION.dmg"
 mkdir -p "$FRAMEWORKS" "$MACOS" "$DMGDIR"
 
 install -m 755 "$BIN" "$MACOS/ntsc"
+install -m 755 "$PKG" "$MACOS/ntsc-pkg"
 
 # The static archive `ntsc build` links every NTSC program against. It goes in
 # Contents/lib/ntsc/ — NOT beside the binary in Contents/MacOS/ — because
@@ -33,10 +42,6 @@ install -m 755 "$BIN" "$MACOS/ntsc"
 # at all"). Files elsewhere in the bundle are sealed as resources instead. ntsc
 # resolves it from Contents/MacOS/ntsc via its executable-relative ../lib/ntsc
 # candidate, so no CLI change is needed.
-if [ ! -f "$RUNTIME" ]; then
-  echo "error: $RUNTIME not found - build it with: cargo build --release -p ntsc-runtime" >&2
-  exit 1
-fi
 mkdir -p "$APP/Contents/lib/ntsc"
 install -m 644 "$RUNTIME" "$APP/Contents/lib/ntsc/libntsc_runtime.a"
 
@@ -89,8 +94,10 @@ copy_dylibs() {
 }
 
 copy_dylibs "$MACOS/ntsc"
+copy_dylibs "$MACOS/ntsc-pkg"
 
 # Ad-hoc signature so macOS accepts the bundle.
+codesign --force --sign - "$MACOS/ntsc-pkg"
 codesign --force --sign - "$APP"
 
 # ── Assemble the .dmg ──────────────────────────────────────────────────────

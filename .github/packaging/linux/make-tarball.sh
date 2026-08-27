@@ -28,12 +28,13 @@ set -euo pipefail
 
 VERSION="${1:?usage: make-tarball.sh <version> [binary]}"
 BIN="${2:-target/release/ntsc}"
+PKG="crates/ntsc-pkg/build/release/ntsc-pkg"
 RUNTIME="target/release/libntsc_runtime.a"
 ARCH="$(uname -m)"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 MAN="$ROOT/../ntsc.1"
 
-for f in "$BIN" "$RUNTIME"; do
+for f in "$BIN" "$PKG" "$RUNTIME"; do
   if [ ! -f "$f" ]; then
     echo "error: $f not found - build it with: cargo build --release -p ntsc-cli -p ntsc-runtime" >&2
     exit 1
@@ -50,6 +51,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/lib/ntsc" "$STAGE/share/man/man1"
 
 install -m 755 "$BIN" "$STAGE/bin/ntsc"
+install -m 755 "$PKG" "$STAGE/bin/ntsc-pkg"
 install -m 644 "$RUNTIME" "$STAGE/lib/ntsc/libntsc_runtime.a"
 gzip -9 -c "$MAN" > "$STAGE/share/man/man1/ntsc.1.gz"
 install -m 644 LICENSE "$STAGE/LICENSE"
@@ -67,21 +69,28 @@ libdl.so.*|librt.so.*|libgcc_s.so.*) return 0 ;;
   esac
 }
 
-while read -r name _arrow path _addr; do
-  # ldd lines are either "name => /path (0x..)" or "/path (0x..)" (loader).
-  if [ -z "${path:-}" ] || [ "${path:0:1}" != "/" ]; then
-    path="$name"
-  fi
-  base="$(basename "$name")"
-  skip_lib "$base" && continue
-  [ -f "$path" ] || continue
-  cp -L "$path" "$STAGE/lib/ntsc/$base"
-done < <(ldd "$STAGE/bin/ntsc")
+bundle_elf() {
+  local binary="$1"
+  while read -r name _arrow path _addr; do
+    # ldd lines are either "name => /path (0x..)" or "/path (0x..)" (loader).
+    if [ -z "${path:-}" ] || [ "${path:0:1}" != "/" ]; then
+      path="$name"
+    fi
+    base="$(basename "$name")"
+    skip_lib "$base" && continue
+    [ -f "$path" ] || continue
+    cp -L "$path" "$STAGE/lib/ntsc/$base"
+  done < <(ldd "$binary")
+}
+
+bundle_elf "$STAGE/bin/ntsc"
+bundle_elf "$STAGE/bin/ntsc-pkg"
 
 # ── Make it relocatable ────────────────────────────────────────────────────
 # $ORIGIN is a literal token the loader expands at run time; single-quote it so
 # the shell does not touch it.
 patchelf --set-rpath '$ORIGIN/../lib/ntsc' "$STAGE/bin/ntsc"
+patchelf --set-rpath '$ORIGIN/../lib/ntsc' "$STAGE/bin/ntsc-pkg"
 for so in "$STAGE"/lib/ntsc/*.so*; do
   [ -f "$so" ] || continue
   chmod u+w "$so"
