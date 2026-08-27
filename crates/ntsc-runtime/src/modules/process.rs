@@ -17,16 +17,42 @@ fn make_response_json(status: i64, stdout: &str, stderr: &str) -> String {
     )
 }
 
+/// Run a command through `/bin/sh -c` and return its exit code.
+fn exec_blocking(command: &str) -> Result<i64, String> {
+    let mut process = Command::new("sh");
+    super::os::apply_environment(&mut process);
+    match process.arg("-c").arg(command).status() {
+        Ok(status) => Ok(status.code().unwrap_or(-1) as i64),
+        Err(e) => Err(format!("process.exec: cannot start command: {e}")),
+    }
+}
+
+/// Run a command through `/bin/sh -c` and capture its output as a JSON string
+/// handle (`status`, `stdout`, `stderr`).
+fn exec_output_blocking(command: &str) -> Result<i64, String> {
+    let mut process = Command::new("sh");
+    super::os::apply_environment(&mut process);
+    match process.arg("-c").arg(command).output() {
+        Ok(output) => {
+            let status = output.status.code().unwrap_or(-1) as i64;
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Ok(registry::put_string(make_response_json(
+                status, &stdout, &stderr,
+            )))
+        }
+        Err(e) => Err(format!("process.exec_output: cannot start command: {e}")),
+    }
+}
+
 /// `process.exec(command)` — runs through `/bin/sh -c`; returns the exit
 /// code.
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_process_exec(command: i64) -> i64 {
     let cmd = registry::get_string(command).unwrap_or_default();
-    let mut process = Command::new("sh");
-    super::os::apply_environment(&mut process);
-    match process.arg("-c").arg(&cmd).status() {
-        Ok(status) => status.code().unwrap_or(-1) as i64,
-        Err(e) => super::throw_str(format!("process.exec: cannot start command: {e}")),
+    match exec_blocking(&cmd) {
+        Ok(code) => code,
+        Err(msg) => super::throw_str(msg),
     }
 }
 
@@ -34,16 +60,9 @@ pub extern "C" fn ntsc_process_exec(command: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_process_exec_output(command: i64) -> i64 {
     let cmd = registry::get_string(command).unwrap_or_default();
-    let mut process = Command::new("sh");
-    super::os::apply_environment(&mut process);
-    match process.arg("-c").arg(&cmd).output() {
-        Ok(output) => {
-            let status = output.status.code().unwrap_or(-1) as i64;
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            registry::put_string(make_response_json(status, &stdout, &stderr))
-        }
-        Err(e) => super::throw_str(format!("process.exec_output: cannot start command: {e}")),
+    match exec_output_blocking(&cmd) {
+        Ok(handle) => handle,
+        Err(msg) => super::throw_str(msg),
     }
 }
 
@@ -60,16 +79,87 @@ pub extern "C" fn ntsc_process_spawn(program: i64, args: i64) -> i64 {
     };
     let mut process = Command::new(&prog);
     super::os::apply_environment(&mut process);
-    match process.args(&arg_vec).output() {
-        Ok(output) => {
-            let status = output.status.code().unwrap_or(-1) as i64;
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            registry::put_string(make_response_json(status, &stdout, &stderr))
-        }
+    let result = process.args(&arg_vec).output().map(|output| {
+        let status = output.status.code().unwrap_or(-1) as i64;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        registry::put_string(make_response_json(status, &stdout, &stderr))
+    });
+    match result {
+        Ok(handle) => handle,
         Err(e) => super::throw_str(format!("process.spawn: cannot start '{prog}': {e}")),
     }
 }
+
+// ── Offloaded (async) process calls ─────────────────────────────────────
+//
+// These register a reactive offload future that runs the blocking command on
+// the worker pool instead of the scheduler thread. The job itself is pure and
+// returns a `Result<i64, String>` so an error on a pool thread is delivered
+// as a throw once the goroutine reaps it.
+
+type BlockingOutcome = Result<i64, String>;
+
+fn put_outcome(work: Box<dyn FnOnce() -> BlockingOutcome + Send + 'static>) -> i64 {
+    registry::async_op_new(Box::new(move || registry::put_opaque(work())))
+}
+
+/// Delivers the outcome of a completed offloaded future: throws if the job
+/// errored, otherwise returns the produced handle.
+fn deliver_outcome(id: i64) -> i64 {
+    let outcome = registry::async_op_result(id);
+    let value: OutcomeValue =
+        registry::take_opaque::<OutcomeValue>(outcome).unwrap_or(Err(String::new()));
+    match value {
+        Ok(handle) => handle,
+        Err(msg) => super::throw_str(msg),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_process_exec(command: i64) -> i64 {
+    let cmd = registry::get_string(command).unwrap_or_default();
+    put_outcome(Box::new(move || exec_blocking(&cmd)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_process_exec_output(command: i64) -> i64 {
+    let cmd = registry::get_string(command).unwrap_or_default();
+    put_outcome(Box::new(move || exec_output_blocking(&cmd)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_process_exec_poll(id: i64) -> i8 {
+    registry::async_op_poll(id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_process_exec_result(id: i64) -> i64 {
+    deliver_outcome(id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_process_exec_output_poll(id: i64) -> i8 {
+    registry::async_op_poll(id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_process_exec_output_result(id: i64) -> i64 {
+    deliver_outcome(id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_process_exec_drop(id: i64) {
+    registry::async_op_drop(id);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_process_exec_output_drop(id: i64) {
+    registry::async_op_drop(id);
+}
+
+/// Owned outcome handed from a process offload job to its reap site.
+pub(crate) type OutcomeValue = Result<i64, String>;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_process_pid() -> i64 {
@@ -199,5 +289,36 @@ mod tests {
     #[test]
     fn test_join_unknown_thread_returns_zero() {
         assert_eq!(ntsc_process_thread_join(999999), 0);
+    }
+
+    #[test]
+    fn test_async_exec_offloads_to_pool() {
+        let fut = ntsc_async_process_exec(put("echo offloaded-value >/dev/null"));
+        let mut spins = 0;
+        while ntsc_async_process_exec_poll(fut) == 0 {
+            spins += 1;
+            assert!(spins < 10_000, "offloaded exec never completed");
+            std::thread::yield_now();
+        }
+        let code = ntsc_async_process_exec_result(fut);
+        ntsc_async_process_exec_drop(fut);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_async_exec_output_offloads_to_pool() {
+        let fut = ntsc_async_process_exec_output(put("printf async-offload-stdout"));
+        let mut spins = 0;
+        while ntsc_async_process_exec_output_poll(fut) == 0 {
+            spins += 1;
+            assert!(spins < 10_000, "offloaded exec_output never completed");
+            std::thread::yield_now();
+        }
+        let json = ntsc_async_process_exec_output_result(fut);
+        ntsc_async_process_exec_output_drop(fut);
+        assert!(
+            read(json).contains("\"stdout\":\"async-offload-stdout\""),
+            "unexpected exec_output result"
+        );
     }
 }

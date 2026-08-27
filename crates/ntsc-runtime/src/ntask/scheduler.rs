@@ -17,7 +17,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use super::core::{self, ChanOp, Goroutine, Park};
@@ -27,6 +27,18 @@ use crate::registry::NULL;
 /// empty; every path that makes a goroutine runnable notifies it.
 pub(crate) static SIGNAL: LazyLock<(Mutex<()>, Condvar)> =
     LazyLock::new(|| (Mutex::new(()), Condvar::new()));
+
+/// A blocking job handed to the bounded offload pool: run to completion on a
+/// standalone thread so a scheduler worker is never blocked on I/O or a
+/// child process.
+type OffloadJob = Box<dyn FnOnce() + Send>;
+
+static OFFLOADING: AtomicBool = AtomicBool::new(false);
+static OFFLOAD_STOP: AtomicBool = AtomicBool::new(false);
+static OFFLOAD_SEND: LazyLock<Mutex<Option<mpsc::Sender<OffloadJob>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static OFFLOAD_THREADS: LazyLock<Mutex<Vec<JoinHandle<()>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -71,6 +83,72 @@ pub(crate) fn start() {
             workers.push(worker);
         }
     }
+}
+
+/// Start the bounded offload pool. Idempotent. A small, fixed number of
+/// standalone threads run blocking jobs (`process.exec*`, socket transfers)
+/// so a scheduler worker is never blocked on I/O or a child process. Bound
+/// the count so runaway children cannot exhaust threads.
+fn start_offload_pool() {
+    if OFFLOADING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    OFFLOAD_STOP.store(false, Ordering::Relaxed);
+    let count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 8);
+    let (tx, rx) = mpsc::channel::<OffloadJob>();
+    *OFFLOAD_SEND.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    let rx = Arc::new(Mutex::new(rx));
+    let mut threads = OFFLOAD_THREADS.lock().unwrap_or_else(|p| p.into_inner());
+    for index in 0..count {
+        let rx = Arc::clone(&rx);
+        if let Ok(handle) = std::thread::Builder::new()
+            .name(format!("ntask-offload-{index}"))
+            .spawn(move || offload_worker(rx))
+        {
+            threads.push(handle);
+        }
+    }
+}
+
+/// A single offload-pool worker: pull jobs off the queue and run them to
+/// completion.
+fn offload_worker(rx: Arc<Mutex<mpsc::Receiver<OffloadJob>>>) {
+    loop {
+        let job = {
+            let Ok(rx) = rx.lock() else {
+                return;
+            };
+            match rx.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            }
+        };
+        job();
+        if OFFLOAD_STOP.load(Ordering::Relaxed) {
+            return;
+        }
+    }
+}
+
+/// Enqueue a blocking job onto the offload pool. It runs on a standalone
+/// thread; the caller registers an op, submits a job that completes it, and
+/// parks the current goroutine on it.
+pub(crate) fn run_offload(job: impl FnOnce() + Send + 'static) {
+    start_offload_pool();
+    let send = OFFLOAD_SEND.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(tx) = send.as_ref() {
+        let _ = tx.send(Box::new(job));
+    }
+}
+
+/// Park the current goroutine on an already-registered offloaded job
+/// (used by the reactive future poll path, which registers the op itself so a
+/// worker can complete it with the future's result).
+pub(crate) fn park_op(core_id: i64) {
+    park_self(Park::Job { core: core_id });
 }
 
 /// Spawn a goroutine running `poll` over the future `future`; returns its id.
@@ -276,6 +354,18 @@ fn drive(gid: i64) {
             return;
         }
         Park::Join { target } => woke = join_park(&mut g, gid, target),
+        Park::Job { core } => {
+            let done = g.ops.get_mut(&core).map(|op| op.done).unwrap_or(false);
+            if done {
+                // The offload pool already finished it; the goroutine resumes
+                // to reap the result on its next poll.
+                requeue_local = true;
+            } else if let Some(op) = g.ops.get_mut(&core) {
+                op.waiter = Some(gid);
+            } else {
+                requeue_local = true;
+            }
+        }
     }
     drop(g);
     if requeue_local {
@@ -600,9 +690,37 @@ pub(crate) fn shutdown() {
         let _ = r.join();
     }
     super::reactor::reset();
+    // Stop and join the offload pool: flag the workers and wake them with a
+    // sentinel job each so they exit their blocking `recv`.
+    if OFFLOADING.load(Ordering::SeqCst) {
+        OFFLOAD_STOP.store(true, Ordering::Relaxed);
+        let count = OFFLOAD_THREADS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        let send = OFFLOAD_SEND.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(tx) = send.as_ref() {
+            for _ in 0..count {
+                let _ = tx.send(Box::new(|| {}));
+            }
+        }
+        drop(send);
+        let offload: Vec<_> =
+            std::mem::take(&mut *OFFLOAD_THREADS.lock().unwrap_or_else(|p| p.into_inner()));
+        for handle in offload {
+            let _ = handle.join();
+        }
+        OFFLOAD_SEND
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        OFFLOADING.store(false, Ordering::SeqCst);
+        OFFLOAD_STOP.store(false, Ordering::Relaxed);
+    }
     let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
     g.ready.clear();
     g.timers.clear();
+    g.ops.clear();
     drop(g);
     QUEUES.lock().unwrap_or_else(|p| p.into_inner()).clear();
     SHUTDOWN.store(false, Ordering::Relaxed);
@@ -614,12 +732,17 @@ pub(crate) fn register_reactor_handle(handle: JoinHandle<()>) {
 }
 
 // Re-exported for the ABI layer.
+pub(crate) use core::complete_op;
 pub(crate) use core::drop_chan;
 pub(crate) use core::drop_goroutine;
 pub(crate) use core::drop_io;
+pub(crate) use core::drop_op;
 pub(crate) use core::io_ready;
+pub(crate) use core::op_done;
+pub(crate) use core::op_result;
 pub(crate) use core::register_chan;
 pub(crate) use core::register_io;
+pub(crate) use core::register_op;
 
 pub(crate) fn wake_workers_all() {
     notify_all();

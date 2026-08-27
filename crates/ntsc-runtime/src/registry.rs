@@ -124,6 +124,17 @@ pub(crate) enum Handle {
     /// An asynchronous I/O future associated with a reactor core.
     AsyncIo { core: i64 },
 
+    /// An offloaded blocking future (sync `http.*`/`process.*` run on the
+    /// worker pool): `state` 0 = not started, 1 = awaiting an offloaded job,
+    /// 2 = done, holding the reaped result handle. The `work` closure runs
+    /// the blocking operation on the pool and completes the op it started.
+    AsyncOp {
+        state: i32,
+        work: Option<Box<dyn FnOnce() -> i64 + Send + 'static>>,
+        op: i64,
+        result: i64,
+    },
+
     /// An opaque value owned by a stdlib module (files, sockets,
     /// channels...).
     Opaque(Box<dyn Any + Send>),
@@ -553,6 +564,7 @@ pub(crate) fn live_entries() -> Vec<LeakEntry> {
                 Handle::Chan { .. } => "channel",
                 Handle::ReactorReg { .. } => "reactor registration",
                 Handle::AsyncIo { .. } => "async io future",
+                Handle::AsyncOp { .. } => "offloaded future",
                 Handle::Opaque(_) => "opaque",
                 Handle::Memory(_) => "pointer capability",
                 Handle::Slice(_) => "slice",
@@ -1305,6 +1317,99 @@ fn remove_kind(id: i64, predicate: impl FnOnce(&Handle) -> bool) -> Option<Handl
         None
     }
 }
+
+// ── Offloaded blocking futures ──────────────────────────────────────────
+
+/// Register an offloaded-blocking future that runs `work` on the worker pool
+/// and yields its result handle. Returns the future handle.
+pub(crate) fn async_op_new(work: Box<dyn FnOnce() -> i64 + Send + 'static>) -> i64 {
+    insert(Handle::AsyncOp {
+        state: 0,
+        work: Some(work),
+        op: 0,
+        result: NULL,
+    })
+}
+
+/// Poll an offloaded future: on the first poll it starts the job on the pool
+/// and parks the goroutine; once the pool completes the job it reaps the
+/// result and reports readiness. All scheduler calls happen outside the
+/// registry lock to avoid a lock-ordering inversion with the task core.
+pub(crate) fn async_op_poll(id: i64) -> i8 {
+    let start_work: Option<Box<dyn FnOnce() -> i64 + Send + 'static>> =
+        lock().get_mut(&id).and_then(|handle| match handle {
+            Handle::AsyncOp { state: 0, work, .. } => work.take(),
+            _ => None,
+        });
+    if let Some(work) = start_work {
+        let op_id = crate::ntask::scheduler::register_op();
+        crate::ntask::scheduler::run_offload(move || {
+            let value = work();
+            crate::ntask::scheduler::complete_op(op_id, value);
+        });
+        if let Some(handle) = lock().get_mut(&id)
+            && let Handle::AsyncOp { state, op, .. } = handle
+        {
+            *state = 1;
+            *op = op_id;
+        }
+        crate::ntask::scheduler::park_op(op_id);
+        return 0;
+    }
+
+    let op = lock().get(&id).and_then(|handle| match handle {
+        Handle::AsyncOp { state: 1, op, .. } => Some(*op),
+        _ => None,
+    });
+    if let Some(op) = op {
+        if !crate::ntask::scheduler::op_done(op) {
+            crate::ntask::scheduler::park_op(op);
+            return 0;
+        }
+        let value = crate::ntask::scheduler::op_result(op);
+        if let Some(handle) = lock().get_mut(&id)
+            && let Handle::AsyncOp { state, result, .. } = handle
+        {
+            *state = 2;
+            *result = value;
+        }
+    }
+    1
+}
+
+/// Reap the result handle of a completed offloaded future.
+pub(crate) fn async_op_result(id: i64) -> i64 {
+    if id == NULL {
+        return NULL;
+    }
+    lock()
+        .get(&id)
+        .map(|handle| match handle {
+            Handle::AsyncOp {
+                state: 2, result, ..
+            } => *result,
+            _ => NULL,
+        })
+        .unwrap_or(NULL)
+}
+
+/// Drop an offloaded future. If it is still running, its pending op is
+/// dropped; a completed result handle is left for the caller to reap.
+pub(crate) fn async_op_drop(id: i64) {
+    if id == NULL {
+        return;
+    }
+    let pending_op = lock().get(&id).and_then(|handle| match handle {
+        Handle::AsyncOp { state: 1, op, .. } if *op != 0 => Some(*op),
+        _ => None,
+    });
+    if let Some(op) = pending_op {
+        crate::ntask::scheduler::drop_op(op);
+    }
+    let _ = remove_kind(id, |handle| matches!(handle, Handle::AsyncOp { .. }));
+}
+
+// ── Goroutine handles ───────────────────────────────────────────────────
 
 /// Drop a scheduled goroutine handle and its task core.
 pub(crate) fn goroutine_drop(id: i64) {

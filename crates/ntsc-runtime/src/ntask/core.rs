@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 
-use crate::registry;
+use crate::registry::{self, NULL};
 
 /// A poll function for one async future. Returns `1` when the future
 /// completed, `0` when it is still pending. See [`crate::AsyncPollFn`].
@@ -33,6 +33,9 @@ pub(crate) enum Park {
     Fd { io: i64, read: bool },
     /// Wait until a sibling goroutine completes.
     Join { target: i64 },
+    /// Wait until an external worker thread completes an offloaded blocking
+    /// job (see [`AsyncOp`]). The result handle is stored on the goroutine.
+    Job { core: i64 },
 }
 
 /// Direction of a channel operation a parked goroutine wants to perform.
@@ -109,6 +112,20 @@ pub(crate) struct AsyncIo {
     pub(crate) waiters: Vec<i64>,
 }
 
+/// An offloaded blocking job. A goroutine parks on it while a worker-thread
+/// (the bounded offload pool) runs the blocking work; that thread completes
+/// the op, waking the parked goroutine. This is how a scheduler thread stays
+/// free while a child process runs or a blocking socket transfer happens.
+#[derive(Debug)]
+pub(crate) struct AsyncOp {
+    /// The goroutine parked waiting for completion, if any.
+    pub(crate) waiter: Option<i64>,
+    /// The result handle once the job finished, or `NULL`.
+    pub(crate) result: i64,
+    /// Whether the worker finished the job.
+    pub(crate) done: bool,
+}
+
 /// The global scheduling + parking state, guarded by one mutex.
 pub(crate) struct Global {
     pub(crate) next_core: i64,
@@ -119,6 +136,8 @@ pub(crate) struct Global {
     pub(crate) goroutines: std::collections::HashMap<i64, Goroutine>,
     pub(crate) chans: std::collections::HashMap<i64, Chan>,
     pub(crate) ios: std::collections::HashMap<i64, AsyncIo>,
+    /// Offloaded blocking jobs not yet completed (or awaiting a reader).
+    pub(crate) ops: std::collections::HashMap<i64, AsyncOp>,
     /// wall-clock ms deadline -> woken goroutine ids.
     pub(crate) timers: std::collections::BTreeMap<i64, Vec<i64>>,
 }
@@ -130,6 +149,7 @@ pub(crate) static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| {
         goroutines: std::collections::HashMap::new(),
         chans: std::collections::HashMap::new(),
         ios: std::collections::HashMap::new(),
+        ops: std::collections::HashMap::new(),
         timers: std::collections::BTreeMap::new(),
     })
 });
@@ -214,4 +234,76 @@ pub(crate) fn io_ready(core: i64) -> bool {
         return false;
     };
     std::mem::take(&mut io.ready)
+}
+
+/// Reserve a fresh offloaded-job id. The caller enqueues the blocking work
+/// on the offload pool and parks the calling goroutine on it. See
+/// [`crate::ntask::scheduler::offload_start`] and
+/// [`crate::ntask::scheduler::complete_job`].
+pub(crate) fn register_op() -> i64 {
+    let id = alloc_core();
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    guard.ops.insert(
+        id,
+        AsyncOp {
+            waiter: None,
+            result: NULL,
+            done: false,
+        },
+    );
+    id
+}
+
+/// Mark an offloaded job done with `result`. Callable from any thread
+/// (typically a worker on the offload pool); wakes the parked goroutine, if
+/// any.
+pub(crate) fn complete_op(core: i64, result: i64) {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(op) = guard.ops.get_mut(&core) else {
+        return;
+    };
+    op.result = result;
+    op.done = true;
+    let waiter = op.waiter.take();
+    if let Some(gid) = waiter {
+        guard.ready.push_back(gid);
+    }
+    drop(guard);
+    if waiter.is_some() {
+        crate::ntask::scheduler::notify_all();
+    }
+}
+
+/// Take the result handle of a completed offloaded job, removing it from the
+/// table. Ownership of the handle transfers to the caller. Returns `NULL`
+/// for an unknown or not-yet-completed job.
+pub(crate) fn op_result(core: i64) -> i64 {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(op) = guard.ops.remove(&core) else {
+        return NULL;
+    };
+    op.result
+}
+
+/// `1` when the offloaded job is already done, `0` otherwise (or unknown).
+pub(crate) fn op_done(core: i64) -> bool {
+    GLOBAL
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ops
+        .get(&core)
+        .map(|op| op.done)
+        .unwrap_or(false)
+}
+
+/// Drop an offloaded job that will never be reaped (e.g. its future was
+/// dropped mid-flight), releasing the result handle if one arrived.
+pub(crate) fn drop_op(core: i64) {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(op) = guard.ops.remove(&core)
+        && op.done
+        && op.result != NULL
+    {
+        let _ = registry::remove(op.result);
+    }
 }

@@ -644,6 +644,34 @@ pub extern "C" fn ntsc_async_sleep_poll(id: i64) -> i8 {
     registry::async_sleep_poll(id)
 }
 
+/// Register an offloaded-blocking future: `work(arg)` runs on the worker pool
+/// and its result handle is yielded once the job completes. Returns the
+/// future handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_op_new(work: extern "C" fn(i64) -> i64, arg: i64) -> i64 {
+    registry::async_op_new(Box::new(move || work(arg)))
+}
+
+/// Poll an offloaded-blocking future. The first poll starts the job on the
+/// pool and parks the goroutine; returns `1` once the job is done and its
+/// result is available via [`ntsc_async_op_result`].
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_op_poll(id: i64) -> i8 {
+    registry::async_op_poll(id)
+}
+
+/// Reap the result handle of a completed offloaded future.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_op_result(id: i64) -> i64 {
+    registry::async_op_result(id)
+}
+
+/// Drop an offloaded-blocking future handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_op_drop(id: i64) {
+    registry::async_op_drop(id);
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Virtual-task scheduler ABI
 // ══════════════════════════════════════════════════════════════════════════
@@ -1325,6 +1353,39 @@ mod tests {
     }
 
     #[test]
+    fn offload_future_parks_goroutine_until_pool_finishes() {
+        // Foreign-future await pattern: the goroutine polls the offloaded
+        // future; while the job runs on the pool its worker is parked and
+        // gives way to other work, then resumes when the pool finishes.
+        use super::modules::process::{
+            ntsc_async_process_exec, ntsc_async_process_exec_drop, ntsc_async_process_exec_poll,
+            ntsc_async_process_exec_result,
+        };
+
+        extern "C" fn drive_offload(id: i64) -> i8 {
+            let fut = registry::with_opaque(id, |s: &(i64, i64)| s.0).unwrap();
+            if ntsc_async_process_exec_poll(fut) == 1 {
+                let code = ntsc_async_process_exec_result(fut);
+                registry::with_opaque_mut(id, |s: &mut (i64, i64)| *s = (fut, code));
+                ntsc_async_process_exec_drop(fut);
+                1
+            } else {
+                0
+            }
+        }
+
+        let fut = ntsc_async_process_exec(registry::put_string("exit 0".to_string()));
+        let state = registry::put_opaque((fut, 0i64));
+        let task = ntask_go(drive_offload, state);
+        assert_ne!(task, NULL);
+        let _ = ntask_join(task);
+        let (_, code) = registry::with_opaque(state, |s: &(i64, i64)| *s).unwrap();
+        assert_eq!(code, 0);
+        ntask_goroutine_drop(task);
+        let _ = registry::take_opaque::<(i64, i64)>(state);
+    }
+
+    #[test]
     fn reactor_handle_lifecycle_is_kind_checked() {
         let timer = ntask_timer_new();
         let io = ntask_io_new();
@@ -1470,7 +1531,11 @@ mod tests {
         assert_eq!(ntsc_exception_pending(), 0);
         let task = ntask_go(throw_boom, NULL);
         let _ = ntask_join(task);
-        assert_eq!(ntsc_exception_pending(), 1, "join must re-raise on the caller");
+        assert_eq!(
+            ntsc_exception_pending(),
+            1,
+            "join must re-raise on the caller"
+        );
         let message = ntsc_exception_take_message();
         let text = registry::get_string(message).unwrap_or_default();
         ntsc_string_drop(message);
