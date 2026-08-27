@@ -961,14 +961,14 @@ fn emit_propagate<'ctx>(
     // Ok path: extract the payload for the caller of this expression.
     fn_ctx.builder.position_at_end(ok_bb);
     let loaded = load_result_payload(fn_ctx, cell, true, &operand_ok)?;
-    let payload = TypedValue::new(loaded, operand_ok);
+    let payload = TypedValue::new(loaded, operand_ok.clone());
     let payload = if fresh {
         free_result_cell(fn_ctx, cell)?;
         payload
     } else {
         emit_copy_value(fn_ctx, payload)?
     };
-    let ok_payload = coerce_value(fn_ctx, payload, &fn_ok)?;
+    let ok_payload = payload;
     fn_ctx.builder.build_unconditional_branch(merge_bb)?;
 
     // Err path: re-box the error as this function's own result and return it.
@@ -994,7 +994,7 @@ fn emit_propagate<'ctx>(
     fn_ctx.builder.build_return(Some(&boxed.value))?;
 
     fn_ctx.builder.position_at_end(merge_bb);
-    Ok(TypedValue::new(ok_payload.value, fn_ok))
+    Ok(TypedValue::new(ok_payload.value, operand_ok))
 }
 
 /// Evaluate a pointer-typed operand and yield its address plus the pointee

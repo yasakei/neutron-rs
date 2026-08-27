@@ -1802,10 +1802,10 @@ impl TypeChecker {
                                     span: *question_span,
                                 });
                             }
-                            // The propagated expression yields the Ok
+                            // The propagated expression yields the operand's Ok
                             // payload; only an early Err return carries the
                             // function's result shape.
-                            Some(*fn_ok)
+                            Some(*ok)
                         }
                         Some(other) => {
                             self.errors.push(TypeError {

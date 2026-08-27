@@ -219,35 +219,38 @@ pub(crate) fn emit_variable<'ctx>(
         ));
     }
 
-    match name_str {
-        // Standard library modules are represented as opaque objects.
-        "math" | "fmt" | "time" | "sys" | "strings" | "json" | "http" | "crypto"
-        | "collections" | "regex" | "arrays" | "process" | "csv" | "toml" | "yaml" => {
-            return Ok(TypedValue::new(
-                fn_ctx
-                    .context
-                    .ptr_type(AddressSpace::default())
-                    .const_null()
-                    .into(),
-                Ty::Object,
-            ));
-        }
-        _ => {}
-    }
-
     match fn_ctx.lookup_var(name_str) {
         Some((ptr, ty)) => {
             let llvm_ty = ty_to_llvm(ty, fn_ctx.context);
             let loaded = fn_ctx.builder.build_load(llvm_ty, ptr, name_str)?;
             Ok(TypedValue::new(loaded, ty.clone()))
         }
-        None => match emit_static_const_variable(fn_ctx, name_str)? {
-            Some(value) => Ok(value),
-            None => match enum_value_expression(name_str, fn_ctx) {
-                Ok(value) => Ok(value),
-                Err(err) => function_reference(fn_ctx, name_str).ok_or(err),
-            },
-        },
+        None => {
+            // Standard library modules are represented as opaque objects.
+            // Only when no local variable shadows the module name.
+            match name_str {
+                "math" | "fmt" | "time" | "sys" | "strings" | "json" | "http" | "crypto"
+                | "collections" | "regex" | "arrays" | "process" | "csv" | "toml" | "yaml" => {
+                    return Ok(TypedValue::new(
+                        fn_ctx
+                            .context
+                            .ptr_type(AddressSpace::default())
+                            .const_null()
+                            .into(),
+                        Ty::Object,
+                    ));
+                }
+                _ => {}
+            }
+
+            match emit_static_const_variable(fn_ctx, name_str)? {
+                Some(value) => Ok(value),
+                None => match enum_value_expression(name_str, fn_ctx) {
+                    Ok(value) => Ok(value),
+                    Err(err) => function_reference(fn_ctx, name_str).ok_or(err),
+                },
+            }
+        }
     }
 }
 

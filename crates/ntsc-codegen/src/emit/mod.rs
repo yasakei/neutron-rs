@@ -418,10 +418,8 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
         // `mem2reg` turns the pre-store load into poison and the drop
         // thunk's null check can fold either way, freeing garbage handles.
         if ty_is_owned_handle(ty) {
-            self.entry_builder.build_store(
-                slot,
-                self.context.ptr_type(AddressSpace::default()).const_null(),
-            )?;
+            let zero = default_llvm_value(ty, self.context);
+            self.entry_builder.build_store(slot, zero)?;
         }
         Ok(slot)
     }
@@ -561,10 +559,9 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
                     | Ty::Result { .. }
             )
         {
-            let _ = self.builder.build_store(
-                ptr,
-                self.context.ptr_type(AddressSpace::default()).const_null(),
-            );
+            let _ = self
+                .builder
+                .build_store(ptr, default_llvm_value(ty, self.context));
         }
     }
 }
