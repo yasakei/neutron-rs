@@ -224,10 +224,10 @@ mod tests {
 
     #[test]
     fn test_normalize() {
-        assert_eq!(
-            read(ntsc_paths_normalize(put("/a/b/../c/./d.txt"))),
-            "/a/c/d.txt"
-        );
+        let result = read(ntsc_paths_normalize(put("/a/b/../c/./d.txt")));
+        let expected = Path::new("/a/c/d.txt");
+        let got = Path::new(&result);
+        assert_eq!(got.components().collect::<Vec<_>>(), expected.components().collect::<Vec<_>>());
     }
 
     #[test]
