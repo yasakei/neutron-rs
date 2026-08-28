@@ -842,6 +842,29 @@ fn stmt_byte_range(stmt: &Stmt) -> (usize, usize) {
             }
             acc
         }
+        ChanRecvFor {
+            variable,
+            channel,
+            body,
+        } => {
+            acc = add_span(variable.span, acc);
+            acc = add_expr(channel, acc);
+            add_sub(body, acc)
+        }
+        Go {
+            call,
+            block,
+            keyword_span,
+        } => {
+            acc = add_span(*keyword_span, acc);
+            acc = add_expr(call, acc);
+            if let Some(block) = block {
+                for s in block {
+                    acc = add_sub(s, acc);
+                }
+            }
+            acc
+        }
     };
 
     if acc.0 == usize::MAX { (0, 0) } else { acc }

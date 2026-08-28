@@ -334,6 +334,27 @@ impl Linter {
             | Stmt::TypeAlias { .. }
             | Stmt::Trait { .. }
             | Stmt::Impl { .. } => {}
+            Stmt::ChanRecvFor {
+                variable,
+                channel,
+                body,
+            } => {
+                self.check_expr(channel);
+                self.scopes.push(HashMap::new());
+                self.declare(variable.lexeme(), variable.span);
+                self.check_stmt(body);
+                self.end_scope();
+            }
+            Stmt::Go { call, block, .. } => {
+                self.check_expr(call);
+                if let Some(block) = block {
+                    self.scopes.push(HashMap::new());
+                    for statement in block {
+                        self.check_stmt(statement);
+                    }
+                    self.end_scope();
+                }
+            }
         }
     }
 
@@ -456,6 +477,17 @@ impl Linter {
             Expr::TupleIndex { object, .. } => {
                 self.check_expr(object);
             }
+            Expr::ChanSend { channel, value, .. } => {
+                self.check_expr(channel);
+                self.check_expr(value);
+            }
+            Expr::ChanRecv {
+                receiver, channel, ..
+            } => {
+                self.declare(receiver.lexeme(), receiver.span);
+                self.check_expr(channel);
+            }
+            Expr::Close { channel, .. } => self.check_expr(channel),
         }
     }
 }

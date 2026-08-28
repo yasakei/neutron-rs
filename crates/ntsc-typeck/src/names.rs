@@ -203,6 +203,27 @@ impl Resolver {
                     resolver.resolve_statement(body);
                 });
             }
+            Stmt::ChanRecvFor {
+                variable,
+                channel,
+                body,
+            } => {
+                self.resolve_expression(channel);
+                self.in_scope(|resolver| {
+                    resolver.define(variable.lexeme(), variable.span);
+                    resolver.resolve_statement(body);
+                });
+            }
+            Stmt::Go { call, block, .. } => {
+                self.resolve_expression(call);
+                if let Some(block) = block {
+                    self.in_scope(|resolver| {
+                        for statement in block {
+                            resolver.resolve_statement(statement);
+                        }
+                    });
+                }
+            }
             Stmt::Function { params, body, .. } => self.resolve_function(params, body),
             Stmt::AsyncFunction { params, body, .. } => self.resolve_function(params, body),
             Stmt::Test { body, .. } => self.resolve_function(&[], body),
@@ -414,6 +435,17 @@ impl Resolver {
                     self.resolve_statement(stmt);
                 }
             }
+            Expr::ChanSend { channel, value, .. } => {
+                self.resolve_expression(channel);
+                self.resolve_expression(value);
+            }
+            Expr::ChanRecv {
+                receiver, channel, ..
+            } => {
+                self.resolve_expression(channel);
+                self.define(receiver.lexeme(), receiver.span);
+            }
+            Expr::Close { channel, .. } => self.resolve_expression(channel),
             Expr::Member { object, .. } | Expr::OptionalMember { object, .. } => {
                 self.resolve_expression(object);
             }

@@ -428,6 +428,11 @@ pub(crate) fn emit_statement_in_function<'ctx>(
         | Stmt::Test { .. }
         | Stmt::Trait { .. }
         | Stmt::Impl { .. } => {}
+        Stmt::ChanRecvFor { .. } | Stmt::Go { .. } => {
+            return Err(crate::CodegenError::LLVMError(
+                "goroutines and channels are not yet supported by code generation".into(),
+            ));
+        }
     }
     Ok(())
 }

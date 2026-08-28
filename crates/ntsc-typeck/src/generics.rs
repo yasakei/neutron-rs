@@ -640,6 +640,7 @@ fn annotation_to_ty(annotation: &TypeAnnotation) -> crate::Ty {
         TypeAnnotation::ImplTrait(_) => Ty::Any,
         TypeAnnotation::Dyn(token) => Ty::Dyn(token.lexeme().to_string()),
         TypeAnnotation::Tuple(types) => Ty::Tuple(types.iter().map(annotation_to_ty).collect()),
+        TypeAnnotation::Chan(inner) => Ty::Chan(Box::new(annotation_to_ty(inner))),
     }
 }
 

@@ -128,6 +128,11 @@ pub(crate) fn expr_mentions_var(expr: &Expr, var: &str) -> bool {
         }
         Expr::TupleLiteral { elements, .. } => elements.iter().any(|e| expr_mentions_var(e, var)),
         Expr::TupleIndex { object, .. } => expr_mentions_var(object, var),
+        Expr::ChanSend { channel, value, .. } => {
+            expr_mentions_var(channel, var) || expr_mentions_var(value, var)
+        }
+        Expr::ChanRecv { channel, .. } => expr_mentions_var(channel, var),
+        Expr::Close { channel, .. } => expr_mentions_var(channel, var),
     }
 }
 
@@ -232,6 +237,15 @@ pub(crate) fn stmt_mentions_var(stmt: &Stmt, var: &str) -> bool {
         Stmt::Quiet { body, .. } => stmt_mentions_var(body, var),
         Stmt::Destructure { initializer, .. } => expr_mentions_var(initializer, var),
         Stmt::TypeAlias { .. } => false,
+        Stmt::ChanRecvFor { channel, body, .. } => {
+            expr_mentions_var(channel, var) || stmt_mentions_var(body, var)
+        }
+        Stmt::Go { call, block, .. } => {
+            expr_mentions_var(call, var)
+                || block
+                    .as_ref()
+                    .is_some_and(|stmts| stmts.iter().any(|s| stmt_mentions_var(s, var)))
+        }
     }
 }
 
@@ -383,6 +397,9 @@ pub(crate) fn expr_uses_var_safely(expr: &Expr, var: &str, ctx: ExprCtx, kind: E
             .iter()
             .any(|e| expr_uses_var_safely(e, var, ExprCtx::Data, kind)),
         Expr::TupleIndex { object, .. } => expr_uses_var_safely(object, var, ExprCtx::Base, kind),
+        // Channel operations are not yet supported by codegen; conservatively
+        // refuse to classify them as safe.
+        Expr::ChanSend { .. } | Expr::ChanRecv { .. } | Expr::Close { .. } => false,
     }
 }
 
@@ -537,6 +554,9 @@ pub(crate) fn stmt_uses_var_safely(stmt: &Stmt, var: &str, kind: EscapeKind) -> 
         Stmt::Destructure { initializer, .. } => {
             expr_uses_var_safely(initializer, var, ExprCtx::Data, kind)
         }
+        // Goroutines and channel iteration are not yet supported by codegen;
+        // conservatively refuse to classify them as safe.
+        Stmt::ChanRecvFor { .. } | Stmt::Go { .. } => false,
     }
 }
 

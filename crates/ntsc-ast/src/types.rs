@@ -62,6 +62,11 @@ pub enum TypeAnnotation {
 
     /// `(T1, T2, ...)` — a fixed-size, heterogeneous product type.
     Tuple(Vec<TypeAnnotation>),
+
+    /// `chan[T]` — a virtual-task channel carrying elements of type `T`.
+    /// Send moves the value in; receive moves it out. It is the communication
+    /// primitive for goroutines.
+    Chan(Box<TypeAnnotation>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +130,7 @@ impl TypeAnnotation {
             Self::ImplTrait(_) => "impl trait",
             Self::Dyn(_) => "dyn trait",
             Self::Tuple(_) => "tuple",
+            Self::Chan(_) => "chan",
         }
     }
 }

@@ -36,6 +36,38 @@ pub(crate) struct AwaitInfo {
     child_result_index: u32,
 }
 
+/// The kind of a channel suspension point (a channel send or receive that
+/// parks the goroutine like an `await`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChanOpKind {
+    Send,
+    Recv,
+}
+
+/// A single suspension point in the unified state ordering, indexed by its
+/// position (segment ordinal). The await/chan indices reference the
+/// `await_infos`/`chan_infos` lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuspKind {
+    Await(usize),
+    Chan(usize),
+}
+
+/// One channel send/receive suspension point in an async body.
+///
+/// Like `await`, channel ops are recognised only at the top level (statement
+/// boundary, variable initializer, or return value). They park the running
+/// goroutine: `ntask_chan_send`/`ntask_chan_recv` set the goroutine's park
+/// state and the poll returns 0; on resume the goroutine's channel op has
+/// been completed by the scheduler. A receive reads its result through
+/// `ntask_chan_recv_result`.
+pub(crate) struct ChanInfo {
+    stmt_idx: usize,
+    op: ChanOpKind,
+    /// Coercion target type for a receive (`Ty::Void` for a send).
+    recv_ty: Ty,
+}
+
 /// Pre-analyzed layout of a single async function's future struct.
 ///
 /// Field order is fixed and ABI-relevant: `state` (0) | params | `result`
@@ -52,6 +84,21 @@ pub(crate) struct AsyncLayout {
     /// Index of the first sub-future slot (after params, result, and locals).
     sub_field_base: u32,
     await_infos: Vec<AwaitInfo>,
+    /// Channel send/receive suspension points, in top-level statement order.
+    chan_infos: Vec<ChanInfo>,
+    /// The suspend-state index (segment ordinal) for each `await_infos` entry.
+    /// These and the channel points partition the state range
+    /// `1..=suspension_count` in statement order; the segment splitter and
+    /// the poll switch both key off this unified ordering.
+    await_state_index: Vec<u32>,
+    /// The suspend-state index (segment ordinal) for each `chan_infos` entry.
+    chan_state_index: Vec<u32>,
+    /// Total suspension points (awaits + channel ops); the done state is
+    /// `suspension_count + 1`, and there are `suspension_count + 1` segments.
+    suspension_count: u32,
+    /// The suspension points in statement order; position i is segment i's
+    /// resume dispatch and carries state index i.
+    susp_order: Vec<SuspKind>,
     ret_ty: Ty,
 
     /// Anonymous async blocks compiled as part of this layout. Maps the
@@ -209,6 +256,16 @@ pub(crate) fn collect_async_locals(
             }
         }
         Stmt::Function { .. } | Stmt::AsyncFunction { .. } => {}
+        Stmt::Expression {
+            expression: Expr::ChanRecv { receiver, .. },
+            ..
+        } => {
+            // A `v |> ch` receive binds its receiver as a fresh local; type it
+            // as `Any` for the field slot (receivers hold ints or owned
+            // handles, both i64), with the precise element type supplied to
+            // `define_var` on resume from the typeck registry.
+            add(receiver.lexeme(), Ty::Any, fields);
+        }
         _ => {}
     }
 }
@@ -269,8 +326,15 @@ pub(crate) fn build_async_layout(
     let sub_field_base = field_names.len() as u32;
 
     let mut await_infos = Vec::new();
+    let mut await_state_index = Vec::new();
+    let mut chan_infos = Vec::new();
     let mut anon_async_blocks = Vec::new();
     let mut anon_counter = 0usize;
+    // Every suspension point (await or channel op) gets a distinct state index
+    // equal to its 1-based ordinal in top-level statement order, shared by the
+    // poll switch, the segment splitter, and the suspend/resume logic.
+    let mut suspension_points = 0u32;
+    let mut recv_index = 0usize;
     for (stmt_idx, stmt) in body.iter().enumerate() {
         let is_await_statement = matches!(
             stmt,
@@ -307,12 +371,23 @@ pub(crate) fn build_async_layout(
             } else {
                 field_tys.push(AsyncFieldTy::Future(child_name.clone()));
             }
+            await_state_index.push(suspension_points);
+            suspension_points += 1;
             await_infos.push(AwaitInfo {
                 stmt_idx,
                 child_name,
                 child_ret_ty,
                 child_result_index: 1 + child_param_count as u32,
             });
+        } else if let Some((op, recv_ty)) =
+            chan_target_ty(stmt, &ret_ty, name.lexeme(), &mut recv_index)
+        {
+            chan_infos.push(ChanInfo {
+                stmt_idx,
+                op,
+                recv_ty,
+            });
+            suspension_points += 1;
         }
     }
 
@@ -326,6 +401,29 @@ pub(crate) fn build_async_layout(
         &mut block_span_to_name,
     );
 
+    // Merge the await and channel suspension points into a single ordered
+    // list (both are already sorted ascending by `stmt_idx`). Position i is
+    // the resume/suspend dispatch for segment i and carries state index i.
+    let mut susp_order = Vec::with_capacity(suspension_points as usize);
+    let mut chan_state_index = Vec::with_capacity(chan_infos.len());
+    let (mut ai, mut ci) = (0usize, 0usize);
+    while ai < await_infos.len() || ci < chan_infos.len() {
+        let pick_await = match (await_infos.get(ai), chan_infos.get(ci)) {
+            (Some(a), Some(c)) => a.stmt_idx <= c.stmt_idx,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if pick_await {
+            susp_order.push(SuspKind::Await(ai));
+            ai += 1;
+        } else {
+            susp_order.push(SuspKind::Chan(ci));
+            chan_state_index.push(susp_order.len() as u32);
+            ci += 1;
+        }
+    }
+
     Ok(AsyncLayout {
         name: name.lexeme().to_string(),
         field_tys,
@@ -333,6 +431,11 @@ pub(crate) fn build_async_layout(
         result_index,
         sub_field_base,
         await_infos,
+        chan_infos,
+        await_state_index,
+        chan_state_index,
+        suspension_count: suspension_points,
+        susp_order,
         ret_ty,
         anon_async_blocks,
         block_span_to_name,
@@ -705,6 +808,81 @@ pub(crate) fn await_stmt_parts(stmt: &Stmt) -> Result<(&Expr, &[Expr]), crate::C
     }
 }
 
+/// The channel-op kind of a top-level channel suspension statement. Sends
+/// (`ch <| v`) and receives (`v |> ch`) both appear as top-level statement
+/// expressions; the receive's freshly-bound receiver variable is typed from
+/// the element type typeck recorded for the owning function.
+fn chan_target_ty(
+    stmt: &Stmt,
+    _ret_ty: &Ty,
+    fn_name: &str,
+    recv_index: &mut usize,
+) -> Option<(ChanOpKind, Ty)> {
+    match stmt {
+        Stmt::Expression {
+            expression: Expr::ChanSend { .. },
+            ..
+        } => Some((ChanOpKind::Send, Ty::Void)),
+        Stmt::Expression {
+            expression: Expr::ChanRecv { .. },
+            ..
+        } => {
+            let element = ntsc_typeck::chan_receiver_element_types(fn_name)
+                .get(*recv_index)
+                .cloned()
+                .unwrap_or(Ty::Any);
+            *recv_index += 1;
+            Some((ChanOpKind::Recv, element))
+        }
+        _ => None,
+    }
+}
+
+/// The channel operand expression of a channel suspension statement.
+pub(crate) fn chan_stmt_channel(stmt: &Stmt) -> Result<&Expr, crate::CodegenError> {
+    match stmt {
+        Stmt::Expression {
+            expression: Expr::ChanSend { channel, .. },
+            ..
+        }
+        | Stmt::Expression {
+            expression: Expr::ChanRecv { channel, .. },
+            ..
+        } => Ok(channel),
+        _ => Err(crate::CodegenError::LLVMError(
+            "internal: expected a channel suspension statement".into(),
+        )),
+    }
+}
+
+/// The value expression sent by a channel-send suspension statement.
+pub(crate) fn chan_stmt_value(stmt: &Stmt) -> Result<&Expr, crate::CodegenError> {
+    match stmt {
+        Stmt::Expression {
+            expression: Expr::ChanSend { value, .. },
+            ..
+        } => Ok(value),
+        _ => Err(crate::CodegenError::LLVMError(
+            "internal: expected a channel-send statement".into(),
+        )),
+    }
+}
+
+/// The receiver variable of a channel-receive suspension statement.
+pub(crate) fn chan_stmt_receiver(
+    stmt: &Stmt,
+) -> Result<&ntsc_ast::token::Token, crate::CodegenError> {
+    match stmt {
+        Stmt::Expression {
+            expression: Expr::ChanRecv { receiver, .. },
+            ..
+        } => Ok(receiver),
+        _ => Err(crate::CodegenError::LLVMError(
+            "internal: expected a channel-receive statement".into(),
+        )),
+    }
+}
+
 /// Declare the (opaque) future struct type for an async function. Called
 /// for callees before callers so sub-future fields can reference resolved
 /// types.
@@ -885,7 +1063,7 @@ pub(crate) fn emit_async_poll<'ctx>(
     let state_field = builder.build_struct_gep(future_ty, future, 0, "state_ptr")?;
     let state = builder.build_load(context.i32_type(), state_field, "state")?;
 
-    let seg_count = layout.await_infos.len() + 1;
+    let seg_count = (layout.suspension_count as usize) + 1;
     let finish_bb = context.append_basic_block(poll_fn, "finish");
     let fallthrough_bb = context.append_basic_block(poll_fn, "fallthrough");
     let seg_blocks: Vec<_> = (0..seg_count)
@@ -1043,20 +1221,21 @@ pub(crate) fn emit_async_segment<'ctx>(
     seg_blocks: &[inkwell::basic_block::BasicBlock<'ctx>],
     finish_bb: inkwell::basic_block::BasicBlock<'ctx>,
 ) -> Result<(), crate::CodegenError> {
-    let await_infos = &layout.await_infos;
-    let (start, end, resume_await) = if segment_index == 0 {
-        let end = await_infos
+    let (start, end, resume) = if segment_index == 0 {
+        let end = layout
+            .susp_order
             .first()
-            .map(|info| info.stmt_idx)
+            .map(|kind| susp_stmt_idx(layout, kind))
             .unwrap_or(body.len());
         (0, end, None)
     } else {
-        let prev_await = await_infos[segment_index - 1].stmt_idx;
-        let end = await_infos
+        let prev = layout.susp_order[segment_index - 1];
+        let end = layout
+            .susp_order
             .get(segment_index)
-            .map(|info| info.stmt_idx)
+            .map(|kind| susp_stmt_idx(layout, kind))
             .unwrap_or(body.len());
-        (prev_await + 1, end, Some(segment_index - 1))
+        (susp_stmt_idx(layout, &prev) + 1, end, Some(prev))
     };
 
     for (name, index) in &layout.fields {
@@ -1071,8 +1250,15 @@ pub(crate) fn emit_async_segment<'ctx>(
         fn_ctx.define_var(name, ptr, ty);
     }
 
-    if let Some(await_idx) = resume_await {
-        emit_await_resume(fn_ctx, layout, body, await_idx)?;
+    if let Some(kind) = &resume {
+        match kind {
+            SuspKind::Await(await_idx) => {
+                emit_await_resume(fn_ctx, layout, body, *await_idx)?;
+            }
+            SuspKind::Chan(chan_idx) => {
+                emit_chan_resume(fn_ctx, layout, body, *chan_idx)?;
+            }
+        }
     }
 
     for stmt in &body[start..end] {
@@ -1099,8 +1285,15 @@ pub(crate) fn emit_async_segment<'ctx>(
         }
     }
 
-    if segment_index < await_infos.len() {
-        emit_await_suspend(fn_ctx, layout, body, segment_index)?;
+    if let Some(kind) = layout.susp_order.get(segment_index) {
+        match kind {
+            SuspKind::Await(await_idx) => {
+                emit_await_suspend(fn_ctx, layout, body, *await_idx)?;
+            }
+            SuspKind::Chan(chan_idx) => {
+                emit_chan_suspend(fn_ctx, layout, body, *chan_idx)?;
+            }
+        }
     } else if fn_ctx
         .builder
         .get_insert_block()
@@ -1112,6 +1305,14 @@ pub(crate) fn emit_async_segment<'ctx>(
 
     let _ = seg_blocks;
     Ok(())
+}
+
+/// The source statement index of a suspension point in the unified order.
+fn susp_stmt_idx(layout: &AsyncLayout, kind: &SuspKind) -> usize {
+    match kind {
+        SuspKind::Await(i) => layout.await_infos[*i].stmt_idx,
+        SuspKind::Chan(i) => layout.chan_infos[*i].stmt_idx,
+    }
 }
 
 /// Suspend on await `await_idx`: zero the child's future slot, evaluate the
@@ -1176,7 +1377,7 @@ pub(crate) fn emit_await_suspend<'ctx>(
         let next_state = fn_ctx
             .context
             .i32_type()
-            .const_int(1 + await_idx as u64, false);
+            .const_int((layout.await_state_index[await_idx] as u64) + 1, false);
         fn_ctx.builder.build_store(state_ptr, next_state)?;
         fn_ctx
             .builder
@@ -1256,7 +1457,7 @@ pub(crate) fn emit_await_suspend<'ctx>(
     let next_state = fn_ctx
         .context
         .i32_type()
-        .const_int((await_idx as u64) + 1, false);
+        .const_int((layout.await_state_index[await_idx] as u64) + 1, false);
     fn_ctx.builder.build_store(state_ptr, next_state)?;
     fn_ctx
         .builder
@@ -1382,6 +1583,133 @@ pub(crate) fn emit_await_resume<'ctx>(
     Ok(())
 }
 
+/// Suspend on a channel send/receive `chan_idx`: evaluate the channel (and
+/// value), park the goroutine via `ntask_chan_send`/`ntask_chan_recv`, store
+/// the resume state, and return 0. On the next poll the scheduler has
+/// completed the op and `emit_chan_resume` reads any received value.
+pub(crate) fn emit_chan_suspend<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    layout: &AsyncLayout,
+    body: &[Stmt],
+    chan_idx: usize,
+) -> Result<(), crate::CodegenError> {
+    let info = &layout.chan_infos[chan_idx];
+    let stmt = &body[info.stmt_idx];
+    let channel_expr = chan_stmt_channel(stmt)?;
+    let channel = emit_expression(fn_ctx, channel_expr)?;
+    let channel_arg = channel.value.into_int_value();
+
+    let result = match info.op {
+        ChanOpKind::Send => {
+            let value_expr = chan_stmt_value(stmt)?;
+            let value = emit_expression(fn_ctx, value_expr)?;
+            // A send moves the value into the channel: null the source
+            // variable's slot when the value was a named owned handle so the
+            // goroutine's drop path does not double-free it.
+            if let Expr::Variable { name } = value_expr
+                && ty_is_owned_handle(&value.ntsc_type)
+                && let Some((ptr, _)) = fn_ctx.variables.get(name.lexeme())
+            {
+                fn_ctx
+                    .builder
+                    .build_store(*ptr, default_llvm_value(&value.ntsc_type, fn_ctx.context))?;
+            }
+            let value_arg = value.value.into_int_value();
+            let send_fn = fn_ctx
+                .module
+                .get_function("ntask_chan_send")
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError("ntask_chan_send not declared".into())
+                })?;
+            fn_ctx.builder.build_call(
+                send_fn,
+                &[channel_arg.into(), value_arg.into()],
+                "chan_send",
+            )?
+        }
+        ChanOpKind::Recv => {
+            let recv_fn = fn_ctx
+                .module
+                .get_function("ntask_chan_recv")
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError("ntask_chan_recv not declared".into())
+                })?;
+            fn_ctx
+                .builder
+                .build_call(recv_fn, &[channel_arg.into()], "chan_recv")?
+        }
+    };
+    let returned = call_result_to_value(fn_ctx, &result).into_int_value();
+    // `ntask_chan_send`/`ntask_chan_recv` return 1 on an invalid channel
+    // handle; assert so a corrupt handle surfaces as a panic.
+    fn_ctx.builder.build_call(
+        fn_ctx
+            .module
+            .get_function("ntsc_assert")
+            .ok_or_else(|| crate::CodegenError::LLVMError("ntsc_assert not declared".into()))?,
+        &[
+            returned.into(),
+            fn_ctx.context.i64_type().const_zero().into(),
+        ],
+        "chan_handle_ok",
+    )?;
+
+    let state_ptr = fn_ctx.future_field(0)?;
+    let next_state = fn_ctx
+        .context
+        .i32_type()
+        .const_int((layout.chan_state_index[chan_idx] as u64) + 1, false);
+    fn_ctx.builder.build_store(state_ptr, next_state)?;
+    fn_ctx
+        .builder
+        .build_return(Some(&fn_ctx.context.i8_type().const_int(0, false)))?;
+    Ok(())
+}
+
+/// On resume after a channel receive, read the completed value through
+/// `ntask_chan_recv_result`, coerce it to the statement's target type, and
+/// store it (or return it). A send has nothing to resume.
+pub(crate) fn emit_chan_resume<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    layout: &AsyncLayout,
+    body: &[Stmt],
+    chan_idx: usize,
+) -> Result<(), crate::CodegenError> {
+    let info = &layout.chan_infos[chan_idx];
+    if info.op == ChanOpKind::Send {
+        return Ok(());
+    }
+    let stmt = &body[info.stmt_idx];
+
+    let result_fn = fn_ctx
+        .module
+        .get_function("ntask_chan_recv_result")
+        .ok_or_else(|| {
+            crate::CodegenError::LLVMError("ntask_chan_recv_result not declared".into())
+        })?;
+    let result = fn_ctx
+        .builder
+        .build_call(result_fn, &[], "chan_recv_result")?;
+    let received = call_result_to_value(fn_ctx, &result);
+
+    let receiver = chan_stmt_receiver(stmt)?;
+    let receiver_name = receiver.lexeme();
+    let field_index = layout.fields.get(receiver_name).copied().ok_or_else(|| {
+        crate::CodegenError::LLVMError(format!(
+            "internal: received variable `{receiver_name}` has no future field"
+        ))
+    })?;
+    let slot = fn_ctx.future_field(field_index)?;
+    fn_ctx.define_var(receiver_name, slot, info.recv_ty.clone());
+    let coerced = coerce_value(
+        fn_ctx,
+        TypedValue::new(received, info.recv_ty.clone()),
+        &info.recv_ty,
+    )?;
+    fn_ctx.builder.build_store(slot, coerced.value)?;
+    Ok(())
+}
+
 /// Complete the future: store the result, set the done state, return 1.
 pub(crate) fn emit_async_return<'ctx>(
     fn_ctx: &mut FunctionContext<'ctx, '_>,
@@ -1396,7 +1724,7 @@ pub(crate) fn emit_async_return<'ctx>(
     let done_state = fn_ctx
         .context
         .i32_type()
-        .const_int((layout.await_infos.len() as u64) + 1, false);
+        .const_int((layout.suspension_count as u64) + 1, false);
     fn_ctx.builder.build_store(state_ptr, done_state)?;
     fn_ctx
         .builder

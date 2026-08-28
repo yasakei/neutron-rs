@@ -965,6 +965,25 @@ impl OwnershipChecker {
                 self.check_stmt(body);
                 self.pop_scope();
             }
+            Stmt::ChanRecvFor {
+                variable,
+                channel,
+                body,
+            } => {
+                let _ = self.check_expr(channel);
+                self.push_scope();
+                self.define_kind(variable.lexeme(), ValueKind::Heap);
+                self.check_stmt(body);
+                self.pop_scope();
+            }
+            Stmt::Go { call, block, .. } => {
+                let _ = self.check_expr(call);
+                if let Some(block) = block {
+                    self.push_scope();
+                    self.check_sequence(block);
+                    self.pop_scope();
+                }
+            }
             Stmt::Return { value } => {
                 if let Some(expr) = value {
                     let _ = self.check_expr(expr);
@@ -1497,6 +1516,29 @@ impl OwnershipChecker {
                 self.pop_scope();
                 None
             }
+            Expr::ChanSend { channel, value, .. } => {
+                let _ = self.check_expr(channel);
+                let _ = self.check_expr(value);
+                // Sending moves the value into the channel; the sender can no
+                // longer use it.
+                if let Expr::Variable { name } = &**value {
+                    self.move_heap_value(name.lexeme(), value.span(), "channel send");
+                }
+                None
+            }
+            Expr::ChanRecv {
+                receiver, channel, ..
+            } => {
+                let _ = self.check_expr(channel);
+                // The received element is owned by the receiver and freed once
+                // at scope exit.
+                self.define_kind(receiver.lexeme(), ValueKind::Heap);
+                Some(ValueKind::Heap)
+            }
+            Expr::Close { channel, .. } => {
+                let _ = self.check_expr(channel);
+                None
+            }
             Expr::View {
                 target, mutable, ..
             } => {
@@ -2014,6 +2056,8 @@ fn kind_of_annotation(annotation: &TypeAnnotation) -> ValueKind {
         TypeAnnotation::Dyn(_) | TypeAnnotation::ImplTrait(_) => ValueKind::Heap,
         // Tuples are stack-allocated value types.
         TypeAnnotation::Tuple(_) => ValueKind::Scalar,
+        // A channel is a heap handle owning its underlying queue.
+        TypeAnnotation::Chan(_) => ValueKind::Heap,
     }
 }
 
@@ -2175,6 +2219,18 @@ fn collect_stmt_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
             collect_expr_uses(producer, uses);
             collect_stmt_uses(body, uses);
         }
+        Stmt::ChanRecvFor { channel, body, .. } => {
+            collect_expr_uses(channel, uses);
+            collect_stmt_uses(body, uses);
+        }
+        Stmt::Go { call, block, .. } => {
+            collect_expr_uses(call, uses);
+            if let Some(block) = block {
+                for stmt in block {
+                    collect_stmt_uses(stmt, uses);
+                }
+            }
+        }
         Stmt::Return { value } => {
             if let Some(value) = value {
                 collect_expr_uses(value, uses);
@@ -2272,6 +2328,17 @@ fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
                 collect_stmt_uses(stmt, uses);
             }
         }
+        Expr::ChanSend { channel, value, .. } => {
+            collect_expr_uses(channel, uses);
+            collect_expr_uses(value, uses);
+        }
+        Expr::ChanRecv {
+            receiver, channel, ..
+        } => {
+            collect_expr_uses(channel, uses);
+            uses.insert(receiver.lexeme().to_string());
+        }
+        Expr::Close { channel, .. } => collect_expr_uses(channel, uses),
         Expr::Assign { name, value } => {
             uses.insert(name.lexeme().to_string());
             collect_expr_uses(value, uses);
