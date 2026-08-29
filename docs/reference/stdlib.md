@@ -225,6 +225,19 @@ bundled CA root certificates.
 | `http.download_with_progress(url, dest, chunk_size)` | `string` | Downloads in chunks. Returns JSON with status, bytes, and chunk count. Throws on failure. |
 | `http.concurrent_download(urls, dest, max_parallel)` | `string` | Downloads multiple URLs in parallel. Returns JSON with per-URL results. Throws on failure. |
 
+The `_async` variants run the blocking request on a worker-thread pool and
+hand back a future: `await` parks the calling goroutine without tying up a
+scheduler thread, so many fetches can overlap on few threads.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `http.get_async(url)` | `string` | Awaitable GET; response JSON (`status`, `body`). |
+| `http.post_async(url, data)` | `string` | Awaitable POST. |
+| `http.put_async(url, data)` | `string` | Awaitable PUT. |
+| `http.delete_async(url)` | `string` | Awaitable DELETE. |
+| `http.head_async(url)` | `string` | Awaitable HEAD. |
+| `http.patch_async(url, data)` | `string` | Awaitable PATCH. |
+
 ## Collections
 
 ### Sets
@@ -564,7 +577,29 @@ Assertions throw on failure. The test runner also uses them.
 
 | Function | Returns | Behavior |
 | --- | --- | --- |
-| `async.sleep(ms)` | `int` | Suspends the coroutine for approximately `ms` milliseconds. |
+| `async.sleep(ms)` | `void` | Suspends the coroutine for approximately `ms` milliseconds. |
+
+`async fun`/`await` and `go`/`chan[T]` run on the same M:N task scheduler
+(one work-stealing thread pool, one reactor): goroutines and coroutines are
+the same machinery, so there is one concurrency model, not two. See the
+[concurrency guide](../guide/concurrency.md).
+
+## Goroutines and channels (built in)
+
+`go`, `chan[T]`, `close`, `<|`, and `|>` are language syntax rather than a
+module; `chan.new(capacity)` is the one constructor function:
+
+| Expression | Behavior |
+| --- | --- |
+| `go worker(args)` / `go { ... }` | Spawn a goroutine on the scheduler. Arguments and captures are classified by the ownership checker (scalars copy, handles share, owned values move, `view`/`shared` are `NTSC-E0501`). |
+| `chan.new(capacity)` | Create a `chan[T]`; the element type comes from the annotated variable (`var chan[string] jobs = chan.new(4)`). |
+| `ch <| v` | Send: moves `v` into the channel; parks while the channel is full. |
+| `v \|> ch` | Receive: binds a fresh variable owning the value; parks while empty. Top-level statement of an `async fun` only. |
+| `close(ch)` | Forbid further sends; receivers drain the queued values, then get the zero value. |
+| `for v in ch { ... }` | Receive until the channel is closed and drained. |
+
+The blocking `collections.channel` family and `process.spawn_thread` remain
+available as lower-level alternatives.
 
 ## Glob
 
