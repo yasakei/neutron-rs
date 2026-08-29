@@ -182,6 +182,11 @@ pub struct OwnershipChecker {
     /// scope exits do not revive or poison the wrong variable.
     moved: HashMap<String, Vec<usize>>,
 
+    /// Nesting depth of `go` statements whose call is being checked: a
+    /// `go` call's arguments are shared with the goroutine (handles stay
+    // usable in the caller) instead of moved into the callee.
+    go_depth: usize,
+
     /// Shared views live in the current statement: name → (count, origin).
     statement_views: HashMap<String, (usize, Span)>,
 
@@ -224,6 +229,7 @@ impl OwnershipChecker {
             contents: vec![HashMap::new()],
             class_fields: HashMap::new(),
             moved: HashMap::new(),
+            go_depth: 0,
             statement_views: HashMap::new(),
             statement_mut_views: HashMap::new(),
             held_views: Vec::new(),
@@ -977,8 +983,13 @@ impl OwnershipChecker {
                 self.pop_scope();
             }
             Stmt::Go { call, block, .. } => {
+                self.go_depth += 1;
                 let _ = self.check_expr(call);
+                self.go_depth -= 1;
                 if let Some(block) = block {
+                    // Captures are shared with the goroutine: handles stay
+                    // usable in the caller (the caller's slot keeps
+                    // ownership of channels), scalars are copied.
                     self.push_scope();
                     self.check_sequence(block);
                     self.pop_scope();
@@ -1887,6 +1898,9 @@ impl OwnershipChecker {
                     .lookup_kind(name.lexeme())
                     .unwrap_or(ValueKind::Unknown);
                 match (arg_value_kind, param_kind) {
+                    (ValueKind::Heap, ParamKind::Owned) if self.go_depth > 0 => {
+                        self.register_view(name.lexeme(), ViewKind::Shared, name.span);
+                    }
                     (ValueKind::Heap, ParamKind::Owned) => {
                         self.move_value(name.lexeme(), name.span, "argument");
                     }
@@ -2160,7 +2174,7 @@ fn deep_stmt_uses(stmt: &Stmt) -> HashSet<String> {
     uses
 }
 
-fn collect_stmt_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
+pub(crate) fn collect_stmt_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
     match stmt {
         Stmt::Var { initializer, .. } => {
             if let Some(init) = initializer {
@@ -2296,7 +2310,7 @@ fn collect_stmt_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
     }
 }
 
-fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
+pub(crate) fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
     match expr {
         Expr::Variable { name } => {
             uses.insert(name.lexeme().to_string());

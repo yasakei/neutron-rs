@@ -244,6 +244,12 @@ pub(crate) struct FunctionContext<'ctx, 'm> {
     /// names. Populated during async poll emission for standalone blocks and
     /// `wait_any`/`wait_all` argument resolution.
     pub(crate) block_span_to_name: Option<HashMap<usize, String>>,
+
+    /// The annotated slot type of a `var` initializer currently being
+    /// emitted, if any. `chan.new` reads it to size the channel's
+    /// element-ownership flag; it must be reset right after the initializer
+    /// is emitted.
+    pub(crate) expected_ty: Option<Ty>,
 }
 
 impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
@@ -278,6 +284,7 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
             owned_slots: HashSet::new(),
             shadowed_owned_slots: Vec::new(),
             block_span_to_name: None,
+            expected_ty: None,
         }
     }
 

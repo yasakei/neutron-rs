@@ -713,6 +713,51 @@ pub(crate) fn emit_call<'ctx>(
         if let Expr::Variable { name } = object.as_ref() {
             let module_name = name.lexeme();
 
+            // `chan.new(capacity)` — create a virtual-task channel. The
+            // element-ownership flag comes from the annotated slot type the
+            // initializer is stored into (`chan[string]` owns its heap
+            // elements, `chan[int]` stores raw scalars).
+            if module_name == "chan" && prop_name == "new" {
+                if arguments.len() != 1 {
+                    return Err(crate::CodegenError::LLVMError(
+                        "chan.new expects exactly 1 capacity argument".into(),
+                    ));
+                }
+                let arg_values = emit_call_arguments(fn_ctx, &arguments)?;
+                let capacity = arg_values
+                    .first()
+                    .ok_or_else(|| {
+                        crate::CodegenError::LLVMError("chan.new expects a capacity".into())
+                    })?
+                    .value
+                    .into_int_value();
+                let element = match &fn_ctx.expected_ty {
+                    Some(Ty::Chan(element)) => (**element).clone(),
+                    _ => Ty::Any,
+                };
+                let owns_elements = if ty_is_owned_handle(&element) { 1 } else { 0 };
+                let new_fn = fn_ctx
+                    .module
+                    .get_function("ntask_chan_new")
+                    .ok_or_else(|| {
+                        crate::CodegenError::LLVMError("ntask_chan_new not declared".into())
+                    })?;
+                let result = fn_ctx.builder.build_call(
+                    new_fn,
+                    &[
+                        capacity.into(),
+                        fn_ctx
+                            .context
+                            .i8_type()
+                            .const_int(owns_elements, false)
+                            .into(),
+                    ],
+                    "chan_new",
+                )?;
+                let handle = call_result_to_value(fn_ctx, &result);
+                return Ok(TypedValue::new(handle, Ty::Chan(Box::new(element))));
+            }
+
             // A stdlib alias (`use strings as s`) dispatches against the real
             // module name: native functions are `ntsc_strings_*` and the
             // routed opcodes key off the module name.

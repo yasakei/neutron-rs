@@ -15,6 +15,8 @@ mod warnings;
 pub use const_eval::ConstValue;
 pub use generics::{TraitMethodInfo, TraitObjectInfo, prepare_program, take_trait_object_tables};
 pub use names::{ResolveError, resolve_program};
-pub use resolve::{TypeError, chan_receiver_element_types, check_program, take_const_values};
+pub use resolve::{
+    TypeError, chan_recv_element_type, check_program, go_captures, take_const_values,
+};
 pub use ty::Ty;
 pub use warnings::{Warning, lint_program};

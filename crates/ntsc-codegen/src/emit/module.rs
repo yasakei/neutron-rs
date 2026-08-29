@@ -272,6 +272,55 @@ pub fn emit_module(
     let mut test_names: Vec<String> = Vec::new();
     let mut async_done: HashSet<String> = HashSet::new();
     let mut async_in_progress: HashSet<String> = HashSet::new();
+
+    // Pre-pass: emit the futures of every `go` callee and `go { }` block
+    // before any body is compiled, so a spawn site can reference their
+    // struct and poll functions regardless of definition order.
+    let mut go_statements: Vec<&Stmt> = Vec::new();
+    for stmt in &program.statements {
+        collect_go_statements(stmt, &mut go_statements);
+    }
+    for go_stmt in go_statements {
+        let Stmt::Go {
+            call,
+            block,
+            keyword_span,
+        } = go_stmt
+        else {
+            continue;
+        };
+        if let Some(block) = block {
+            let name = format!("__ntsc_go_{}", keyword_span.start);
+            let captures = ntsc_typeck::go_captures(keyword_span.start);
+            super::async_sm::emit_go_block_future(
+                context,
+                &module,
+                program,
+                &name,
+                block,
+                &captures,
+                &mut async_done,
+                &mut async_in_progress,
+            )?;
+            super::async_sm::emit_goroutine_trampoline(context, &module, &name)?;
+        } else if let Expr::Call { callee, .. } = call
+            && let Expr::Variable { name } = callee.as_ref()
+            && let Some(callee_decl) = program.statements.iter().find(
+                |s| matches!(s, Stmt::AsyncFunction { name: n, .. } if n.lexeme() == name.lexeme()),
+            )
+        {
+            emit_async_function(
+                context,
+                &module,
+                program,
+                callee_decl,
+                &mut async_done,
+                &mut async_in_progress,
+            )?;
+            super::async_sm::emit_goroutine_trampoline(context, &module, name.lexeme())?;
+        }
+    }
+
     for stmt in &program.statements {
         match stmt {
             Stmt::Test { name, body } => {
@@ -328,6 +377,128 @@ pub fn emit_module(
     }
 
     crate::context::write_object_file(&module, target_machine, obj_path)
+}
+
+/// Recursively collect every `Stmt::Go` (in function bodies, control flow,
+/// classes, and tests) for the goroutine-future pre-pass.
+fn collect_go_statements<'a>(stmt: &'a Stmt, out: &mut Vec<&'a Stmt>) {
+    if matches!(stmt, Stmt::Go { .. }) {
+        out.push(stmt);
+    }
+    match stmt {
+        Stmt::Block { statements, .. } => {
+            for inner in statements {
+                collect_go_statements(inner, out);
+            }
+        }
+        Stmt::If {
+            then_branch,
+            elif_branches,
+            else_branch,
+            ..
+        } => {
+            collect_go_statements(then_branch, out);
+            for branch in elif_branches {
+                collect_go_statements(&branch.body, out);
+            }
+            if let Some(else_branch) = else_branch {
+                collect_go_statements(else_branch, out);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Retry { body, .. }
+        | Stmt::Unsafe { body, .. }
+        | Stmt::Quiet { body, .. } => collect_go_statements(body, out),
+        Stmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                collect_go_statements(init, out);
+            }
+            collect_go_statements(body, out);
+        }
+        Stmt::ForIn { body, .. } | Stmt::ForAwait { body, .. } | Stmt::ChanRecvFor { body, .. } => {
+            collect_go_statements(body, out)
+        }
+        Stmt::Match {
+            cases,
+            default_case,
+            ..
+        } => {
+            for case in cases {
+                collect_go_statements(&case.body, out);
+            }
+            if let Some(default_case) = default_case {
+                collect_go_statements(default_case, out);
+            }
+        }
+        Stmt::Try {
+            try_block,
+            catch_block,
+            finally_block,
+            ..
+        } => {
+            collect_go_statements(try_block, out);
+            if let Some(catch_block) = catch_block {
+                collect_go_statements(catch_block, out);
+            }
+            if let Some(finally_block) = finally_block {
+                collect_go_statements(finally_block, out);
+            }
+        }
+        Stmt::Function { body, .. }
+        | Stmt::AsyncFunction { body, .. }
+        | Stmt::Test { body, .. } => {
+            for inner in body {
+                collect_go_statements(inner, out);
+            }
+        }
+        Stmt::Class { body, .. } => {
+            for member in body {
+                collect_go_statements(member, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Emit a top-level `go` statement inside a synthetic void function, so a
+/// script body can spawn goroutines without a `main`.
+fn emit_top_level_go<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    stmt: &Stmt,
+) -> Result<(), crate::CodegenError> {
+    let Stmt::Go { keyword_span, .. } = stmt else {
+        return Ok(());
+    };
+    let fn_name = format!("__ntsc_init_go_{}", keyword_span.start);
+    if module.get_function(&fn_name).is_some() {
+        return Ok(());
+    }
+    let function = module.add_function(
+        &fn_name,
+        context.void_type().fn_type(&[], false),
+        Some(inkwell::module::Linkage::Internal),
+    );
+    let entry = context.append_basic_block(function, "entry");
+    let builder = context.create_builder();
+    builder.position_at_end(entry);
+    let entry_builder = context.create_builder();
+    entry_builder.position_at_end(entry);
+    let mut fn_ctx = FunctionContext::new(
+        function,
+        &builder,
+        &entry_builder,
+        entry,
+        module,
+        Ty::Void,
+        context,
+    );
+    super::async_sm::emit_go_program_spawn(&mut fn_ctx, stmt)?;
+    emit_exception_return(&mut fn_ctx, &Ty::Void, context)?;
+    emit_drop_all_owned(&mut fn_ctx)?;
+    builder.build_return(None)?;
+    Ok(())
 }
 
 /// Emit a `test name { body }` block as a no-argument void function
@@ -442,6 +613,9 @@ pub(crate) fn emit_top_level<'ctx>(
         }
         Stmt::Expression { expression } => {
             emit_implicit_init(context, module, expression)?;
+        }
+        Stmt::Go { .. } => {
+            emit_top_level_go(context, module, stmt)?;
         }
         Stmt::Var {
             name,

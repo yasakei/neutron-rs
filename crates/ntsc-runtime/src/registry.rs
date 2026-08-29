@@ -1412,6 +1412,22 @@ pub(crate) fn async_op_drop(id: i64) {
 // ── Goroutine handles ───────────────────────────────────────────────────
 
 /// Drop a scheduled goroutine handle and its task core.
+/// Remove the `Handle::Goroutine` wrapper whose core id is `core`.
+/// Called by the scheduler when a goroutine completes, so fire-and-forget
+/// spawns do not leak their registry entry.
+pub(crate) fn remove_goroutine_by_core(core: i64) {
+    let mut guard = lock();
+    let stale: Vec<i64> = guard
+        .iter()
+        .filter(|(_, handle)| matches!(handle, Handle::Goroutine { core: c } if *c == core))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in stale {
+        guard.remove(&id);
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn goroutine_drop(id: i64) {
     let Some(Handle::Goroutine { core }) =
         remove_kind(id, |handle| matches!(handle, Handle::Goroutine { .. }))

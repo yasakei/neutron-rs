@@ -160,6 +160,7 @@ pub(crate) fn spawn(poll: core::PollFn, future: i64) -> i64 {
         park: Park::None,
         pending_send: NULL,
         recv_result: NULL,
+        recv_ok: false,
         done: false,
         result: NULL,
         pending_exception: NULL,
@@ -300,30 +301,53 @@ fn drive(gid: i64) {
     CURRENT_GID.with(|cur| *cur.borrow_mut() = None);
 
     let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(gr) = g.goroutines.get_mut(&gid) else {
-        return;
-    };
-    gr.tasks = tasks;
     if done {
-        gr.done = true;
-        // The poll ran on this worker, so an exception it raised (a throw with
-        // no handler in an async body) is parked on this thread's TLS. Capture
-        // it so the thread that joins the goroutine can re-raise it; otherwise
-        // the uncaught exception would vanish with the worker thread.
-        let thrown = crate::take_pending_exception_message();
-        if thrown != NULL {
-            gr.pending_exception = thrown;
-        }
-        let joiners = std::mem::take(&mut gr.joiners);
+        let (joiners, reclaim) = {
+            let Some(gr) = g.goroutines.get_mut(&gid) else {
+                return;
+            };
+            gr.tasks = tasks;
+            gr.done = true;
+            // The poll ran on this worker, so an exception it raised (a throw
+            // with no handler in an async body) is parked on this thread's
+            // TLS. Capture it so the thread that joins the goroutine can
+            // re-raise it; otherwise the uncaught exception would vanish with
+            // the worker thread.
+            let thrown = crate::take_pending_exception_message();
+            if thrown != NULL {
+                gr.pending_exception = thrown;
+            }
+            let joiners = std::mem::take(&mut gr.joiners);
+            // A goroutine nobody waits on is reclaimed here: the registry
+            // entry (and its `Handle::Goroutine` wrapper) exists only while a
+            // joiner may still need its result or pending exception. An entry
+            // with joiners or a captured throw stays until an explicit
+            // join/drop consumes it.
+            let reclaim = gr.pending_exception == NULL && joiners.is_empty();
+            (joiners, reclaim)
+        };
         for j in &joiners {
             g.ready.push_back(*j);
         }
+        if reclaim {
+            g.goroutines.remove(&gid);
+        }
         drop(g);
+        if reclaim {
+            crate::registry::remove_goroutine_by_core(gid);
+        }
         notify_all();
         return;
     }
-    let park = gr.park;
-    gr.park = Park::None;
+    let park = {
+        let Some(gr) = g.goroutines.get_mut(&gid) else {
+            return;
+        };
+        gr.tasks = tasks;
+        let park = gr.park;
+        gr.park = Park::None;
+        park
+    };
     let mut woke = false;
     let mut requeue_local = false;
     match park {
@@ -443,6 +467,7 @@ fn chan_send(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
     if let Some(receiver) = chan.receivers.pop_front() {
         if let Some(gr) = g.goroutines.get_mut(&receiver) {
             gr.recv_result = value;
+            gr.recv_ok = true;
         }
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.pending_send = NULL;
@@ -471,6 +496,7 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
         // Channel gone: receive returns the zero value.
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.recv_result = NULL;
+            gr.recv_ok = false;
         }
         g.ready.push_back(gid);
         return false;
@@ -479,6 +505,7 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
     if let Some(v) = chan.buf.pop_front() {
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.recv_result = v;
+            gr.recv_ok = true;
         }
         // Refill the freed slot from a parked sender.
         if let Some(s) = chan.senders.pop_front() {
@@ -509,6 +536,7 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
         }
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.recv_result = sv;
+            gr.recv_ok = true;
         }
         g.ready.push_back(s);
         g.ready.push_back(gid);
@@ -517,6 +545,7 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
     if chan.closed {
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.recv_result = NULL;
+            gr.recv_ok = false;
         }
         g.ready.push_back(gid);
         return false;
@@ -530,22 +559,46 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
 /// the zero value; parked senders are released.
 pub(crate) fn chan_close(core_id: i64) {
     let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(chan) = g.chans.get_mut(&core_id) else {
-        return;
+    let (drained, senders, owns_elements, count) = {
+        let Some(chan) = g.chans.get_mut(&core_id) else {
+            return;
+        };
+        if chan.closed {
+            return;
+        }
+        chan.closed = true;
+        let receivers: Vec<i64> = chan.receivers.drain(..).collect();
+        let senders: Vec<i64> = chan.senders.drain(..).collect();
+        let count = receivers.len() + senders.len();
+        // Parked receivers drain whatever is buffered; the rest stays in the
+        // buffer for future receives (close forbids sends, it does not
+        // discard queued values — they are released when the channel itself
+        // drops).
+        let drained: Vec<(i64, Option<i64>)> = receivers
+            .into_iter()
+            .map(|r| (r, chan.buf.pop_front()))
+            .collect();
+        (drained, senders, chan.owns_elements, count)
     };
-    if chan.closed {
-        return;
-    }
-    chan.closed = true;
-    let receivers: Vec<i64> = chan.receivers.drain(..).collect();
-    let senders: Vec<i64> = chan.senders.drain(..).collect();
-    let count = receivers.len() + senders.len();
-    let owns_elements = chan.owns_elements;
-    let mut buffered = std::mem::take(&mut chan.buf);
     let mut abandoned = Vec::new();
-    for r in receivers {
-        if let Some(gr) = g.goroutines.get_mut(&r) {
-            gr.recv_result = buffered.pop_front().unwrap_or(NULL);
+    for (r, got) in drained {
+        let has_gr = g.goroutines.contains_key(&r);
+        match (got, has_gr, owns_elements) {
+            (Some(value), true, _) => {
+                if let Some(gr) = g.goroutines.get_mut(&r) {
+                    gr.recv_result = value;
+                    gr.recv_ok = true;
+                }
+            }
+            (Some(value), false, true) => abandoned.push(value),
+            (None, true, _) => {
+                if let Some(gr) = g.goroutines.get_mut(&r) {
+                    gr.recv_result = NULL;
+                    gr.recv_ok = false;
+                }
+            }
+            (None, false, _) => {}
+            (Some(_), false, false) => {}
         }
         g.ready.push_back(r);
     }
@@ -557,9 +610,6 @@ pub(crate) fn chan_close(core_id: i64) {
             gr.pending_send = NULL;
         }
         g.ready.push_back(s);
-    }
-    if owns_elements {
-        abandoned.extend(buffered);
     }
     drop(g);
     if owns_elements {
@@ -610,6 +660,7 @@ pub(crate) fn park_chan_recv(core_id: i64) {
         let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.recv_result = NULL;
+            gr.recv_ok = false;
         }
     }
     park_self(Park::Chan {
@@ -645,6 +696,20 @@ pub(crate) fn recv_result() -> i64 {
                 .map(|gr| gr.recv_result)
         })
         .unwrap_or(NULL)
+}
+
+/// Whether the last receive on this goroutine delivered a real value.
+pub(crate) fn recv_ok() -> bool {
+    current_gid()
+        .and_then(|gid| {
+            core::GLOBAL
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .goroutines
+                .get(&gid)
+                .map(|gr| gr.recv_ok)
+        })
+        .unwrap_or(false)
 }
 
 /// Block the calling *OS thread* until the goroutine completes, then return its

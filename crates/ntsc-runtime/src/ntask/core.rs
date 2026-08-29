@@ -58,6 +58,10 @@ pub(crate) struct Goroutine {
     pub(crate) pending_send: i64,
     /// The value a receiver picked up (or the zero value on close), or `NULL`.
     pub(crate) recv_result: i64,
+    /// Whether `recv_result` carries a real value (`false` after a close-drain
+    /// or a failed receive). `for v in chan` needs the distinction because a
+    /// raw scalar `0` is a legal received value.
+    pub(crate) recv_ok: bool,
     /// `1` once the future has completed (its result is in `result`).
     pub(crate) done: bool,
     /// The result handle of a completed goroutine.

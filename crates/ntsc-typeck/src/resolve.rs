@@ -15,17 +15,101 @@ use crate::ty::Ty;
 
 // Async function name -> element types of its `|>` channel receives, in
 // order of appearance. Populated during type checking and read by codegen so
-// a receive can type its freshly-bound receiver variable.
+// a receive can type its freshly-bound receiver variable. Keyed by the
+// receive's operator span (unique per site), so receives inside `go { }`
+// blocks resolve even though they are checked under the enclosing function.
 std::thread_local! {
-    static CHAN_RECV_TYPES: std::cell::RefCell<HashMap<String, Vec<Ty>>> =
+    static CHAN_RECV_TYPES: std::cell::RefCell<HashMap<usize, Ty>> =
         std::cell::RefCell::new(HashMap::new());
 }
 
-/// Returns the element types of `|>` receives inside the named async
-/// function, in statement order. Used by codegen to type the receiver
-/// variable of each channel receive it lowers.
-pub fn chan_receiver_element_types(fn_name: &str) -> Vec<Ty> {
-    CHAN_RECV_TYPES.with(|map| map.borrow().get(fn_name).cloned().unwrap_or_default())
+/// Returns the element type of the `|>` receive (or `for v in chan` loop)
+/// at the given operator/channel span start. Used by codegen to type the
+/// receiver variable of each channel receive it lowers.
+pub fn chan_recv_element_type(span_start: usize) -> Ty {
+    CHAN_RECV_TYPES
+        .with(|map| map.borrow().get(&span_start).cloned())
+        .unwrap_or(Ty::Any)
+}
+
+// Captured outer locals per `go { ... }` block, keyed by the `go`
+// keyword's span start. Codegen turns each entry into the parameters of
+// the block's synthesized goroutine function; the list is deterministic
+// (sorted by name) and only contains variables of the enclosing function.
+std::thread_local! {
+    static GO_CAPTURES: std::cell::RefCell<HashMap<usize, Vec<(String, Ty)>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Returns the locals a `go { ... }` block captures, sorted by name.
+pub fn go_captures(keyword_span_start: usize) -> Vec<(String, Ty)> {
+    GO_CAPTURES.with(|map| {
+        map.borrow()
+            .get(&keyword_span_start)
+            .cloned()
+            .unwrap_or_default()
+    })
+}
+
+/// Names bound anywhere inside a `go` block (any depth): those never count
+/// as captures of the enclosing function.
+pub(crate) fn collect_go_bindings(stmts: &[Stmt], bound: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Var { name, .. } | Stmt::ForIn { variable: name, .. } => {
+                bound.insert(name.lexeme().to_string());
+            }
+            Stmt::ForAwait { variable, .. } => {
+                bound.insert(variable.lexeme().to_string());
+            }
+            Stmt::For {
+                init: Some(init), ..
+            } => {
+                if let Stmt::Var { name, .. } = init.as_ref() {
+                    bound.insert(name.lexeme().to_string());
+                }
+            }
+            Stmt::ChanRecvFor { variable, .. } => {
+                bound.insert(variable.lexeme().to_string());
+            }
+            Stmt::Destructure { names, .. } => {
+                for name in names {
+                    bound.insert(name.lexeme().to_string());
+                }
+            }
+            Stmt::Block { statements, .. } => collect_go_bindings(statements, bound),
+            Stmt::If {
+                then_branch,
+                elif_branches,
+                else_branch,
+                ..
+            } => {
+                collect_go_bindings(std::slice::from_ref(then_branch), bound);
+                for branch in elif_branches {
+                    collect_go_bindings(std::slice::from_ref(&branch.body), bound);
+                }
+                if let Some(else_branch) = else_branch {
+                    collect_go_bindings(std::slice::from_ref(else_branch), bound);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                collect_go_bindings(std::slice::from_ref(body), bound)
+            }
+            Stmt::Try {
+                catch_var,
+                catch_block,
+                ..
+            } => {
+                if let Some(catch_var) = catch_var {
+                    bound.insert(catch_var.lexeme().to_string());
+                }
+                if let Some(catch_block) = catch_block {
+                    collect_go_bindings(std::slice::from_ref(catch_block), bound);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 thread_local! {
@@ -207,6 +291,13 @@ impl TypeChecker {
         // it stays always in scope.
         symbols
             .define("async", Ty::Object)
+            .expect("global scope should be empty");
+
+        // `chan.new(...)` — the virtual-task channel constructor. The
+        // element type comes from the target slot, so the constructor call
+        // itself is only arity-checked.
+        symbols
+            .define("chan", Ty::Object)
             .expect("global scope should be empty");
 
         Self {
@@ -822,7 +913,7 @@ impl TypeChecker {
                     }
                 };
                 self.symbols.push_scope();
-                if let Err(msg) = self.symbols.define(variable.lexeme(), element_ty) {
+                if let Err(msg) = self.symbols.define(variable.lexeme(), element_ty.clone()) {
                     self.errors.push(TypeError {
                         code: None,
                         help: None,
@@ -830,14 +921,56 @@ impl TypeChecker {
                         span: variable.span,
                     });
                 }
+                CHAN_RECV_TYPES.with(|map| {
+                    map.borrow_mut()
+                        .insert(channel.span().start, element_ty.clone());
+                });
                 self.check_statement(body);
                 self.symbols.pop_scope();
             }
-            Stmt::Go { call, block, .. } => {
-                // A goroutine evaluates the call for its side effects; its
-                // return value is discarded.
-                let _call_ty = self.check_expression(call);
+            Stmt::Go {
+                call,
+                block,
+                keyword_span,
+            } => {
+                // `go worker(args)` runs an async function's future on the
+                // scheduler; the bare call is legal here (no `await`).
+                match call {
+                    Expr::Call {
+                        callee, arguments, ..
+                    } if matches!(callee.as_ref(), Expr::Variable { name }
+                            if self.async_fns.contains(name.lexeme())) =>
+                    {
+                        for argument in arguments {
+                            let _ = self.check_expression(argument);
+                        }
+                    }
+                    _ => {
+                        let _ = self.check_expression(call);
+                    }
+                }
                 if let Some(block) = block {
+                    let mut uses = HashSet::new();
+                    for stmt in block {
+                        crate::ownership::collect_stmt_uses(stmt, &mut uses);
+                    }
+                    let mut bound = HashSet::new();
+                    collect_go_bindings(block, &mut bound);
+                    let mut captures: Vec<(String, Ty)> = uses
+                        .into_iter()
+                        .filter(|name| !bound.contains(name))
+                        .filter_map(|name| {
+                            let (depth, ty) = self.symbols.lookup_depth(&name)?;
+                            if depth == 0 || matches!(ty, Ty::Function { .. }) {
+                                return None;
+                            }
+                            Some((name, ty.clone()))
+                        })
+                        .collect();
+                    captures.sort_by(|a, b| a.0.cmp(&b.0));
+                    GO_CAPTURES.with(|map| {
+                        map.borrow_mut().insert(keyword_span.start, captures);
+                    });
                     self.symbols.push_scope();
                     for stmt in block {
                         self.check_statement(stmt);
@@ -1154,9 +1287,7 @@ impl TypeChecker {
         let prev_async_depth = self.async_depth;
         if is_async {
             self.async_depth += 1;
-            CHAN_RECV_TYPES.with(|map| {
-                map.borrow_mut().remove(name);
-            });
+            CHAN_RECV_TYPES.with(|map| map.borrow_mut().clear());
             self.current_fn_name = Some(name.to_string());
         }
 
@@ -2284,7 +2415,10 @@ impl TypeChecker {
                 Some(Ty::Void)
             }
             Expr::ChanRecv {
-                receiver, channel, ..
+                receiver,
+                channel,
+                op_span,
+                ..
             } => {
                 if self.async_depth == 0 {
                     self.errors.push(TypeError {
@@ -2320,14 +2454,9 @@ impl TypeChecker {
                         span: receiver.span,
                     });
                 }
-                if let Some(fn_name) = &self.current_fn_name {
-                    CHAN_RECV_TYPES.with(|map| {
-                        map.borrow_mut()
-                            .entry(fn_name.clone())
-                            .or_default()
-                            .push(element_ty.clone());
-                    });
-                }
+                CHAN_RECV_TYPES.with(|map| {
+                    map.borrow_mut().insert(op_span.start, element_ty.clone());
+                });
                 Some(element_ty)
             }
             Expr::Close { channel, keyword } => {
@@ -2615,6 +2744,34 @@ impl TypeChecker {
                     });
                 }
                 Some(Ty::Void)
+            }
+            Expr::Member { object, property }
+                if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "http")
+                    && property.lexeme().ends_with("_async") =>
+            {
+                // Awaiting an offloaded http future: the runtime runs the
+                // blocking request on the worker pool and the goroutine
+                // parks until the response handle is ready.
+                let expected_arity = match property.lexeme() {
+                    "get_async" | "delete_async" | "head_async" => 1,
+                    _ => 2,
+                };
+                if arguments.len() != expected_arity {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: format!(
+                            "http.{} expects {expected_arity} argument(s), got {}",
+                            property.lexeme(),
+                            arguments.len()
+                        ),
+                        span,
+                    });
+                }
+                for argument in arguments {
+                    let _ = self.check_expression(argument);
+                }
+                Some(Ty::String)
             }
             Expr::Variable { name } => {
                 let callee_name = name.lexeme();

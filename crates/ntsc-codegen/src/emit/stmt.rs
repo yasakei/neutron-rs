@@ -12,6 +12,9 @@ pub(crate) fn emit_statement_in_function<'ctx>(
     {
         return Ok(());
     }
+    if let Stmt::Go { .. } = stmt {
+        return super::async_sm::emit_go_program_spawn(fn_ctx, stmt);
+    }
     match stmt {
         Stmt::Say { expression, .. } => {
             emit_say_call(fn_ctx, expression)?;
@@ -175,7 +178,19 @@ pub(crate) fn emit_statement_in_function<'ctx>(
 
             let ann_ty = type_annotation_to_ty(type_annotation);
             let (ty, ptr, owned) = if let Some(init_expr) = initializer {
-                let init_val = emit_expression(fn_ctx, init_expr)?;
+                if view.is_none() && type_annotation.is_some() {
+                    fn_ctx.expected_ty = Some(ann_ty.clone());
+                }
+                let init_val = match emit_expression(fn_ctx, init_expr) {
+                    Ok(value) => {
+                        fn_ctx.expected_ty = None;
+                        value
+                    }
+                    Err(error) => {
+                        fn_ctx.expected_ty = None;
+                        return Err(error);
+                    }
+                };
                 let inferred = if view.is_some() {
                     // A view declaration borrows the annotated (or
                     // initializer) inner type; a view of a shared value
@@ -428,9 +443,10 @@ pub(crate) fn emit_statement_in_function<'ctx>(
         | Stmt::Test { .. }
         | Stmt::Trait { .. }
         | Stmt::Impl { .. } => {}
-        Stmt::ChanRecvFor { .. } | Stmt::Go { .. } => {
+        Stmt::Go { .. } => {}
+        Stmt::ChanRecvFor { .. } => {
             return Err(crate::CodegenError::LLVMError(
-                "goroutines and channels are not yet supported by code generation".into(),
+                "for-in over a channel is only supported inside an async body".into(),
             ));
         }
     }

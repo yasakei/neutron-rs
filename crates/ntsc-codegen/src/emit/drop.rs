@@ -249,6 +249,18 @@ pub(crate) fn emit_drop_value<'ctx>(
         return super::result_cell::emit_drop_result_value(fn_ctx, ok, err, val);
     }
 
+    // A channel is a virtual-task registry handle.
+    if matches!(val.ntsc_type, Ty::Chan(_)) {
+        if let Some(drop_fn) = fn_ctx.module.get_function("ntask_chan_drop") {
+            fn_ctx.builder.build_call(
+                drop_fn,
+                &[BasicMetadataValueEnum::IntValue(val.value.into_int_value())],
+                "chan_drop",
+            )?;
+        }
+        return Ok(());
+    }
+
     // A string and an `object` are both registry-backed string handles (an
     // object is its JSON text), so both are reclaimed by the same drop.
     if matches!(val.ntsc_type, Ty::String | Ty::Object) {
@@ -478,6 +490,7 @@ pub(crate) fn ty_is_owned_handle(ty: &Ty) -> bool {
             | Ty::Object
             | Ty::Shared(_)
             | Ty::Class(_)
+            | Ty::Chan(_)
             | Ty::Option(_)
             | Ty::Result { .. }
             | Ty::Pointer

@@ -2106,6 +2106,21 @@ impl<'src> Parser<'src> {
                     })
                 }
             }
+            TokenKind::Chan => {
+                // `chan.new(capacity)` in expression position: the keyword
+                // names the constructor namespace.
+                if matches!(self.peek_at(1), TokenKind::Dot) {
+                    let tok = self.advance();
+                    Ok(Expr::Variable {
+                        name: Token::new(TokenKind::Identifier("chan".to_string()), tok.span),
+                    })
+                } else {
+                    Err(ParseError {
+                        message: "unexpected 'chan' in expression; use `chan.new(capacity)`".into(),
+                        span: self.peek().span,
+                    })
+                }
+            }
             TokenKind::View => {
                 let view_token = self.advance();
                 let mutable = self.consume(&TokenKind::Mut).is_some();

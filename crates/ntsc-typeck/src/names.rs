@@ -85,6 +85,9 @@ impl Resolver {
         // it stays always in scope.
         global.insert("async".into());
 
+        // `chan` — the virtual-task channel constructor namespace.
+        global.insert("chan".into());
+
         Self {
             scopes: vec![global],
             errors: Vec::new(),

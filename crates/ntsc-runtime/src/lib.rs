@@ -734,6 +734,11 @@ pub extern "C" fn ntask_chan_recv_result() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_recv_ok() -> i8 {
+    ntask::scheduler::recv_ok().into()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn ntask_chan_close(channel: i64) {
     if let Some(core) = registry::task_core(channel) {
         ntask::scheduler::chan_close(core);

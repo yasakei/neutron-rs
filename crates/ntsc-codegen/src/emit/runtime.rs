@@ -193,11 +193,22 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
     declare!("ntask_chan_send", i8_ty, i64_ty, i64_ty);
     declare!("ntask_chan_recv", i8_ty, i64_ty);
     declare!("ntask_chan_recv_result", i64_ty);
+    declare!("ntask_chan_recv_ok", i8_ty);
     declare!("ntask_chan_close", void_ty, i64_ty);
     declare!("ntask_chan_drop", void_ty, i64_ty);
     declare!("ntask_timer_new", i64_ty);
     declare!("ntask_timer_park", i8_ty, i64_ty, i64_ty);
     declare!("ntask_reactor_drop", void_ty, i64_ty);
+    // ── Offloaded http futures ──────────────────────────────────────────
+    declare!("ntsc_async_http_get", i64_ty, i64_ty);
+    declare!("ntsc_async_http_post", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_async_http_put", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_async_http_delete", i64_ty, i64_ty);
+    declare!("ntsc_async_http_patch", i64_ty, i64_ty, i64_ty);
+    declare!("ntsc_async_http_head", i64_ty, i64_ty);
+    declare!("ntsc_async_http_poll", i8_ty, i64_ty);
+    declare!("ntsc_async_http_result", i64_ty, i64_ty);
+    declare!("ntsc_async_http_drop", void_ty, i64_ty);
     declare!("ntask_io_new", i64_ty);
     declare!("ntask_io_attach", void_ty, i64_ty, i64_ty, i8_ty);
     declare!("ntask_io_park", i8_ty, i64_ty, i8_ty);
