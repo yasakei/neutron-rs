@@ -1627,7 +1627,15 @@ pub(crate) fn emit_await_resume<'ctx>(
                 type_annotation,
                 ..
             } => {
-                let slot_ty = type_annotation_to_ty(type_annotation);
+                // An unannotated `var x = await http.get_async(..)` binds to
+                // the response string; without an annotation the variable
+                // would default to `Any`, which loses ownership tracking (a
+                // later move out of the slot would go unnoticed by the drop
+                // path and the sent handle would be freed twice).
+                let slot_ty = match type_annotation {
+                    Some(_) => type_annotation_to_ty(type_annotation),
+                    None => Ty::String,
+                };
                 let field_index = layout.fields.get(name.lexeme()).copied().ok_or_else(|| {
                     crate::CodegenError::LLVMError(format!(
                         "internal: awaited variable `{}` has no future field",
@@ -1730,7 +1738,12 @@ pub(crate) fn emit_await_resume<'ctx>(
             type_annotation,
             ..
         } => {
-            let slot_ty = type_annotation_to_ty(type_annotation);
+            // An unannotated `var x = await f(..)` binds the child's result
+            // type (not `Any`) so ownership of an owned handle is tracked.
+            let slot_ty = match type_annotation {
+                Some(_) => type_annotation_to_ty(type_annotation),
+                None => info.child_ret_ty.clone(),
+            };
             let field_index = layout.fields.get(name.lexeme()).copied().ok_or_else(|| {
                 crate::CodegenError::LLVMError(format!(
                     "internal: awaited variable `{}` has no future field",

@@ -40,8 +40,8 @@ async fun drain(chan[string] jobs) {
 async fun main() -> int {
     var chan[string] jobs = chan.new(4)
     go drain(jobs)
-    jobs <| "render"
-    jobs <| "package"
+    "render" |> jobs
+    "package" |> jobs
     close(jobs)
     await async.sleep(50)   // give the worker time to drain
     return 0
@@ -58,15 +58,15 @@ for url in urls {
 
 ## Channels
 
-`chan[T]` is a typed channel. The operators show the direction data moves:
-`<|` pushes a value into the channel operand on its left; `|>` pulls a value
-out of the channel operand on its right.
+`chan[T]` is a typed channel. The operators show the direction data moves — the arrow points where the
+value goes: `|>` pipes the value on its left into the channel on its right;
+`<|` feeds the variable on its left from the channel on its right.
 
 ```ntsc
 var chan[int] jobs = chan.new(10)   // buffered channel, capacity 10
 
-jobs <| value                       // send: moves value into jobs (parks when full)
-x |> jobs                           // receive: binds fresh x from jobs (parks when empty)
+value |> jobs                       // send: moves value into jobs (parks when full)
+x <| jobs                           // receive: binds fresh x from jobs (parks when empty)
 close(jobs)                         // no more sends; receivers drain, then get zero
 
 for v in jobs {                     // receive until the channel is closed and drained
@@ -140,6 +140,14 @@ A goroutine is not an OS thread: prefer `go` for concurrency, and reach for
 OS-thread code (they copy string messages and block the calling thread).
 New goroutine code should use `chan[T]`, which is typed and parks instead of
 blocking.
+
+### Scaling benchmarks
+
+`benchmarks/run_concurrency.py` measures the worker pool directly: 10k–100k
+goroutines on a fixed pool, CPU fan-out across cores, blocked-on-`sleep`
+goroutines freeing workers, and concurrent HTTP fan-out — each side by side
+with the equivalent Go goroutine program. Results land in
+`benchmarks/results_concurrency.md`.
 
 ### Threading rules
 

@@ -39,6 +39,13 @@ static REGISTRY: LazyLock<Mutex<HashMap<i64, Handle>>> =
 static NEXT_ID: AtomicI64 = AtomicI64::new(1);
 static LIVE: AtomicI64 = AtomicI64::new(0);
 
+/// Registry ids of `Handle::Goroutine` wrappers, grouped by the goroutine core
+/// they wrap. Kept so a goroutine's wrappers can be dropped in O(wrappers)
+/// instead of scanning the whole registry when the goroutine is reclaimed.
+/// Lock ordering is always REGISTRY first, then this map.
+static GOROUTINE_CORES: LazyLock<Mutex<HashMap<i64, HashSet<i64>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Handles registered as permanent (compile-time constants such as string
 /// literals). They are owned by the program for its whole lifetime, are
 /// never removed, and are excluded from leak reporting.
@@ -450,6 +457,14 @@ fn insert_locked(
     handle: Handle,
 ) -> i64 {
     let id = next_id();
+    if let Handle::Goroutine { core } = &handle {
+        GOROUTINE_CORES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(*core)
+            .or_default()
+            .insert(id);
+    }
     guard.insert(id, handle);
     // Bumped under the lock, like every other counter mutation, so the two
     // can never be observed out of step (see `counters_agree_with_map`).
@@ -485,6 +500,15 @@ pub(crate) fn remove(id: i64) -> Option<Handle> {
     }
     let mut guard = lock();
     let taken = guard.remove(&id);
+    if let Some(Handle::Goroutine { core }) = &taken {
+        let mut cores = GOROUTINE_CORES.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ids) = cores.get_mut(core) {
+            ids.remove(&id);
+            if ids.is_empty() {
+                cores.remove(core);
+            }
+        }
+    }
     if taken.is_some() {
         LIVE.fetch_sub(1, Ordering::Relaxed);
         REGISTRY_GEN.fetch_add(1, Ordering::Release);
@@ -1416,15 +1440,21 @@ pub(crate) fn async_op_drop(id: i64) {
 /// Called by the scheduler when a goroutine completes, so fire-and-forget
 /// spawns do not leak their registry entry.
 pub(crate) fn remove_goroutine_by_core(core: i64) {
+    let stale: Vec<i64> = GOROUTINE_CORES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&core)
+        .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default();
     let mut guard = lock();
-    let stale: Vec<i64> = guard
-        .iter()
-        .filter(|(_, handle)| matches!(handle, Handle::Goroutine { core: c } if *c == core))
-        .map(|(id, _)| *id)
-        .collect();
+    let mut removed = 0;
     for id in stale {
-        guard.remove(&id);
-        LIVE.fetch_sub(1, Ordering::Relaxed);
+        if guard.remove(&id).is_some() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        LIVE.fetch_sub(removed, Ordering::Relaxed);
     }
 }
 

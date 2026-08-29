@@ -593,8 +593,8 @@ module; `chan.new(capacity)` is the one constructor function:
 | --- | --- |
 | `go worker(args)` / `go { ... }` | Spawn a goroutine on the scheduler. Arguments and captures are classified by the ownership checker (scalars copy, handles share, owned values move, `view`/`shared` are `NTSC-E0501`). |
 | `chan.new(capacity)` | Create a `chan[T]`; the element type comes from the annotated variable (`var chan[string] jobs = chan.new(4)`). |
-| `ch <| v` | Send: moves `v` into the channel; parks while the channel is full. |
-| `v \|> ch` | Receive: binds a fresh variable owning the value; parks while empty. Top-level statement of an `async fun` only. |
+| `v \|> ch` | Send: moves `v` into the channel; parks while the channel is full. |
+| `v <\| ch` | Receive: binds a fresh variable owning the value; parks while empty. Top-level statement of an `async fun` only. |
 | `close(ch)` | Forbid further sends; receivers drain the queued values, then get the zero value. |
 | `for v in ch { ... }` | Receive until the channel is closed and drained. |
 

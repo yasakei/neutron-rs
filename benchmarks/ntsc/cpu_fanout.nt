@@ -1,0 +1,60 @@
+// cpu_fanout.nt — CPU-bound work (counting primes up to LIMIT) split into
+// `g` disjoint ranges, one goroutine per range. With the scheduler pool sized
+// at num_cpus, g ≈ cores keeps every core busy; the wall-clock speedup from
+// `g = 1` to `g = cores` shows the fan-out actually uses the whole machine
+// (and, at g >> cores, the work-stealing keeps all workers even).
+//
+//   usage: NTS_BENCH_N=8 ntsc_cpu_fanout    (default g = 8)
+use sys
+use strings
+use fmt
+
+async fun count_primes(int begin, int end, chan[int] out) {
+    var int count = 0
+    var int i = begin
+    while (i < end) {
+        if (i >= 2) {
+            var bool prime = true
+            var int j = 2
+            while (j * j <= i) {
+                if (i % j == 0) {
+                    prime = false
+                    break
+                }
+                j = j + 1
+            }
+            if (prime) {
+                count = count + 1
+            }
+        }
+        i = i + 1
+    }
+    count |> out
+}
+
+async fun main() -> int {
+    var int g = 8
+    var int limit = 400000
+    var string g_env = sys.env("NTS_BENCH_N")
+    if (!strings.is_empty(g_env)) {
+        g = fmt.to_int(g_env)
+    }
+
+    var chan[int] out = chan.new(64)
+    var int id = 0
+    while (id < g) {
+        go count_primes(id * (limit / g), (id + 1) * (limit / g), out)
+        id = id + 1
+    }
+
+    var int total = 0
+    var int received = 0
+    for found in out {
+        total = total + found
+        received = received + 1
+        if (received == g) {
+            close(out)
+        }
+    }
+    return total
+}

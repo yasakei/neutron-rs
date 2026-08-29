@@ -1,0 +1,75 @@
+// io_mixed.nt — n_cpu goroutines count primes while n_io goroutines block in
+// a 300 ms async.sleep. If a worker were pinned by a sleeper, wall time would
+// scale as n_io/workers rounds of 300 ms; it stays ~300 ms at any n_io.
+//
+//   usage: NTS_BENCH_N=4 NTS_BENCH_IO=512 ntsc_io_mixed
+//          (default n_cpu = 4, n_io = 64, sleep = 300 ms)
+use sys
+use strings
+use fmt
+
+async fun count_primes(int begin, int end, chan[int] out) {
+    var int count = 0
+    var int i = begin
+    while (i < end) {
+        if (i >= 2) {
+            var bool prime = true
+            var int j = 2
+            while (j * j <= i) {
+                if (i % j == 0) {
+                    prime = false
+                    break
+                }
+                j = j + 1
+            }
+            if (prime) {
+                count = count + 1
+            }
+        }
+        i = i + 1
+    }
+    count |> out
+}
+
+async fun block_io(chan[int] out) {
+    await async.sleep(300)
+    1 |> out
+}
+
+async fun main() -> int {
+    var int n_cpu = 4
+    var int n_io = 64
+    var string cpu_env = sys.env("NTS_BENCH_N")
+    if (!strings.is_empty(cpu_env)) {
+        n_cpu = fmt.to_int(cpu_env)
+    }
+    var string io_env = sys.env("NTS_BENCH_IO")
+    if (!strings.is_empty(io_env)) {
+        n_io = fmt.to_int(io_env)
+    }
+
+    var int limit = 400000
+    var chan[int] out = chan.new(64)
+    var int id = 0
+    while (id < n_cpu) {
+        go count_primes(id * (limit / n_cpu), (id + 1) * (limit / n_cpu), out)
+        id = id + 1
+    }
+    id = 0
+    while (id < n_io) {
+        go block_io(out)
+        id = id + 1
+    }
+
+    var int total = 0
+    var int received = 0
+    var int want = n_cpu + n_io
+    for found in out {
+        total = total + found
+        received = received + 1
+        if (received == want) {
+            close(out)
+        }
+    }
+    return total
+}

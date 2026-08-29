@@ -1,0 +1,44 @@
+// goroutine_spawn.nt — spawn `n` goroutines, each performing a fixed slice
+// of arithmetic before signalling over a channel. The runtime multiplexes
+// the goroutines onto a fixed OS-thread pool (one worker per CPU), so
+// spawning 10k–100k goroutines costs memory for the futures alone, never for
+// an OS thread each.
+//
+//   usage: NTS_BENCH_N=100000 ntsc_goroutine_spawn   (default 100000)
+use sys
+use strings
+use fmt
+
+async fun worker(chan[int] done) {
+    var int acc = 0
+    var int i = 0
+    while (i < 64) {
+        acc = acc + i
+        i = i + 1
+    }
+    1 |> done
+}
+
+async fun main() -> int {
+    var int n = 100000
+    var string n_env = sys.env("NTS_BENCH_N")
+    if (!strings.is_empty(n_env)) {
+        n = fmt.to_int(n_env)
+    }
+
+    var chan[int] done = chan.new(512)
+    var int i = 0
+    while (i < n) {
+        go worker(done)
+        i = i + 1
+    }
+
+    var int received = 0
+    for count in done {
+        received = received + count
+        if (received == n) {
+            close(done)
+        }
+    }
+    return received
+}

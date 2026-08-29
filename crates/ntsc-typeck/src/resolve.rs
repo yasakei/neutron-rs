@@ -4341,7 +4341,7 @@ mod tests {
     #[test]
     fn channel_send_moves_the_value() {
         let errors = check_source(
-            "async fun main() { var chan[string] ch = chan.new(1)\n var string m = \"x\"\n ch <| m\n say(m) }",
+            "async fun main() { var chan[string] ch = chan.new(1)\n var string m = \"x\"\n m |> ch\n say(m) }",
         )
         .unwrap_err();
         assert!(
@@ -4355,7 +4355,7 @@ mod tests {
     #[test]
     fn channel_receive_binds_an_owned_receiver() {
         check_source(
-            "async fun main() { var chan[string] ch = chan.new(2)\n ch <| \"ping\"\n x |> ch\n say(x) }",
+            "async fun main() { var chan[string] ch = chan.new(2)\n \"ping\" |> ch\n x <| ch\n say(x) }",
         )
         .expect("a receive binds a fresh owned receiver");
     }
@@ -5151,7 +5151,7 @@ mod tests {
     #[test]
     fn channel_send_and_recv_are_allowed_as_top_level_async_statements() {
         assert!(
-            check_source("async fun f(chan[int] c) {\n    c <| 5\n    x |> c\n}").is_ok(),
+            check_source("async fun f(chan[int] c) {\n    5 |> c\n    x <| c\n}").is_ok(),
             "top-level channel send/recv in an async body should type-check"
         );
     }
@@ -5159,7 +5159,7 @@ mod tests {
     #[test]
     fn channel_send_inside_control_flow_is_rejected() {
         let errors = check_source(
-            "async fun f(chan[int] c) {\n    while (true) {\n        c <| 5\n    }\n}",
+            "async fun f(chan[int] c) {\n    while (true) {\n        5 |> c\n    }\n}",
         )
         .unwrap_err();
         assert!(
@@ -5172,7 +5172,7 @@ mod tests {
 
     #[test]
     fn channel_send_in_sync_function_is_rejected() {
-        let errors = check_source("fun f(chan[int] c) {\n    c <| 5\n}").unwrap_err();
+        let errors = check_source("fun f(chan[int] c) {\n    5 |> c\n}").unwrap_err();
         assert!(
             errors
                 .iter()
@@ -5183,7 +5183,7 @@ mod tests {
 
     #[test]
     fn channel_recv_in_sync_function_is_rejected() {
-        let errors = check_source("fun f(chan[int] c) {\n    x |> c\n}").unwrap_err();
+        let errors = check_source("fun f(chan[int] c) {\n    x <| c\n}").unwrap_err();
         assert!(
             errors
                 .iter()

@@ -65,18 +65,18 @@ fn assert_clean(stdout: &str, stderr: &str, output: &std::process::Output, expec
 fn go_call_and_channel_handshake() {
     let source = r#"
 async fun producer(chan[int] ch) {
-    ch <| 7
+    7 |> ch
     close(ch)
 }
 
 async fun main() -> int {
     var chan[int] ch = chan.new(2)
     go producer(ch)
-    x |> ch
+    x <| ch
     if (x == 7) {
         say("handshake ok")
     }
-    y |> ch
+    y <| ch
     return 0
 }
 "#;
@@ -94,8 +94,8 @@ async fun main() -> int {
             say(w)
         }
     }
-    words <| "alpha"
-    words <| "beta"
+    "alpha" |> words
+    "beta" |> words
     close(words)
     await async.sleep(100)
     return 0

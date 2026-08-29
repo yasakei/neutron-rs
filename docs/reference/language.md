@@ -119,7 +119,7 @@ object     any        result
 | `&T` / `&mut T` | Addressable reference / exclusive reference. |
 | `*const T` / `*mut T` | Raw pointer, usable only inside `unsafe`. |
 | `slice[T]` | Bounds-checked window over an `array[T]`. |
-| `chan[T]` | Virtual-task channel carrying elements of type `T`; created with `chan.new(capacity)`. Send with `<\|` (moves the value in), receive with `\|>` (moves it out). |
+| `chan[T]` | Virtual-task channel carrying elements of type `T`; created with `chan.new(capacity)`. Send with `\|>` (moves the value in), receive with `<\|` (moves it out). |
 
 | `(T, U, ...)` | Tuple type. |
 | class name | Instance of that class. |
@@ -570,15 +570,17 @@ caller, and `view`/`shared` values are rejected (`NTSC-E0501`). See
 ```ntsc
 var chan[int] jobs = chan.new(4)
 
-jobs <| 7        // send: moves 7 into `jobs` (parks while full)
-x |> jobs        // receive: binds a fresh `x` from `jobs` (parks while empty)
+7 |> jobs        // send: moves 7 into `jobs` (parks while full)
+x <| jobs        // receive: binds a fresh `x` from `jobs` (parks while empty)
 close(jobs)      // no more sends; receivers drain what is queued
 ```
 
-- `<|` sends: the value is *moved into* the channel; the sender cannot use it
-  afterwards (`NTSC-E0501` on later use).
-- `|>` receives: legal only as a statement at the top level of an `async fun`
-  body; it binds a fresh variable that owns the received value.
+- `|>` sends: the arrow points where the data flows — the value is *moved
+  into* the channel on its right; the sender cannot use it afterwards
+  (`NTSC-E0501` on later use).
+- `<|` receives: the channel on the right feeds the variable on its left.
+  Legal only as a statement at the top level of an `async fun` body; it binds
+  a fresh variable that owns the received value.
 - `close(expr)` closes the channel. Receivers drain the values already queued,
   then a receive completes with the zero value.
 - `for name in channel { ... }` receives one value per iteration until the

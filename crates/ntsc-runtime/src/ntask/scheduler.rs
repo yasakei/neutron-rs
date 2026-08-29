@@ -90,7 +90,10 @@ pub(crate) fn start() {
 /// so a scheduler worker is never blocked on I/O or a child process. Bound
 /// the count so runaway children cannot exhaust threads.
 fn start_offload_pool() {
-    if OFFLOADING.swap(true, Ordering::SeqCst) {
+    let mut guard = OFFLOAD_SEND.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.is_some() {
+        // The sender is the single initialization marker: another thread has
+        // already run the one-time setup (or is about to, under this lock).
         return;
     }
     OFFLOAD_STOP.store(false, Ordering::Relaxed);
@@ -99,7 +102,12 @@ fn start_offload_pool() {
         .unwrap_or(2)
         .clamp(2, 8);
     let (tx, rx) = mpsc::channel::<OffloadJob>();
-    *OFFLOAD_SEND.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    // Publish the sender under the lock *before* spawning workers, so any
+    // concurrent `run_offload` that locks `OFFLOAD_SEND` after this returns
+    // is guaranteed to see it (no job can be dropped racing the startup).
+    *guard = Some(tx);
+    OFFLOADING.store(true, Ordering::SeqCst);
+    drop(guard);
     let rx = Arc::new(Mutex::new(rx));
     let mut threads = OFFLOAD_THREADS.lock().unwrap_or_else(|p| p.into_inner());
     for index in 0..count {
@@ -139,6 +147,8 @@ fn offload_worker(rx: Arc<Mutex<mpsc::Receiver<OffloadJob>>>) {
 pub(crate) fn run_offload(job: impl FnOnce() + Send + 'static) {
     start_offload_pool();
     let send = OFFLOAD_SEND.lock().unwrap_or_else(|p| p.into_inner());
+    // `start_offload_pool` publishes the sender under this same lock before
+    // returning, so it is always `Some` here.
     if let Some(tx) = send.as_ref() {
         let _ = tx.send(Box::new(job));
     }
@@ -220,7 +230,9 @@ fn worker_loop(index: usize) {
         }
         let gid = pop_ready(index);
         match gid {
-            Some(gid) => drive(gid),
+            Some(gid) => {
+                drive(gid);
+            }
             None => wait_for_work(),
         }
     }
@@ -731,9 +743,13 @@ pub(crate) fn join_blocking(gid: i64) -> i64 {
                 return r;
             }
             Some((false, _, _)) => {
+                // A bounded wait re-reads the state on completion even when
+                // the notify lands between the state check and the wait.
                 let (lock, cvar) = &*SIGNAL;
-                let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-                guard = cvar.wait(guard).unwrap_or_else(|p| p.into_inner());
+                let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+                let _ = cvar
+                    .wait_timeout(guard, std::time::Duration::from_millis(10))
+                    .unwrap_or_else(|p| p.into_inner());
             }
             None => return NULL,
         }

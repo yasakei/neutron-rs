@@ -2441,16 +2441,19 @@ impl<'src> Parser<'src> {
                     right: Box::new(right),
                 })
             }
-            TokenKind::LessPipe => {
+            // The arrow points where the data flows: `v |> ch` pipes the
+            // value into the channel (send); `r <| ch` feeds the receiver
+            // from the channel (receive).
+            TokenKind::PipeGreater => {
                 let op_span = self.advance().span;
-                let value = self.parse_precedence(op_prec.next_higher())?;
+                let channel = self.parse_precedence(op_prec.next_higher())?;
                 Ok(Expr::ChanSend {
-                    channel: Box::new(left),
-                    value: Box::new(value),
+                    channel: Box::new(channel),
+                    value: Box::new(left),
                     op_span,
                 })
             }
-            TokenKind::PipeGreater => {
+            TokenKind::LessPipe => {
                 let op_span = self.advance().span;
                 let channel = self.parse_precedence(op_prec.next_higher())?;
                 match left {
@@ -3809,28 +3812,28 @@ for (var i = 0; i < 10; i = i + 1) {
 
     #[test]
     fn channel_send_and_receive_parse() {
-        // `<|` and `|>` are the channel operators; they do not collide with
-        // the `<<`/`>>` shift operators.
+        // `<|` receives, `|>` sends; they do not collide with the `<<`/`>>`
+        // shift operators.
         let source = "jobs <| value\nvalue |> jobs";
         let prog = parse_source(source).unwrap();
         assert_eq!(prog.statements.len(), 2);
         assert!(matches!(
             &prog.statements[0],
             Stmt::Expression {
-                expression: Expr::ChanSend { .. }
+                expression: Expr::ChanRecv { .. }
             }
         ));
         assert!(matches!(
             &prog.statements[1],
             Stmt::Expression {
-                expression: Expr::ChanRecv { .. }
+                expression: Expr::ChanSend { .. }
             }
         ));
     }
 
     #[test]
     fn channel_receive_rejects_non_variable_target() {
-        let source = "(a + b) |> jobs";
+        let source = "(a + b) <| jobs";
         let err = parse_source(source).unwrap_err();
         assert!(
             err.iter()

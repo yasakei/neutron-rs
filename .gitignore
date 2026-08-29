@@ -41,3 +41,7 @@ benchmarks/_build/
 # Agents
 .claude/
 .codex/
+
+# Python benchmark harness
+**/__pycache__/
+*.pyc
