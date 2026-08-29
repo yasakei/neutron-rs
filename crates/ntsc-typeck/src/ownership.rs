@@ -35,6 +35,7 @@ use ntsc_ast::stmt::{Program, Stmt};
 use ntsc_ast::types::TypeAnnotation;
 
 use crate::resolve::TypeError;
+use crate::ty::Ty;
 
 /// How a value of a given type behaves under assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -982,17 +983,31 @@ impl OwnershipChecker {
                 self.check_stmt(body);
                 self.pop_scope();
             }
-            Stmt::Go { call, block, .. } => {
+            Stmt::Go {
+                call,
+                block,
+                keyword_span,
+            } => {
                 self.go_depth += 1;
                 let _ = self.check_expr(call);
                 self.go_depth -= 1;
                 if let Some(block) = block {
-                    // Captures are shared with the goroutine: handles stay
-                    // usable in the caller (the caller's slot keeps
-                    // ownership of channels), scalars are copied.
                     self.push_scope();
                     self.check_sequence(block);
                     self.pop_scope();
+                    // Owned (non-channel) captures move into the goroutine's
+                    // future: the caller cannot use them afterwards. Capture
+                    // types come from the typed pass via the GO_CAPTURES
+                    // bridge; channels stay shared (the spawner keeps
+                    // ownership of the registry handle), scalars are copied.
+                    for (name, ty) in crate::resolve::go_captures(keyword_span.start) {
+                        if matches!(
+                            ty,
+                            Ty::String | Ty::Array(_) | Ty::Object | Ty::Class(_) | Ty::Own(_)
+                        ) {
+                            self.move_heap_value(&name, *keyword_span, "go capture");
+                        }
+                    }
                 }
             }
             Stmt::Return { value } => {

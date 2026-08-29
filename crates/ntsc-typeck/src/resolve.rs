@@ -32,6 +32,46 @@ pub fn chan_recv_element_type(span_start: usize) -> Ty {
         .unwrap_or(Ty::Any)
 }
 
+/// The name of a `go` callee for diagnostics (`worker` from `go worker(..)`).
+fn name_of_callee(callee: &Expr) -> String {
+    match callee {
+        Expr::Variable { name } => name.lexeme().to_string(),
+        _ => "go".into(),
+    }
+}
+
+impl TypeChecker {
+    /// Reject a `go` argument whose type cannot cross a thread boundary.
+    /// Views borrow the spawner's frame; `shared` refcounts are not
+    /// synchronized across goroutines.
+    fn reject_thread_unsafe(&mut self, ty: &Ty, span: Span, callee: &str) {
+        match ty {
+            Ty::View(..) => self.errors.push(TypeError {
+                code: Some("NTSC-E0501"),
+                help: Some(
+                    "a borrow may not outlive the goroutine; move or copy the value instead"
+                        .into(),
+                ),
+                message: format!(
+                    "cannot pass `{ty}` to `go {callee}`: a view cannot cross into a goroutine"
+                ),
+                span,
+            }),
+            Ty::Shared(..) => self.errors.push(TypeError {
+                code: Some("NTSC-E0501"),
+                help: Some(
+                    "`shared` reference counts are not synchronized across goroutines; send the value through a channel instead".into(),
+                ),
+                message: format!(
+                    "cannot pass `{ty}` to `go {callee}`: unsynchronized reference counting"
+                ),
+                span,
+            }),
+            _ => {}
+        }
+    }
+}
+
 // Captured outer locals per `go { ... }` block, keyed by the `go`
 // keyword's span start. Codegen turns each entry into the parameters of
 // the block's synthesized goroutine function; the list is deterministic
@@ -934,7 +974,9 @@ impl TypeChecker {
                 keyword_span,
             } => {
                 // `go worker(args)` runs an async function's future on the
-                // scheduler; the bare call is legal here (no `await`).
+                // scheduler; the bare call is legal here (no `await`). Every
+                // argument crosses a thread boundary: views may not outlive
+                // the spawner and `shared` refcounts are unsynchronized.
                 match call {
                     Expr::Call {
                         callee, arguments, ..
@@ -942,11 +984,29 @@ impl TypeChecker {
                             if self.async_fns.contains(name.lexeme())) =>
                     {
                         for argument in arguments {
-                            let _ = self.check_expression(argument);
+                            if let Some(ty) = self.check_expression(argument) {
+                                self.reject_thread_unsafe(
+                                    &ty,
+                                    argument.span(),
+                                    &name_of_callee(callee.as_ref()),
+                                );
+                            }
                         }
                     }
+                    Expr::Literal {
+                        value: LiteralValue::Nil,
+                        ..
+                    } if block.is_some() => {}
                     _ => {
-                        let _ = self.check_expression(call);
+                        self.errors.push(TypeError {
+                            code: Some("NTSC-E0501"),
+                            help: Some(
+                                "spawn an async function: `go worker(args)`, or run a block: `go { ... }`"
+                                    .into(),
+                            ),
+                            message: "`go` requires a call to an async function or a block".into(),
+                            span: call.span(),
+                        });
                     }
                 }
                 if let Some(block) = block {
@@ -962,6 +1022,32 @@ impl TypeChecker {
                         .filter_map(|name| {
                             let (depth, ty) = self.symbols.lookup_depth(&name)?;
                             if depth == 0 || matches!(ty, Ty::Function { .. }) {
+                                return None;
+                            }
+                            if let Ty::View(..) = &ty {
+                                self.errors.push(TypeError {
+                                    code: Some("NTSC-E0501"),
+                                    help: Some(
+                                        "a borrow may not outlive the goroutine; move or copy the value instead".into(),
+                                    ),
+                                    message: format!(
+                                        "cannot capture view `{name}` in a `go` block: a borrow cannot cross into a goroutine"
+                                    ),
+                                    span: *keyword_span,
+                                });
+                                return None;
+                            }
+                            if let Ty::Shared(..) = &ty {
+                                self.errors.push(TypeError {
+                                    code: Some("NTSC-E0501"),
+                                    help: Some(
+                                        "`shared` reference counts are not synchronized across goroutines; send the value through a channel instead".into(),
+                                    ),
+                                    message: format!(
+                                        "cannot capture shared `{name}` in a `go` block: unsynchronized reference counting"
+                                    ),
+                                    span: *keyword_span,
+                                });
                                 return None;
                             }
                             Some((name, ty.clone()))
@@ -4155,6 +4241,124 @@ mod tests {
     use super::*;
     use ntsc_lexer::tokenize;
     use ntsc_parser::parse;
+
+    // ── go: callable, thread-boundary args, capture classification ───────
+
+    #[test]
+    fn go_requires_an_async_fn_call_or_block() {
+        let errors =
+            check_source("fun helper() { }\nasync fun main() { go helper() }").unwrap_err();
+        assert!(
+            errors.iter().any(|e| e
+                .message
+                .contains("`go` requires a call to an async function")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_accepts_an_async_fn_call() {
+        check_source("async fun worker(int n) { say(\"w\") }\nasync fun main() { go worker(1) }")
+            .expect("an async fn call is a legal go spawn");
+    }
+
+    #[test]
+    fn go_rejects_view_argument() {
+        let errors = check_source(
+            "async fun worker(string s) { }\nasync fun main() { var string msg = \"hi\"\n view var v = msg\n go worker(v) }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("a view cannot cross into a goroutine")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_rejects_shared_argument() {
+        let errors = check_source(
+            "async fun worker(shared string s) { }\nasync fun main() { shared string g = \"hi\"\n go worker(g) }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("unsynchronized reference counting")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_rejects_view_capture() {
+        let errors = check_source(
+            "async fun main() { var string msg = \"hi\"\n view var v = msg\n go { say(v) } }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("cannot capture view `v`")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_rejects_shared_capture() {
+        let errors = check_source("async fun main() { shared string g = \"hi\"\n go { say(g) } }")
+            .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("cannot capture shared `g`")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_scalar_and_channel_captures_are_allowed() {
+        check_source(
+            "async fun main() { var chan[string] words = chan.new(2)\n var int base = 40\n go { say(\"capture \" + base) }\n go { for w in words { say(w) } }\n await async.sleep(1) }",
+        )
+        .expect("scalar and channel captures are safe");
+    }
+
+    #[test]
+    fn go_owned_capture_moves_out_of_the_caller() {
+        let errors = check_source(
+            "async fun main() { var string msg = \"hi\"\n go { say(msg) }\n say(msg) }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("use of moved value: `msg`")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn channel_send_moves_the_value() {
+        let errors = check_source(
+            "async fun main() { var chan[string] ch = chan.new(1)\n var string m = \"x\"\n ch <| m\n say(m) }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("use of moved value: `m`")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn channel_receive_binds_an_owned_receiver() {
+        check_source(
+            "async fun main() { var chan[string] ch = chan.new(2)\n ch <| \"ping\"\n x |> ch\n say(x) }",
+        )
+        .expect("a receive binds a fresh owned receiver");
+    }
 
     fn check_source(source: &str) -> Result<(), Vec<TypeError>> {
         let tokens = tokenize(source);
