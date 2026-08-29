@@ -165,35 +165,30 @@ pub(crate) fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Reserve a fresh core id.
-pub(crate) fn alloc_core() -> i64 {
-    let mut g = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
-    let id = g.next_core;
-    g.next_core = g.next_core.saturating_add(1);
-    id
-}
-
 /// Register a new goroutine and return its core id. The goroutine is not
 /// scheduled until [`crate::ntask::scheduler::make_runnable`] is called for it.
 pub(crate) fn register_goroutine(g: Goroutine) -> i64 {
-    let id = alloc_core();
     let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let id = guard.next_core;
+    guard.next_core = guard.next_core.saturating_add(1);
     guard.goroutines.insert(id, g);
     id
 }
 
 /// Register a new channel and return its core id.
 pub(crate) fn register_chan(cap: usize, owns_elements: bool) -> i64 {
-    let id = alloc_core();
     let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let id = guard.next_core;
+    guard.next_core = guard.next_core.saturating_add(1);
     guard.chans.insert(id, Chan::new(cap, owns_elements));
     id
 }
 
 /// Register a new reactor interest and return its core id.
 pub(crate) fn register_io() -> i64 {
-    let id = alloc_core();
     let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let id = guard.next_core;
+    guard.next_core = guard.next_core.saturating_add(1);
     guard.ios.insert(
         id,
         AsyncIo {
@@ -245,8 +240,9 @@ pub(crate) fn io_ready(core: i64) -> bool {
 /// [`crate::ntask::scheduler::offload_start`] and
 /// [`crate::ntask::scheduler::complete_job`].
 pub(crate) fn register_op() -> i64 {
-    let id = alloc_core();
     let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let id = guard.next_core;
+    guard.next_core = guard.next_core.saturating_add(1);
     guard.ops.insert(
         id,
         AsyncOp {

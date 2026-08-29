@@ -408,12 +408,11 @@ fn drive(gid: i64) {
         make_runnable(gid);
         return;
     }
-    // Always re-notify a sleeper: at least the requeued current goroutine (or a
-    // woken opposite waiter / joiner) is runnable.
+    // A bare park made nothing runnable: whoever later completes it (offload
+    // job, timer, channel partner) notifies then. Only a real handoff or
+    // requeue needs a worker.
     if woke {
         notify_all();
-    } else {
-        notify_one();
     }
 }
 
