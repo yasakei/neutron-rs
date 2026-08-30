@@ -140,6 +140,42 @@ async fun main() -> int {
     assert_clean(&stdout, &stderr, &output, &["fanout 8"]);
 }
 
+/// A goroutine still parked when `main` returns must not leak its future:
+/// the scheduler reclaims an abandoned future at shutdown, releasing the
+/// armed `async.sleep` handle and every owned local the future's slots hold.
+#[test]
+fn abandoned_goroutine_futures_are_reclaimed_at_shutdown() {
+    let source = r#"
+use fmt
+use arrays
+
+async fun napper(int id) {
+    var string tag = "worker-" + fmt.i64_to_str(id)
+    var array[int] work = [1, 2, 3]
+    await async.sleep(50)
+    say(tag)
+    say(fmt.i64_to_str(arrays.length(work)))
+}
+
+async fun main() -> int {
+    var int i = 0
+    while (i < 8) {
+        go napper(i)
+        i = i + 1
+    }
+    say("spawned, returning while they sleep")
+    return 0
+}
+"#;
+    let (stdout, stderr, output) = build_and_run(source, "ntroutine_abandoned_future");
+    assert_clean(
+        &stdout,
+        &stderr,
+        &output,
+        &["spawned, returning while they sleep"],
+    );
+}
+
 #[test]
 fn go_block_scalar_capture() {
     let source = r#"

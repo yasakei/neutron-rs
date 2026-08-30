@@ -186,6 +186,13 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
 
     // ── Virtual tasks / reactor ─────────────────────────────────────────
     declare!("ntask_go", i64_ty, async_poll_fn, i64_ty);
+    declare!(
+        "ntask_go_owned",
+        i64_ty,
+        async_poll_fn,
+        i64_ty,
+        ctx.ptr_type(AddressSpace::default())
+    );
     declare!("ntask_join", i64_ty, i64_ty);
     declare!("ntask_join_park", i8_ty, i64_ty);
     declare!("ntask_goroutine_drop", void_ty, i64_ty);

@@ -164,10 +164,12 @@ pub(crate) fn park_op(core_id: i64) {
 /// Register a goroutine running `poll` over the future `future`; returns its
 /// id without scheduling it. Call with a registry wrapper already published
 /// so a goroutine that finishes on its first poll can be reclaimed.
-pub(crate) fn register(poll: core::PollFn, future: i64) -> i64 {
+/// `cleanup` reclaims the future if the goroutine never completes.
+pub(crate) fn register(poll: core::PollFn, future: i64, cleanup: Option<core::CleanupFn>) -> i64 {
     start();
     core::register_goroutine(Goroutine {
         tasks: vec![(poll, future)],
+        cleanup: cleanup.map(|f| (f, future)),
         park: Park::None,
         pending_send: NULL,
         recv_result: NULL,
@@ -319,6 +321,9 @@ fn drive(gid: i64) {
             };
             gr.tasks = tasks;
             gr.done = true;
+            // The trampoline dropped and freed the future on its completion
+            // path, so the shutdown cleanup must not touch it again.
+            gr.cleanup = None;
             // The poll ran on this worker, so an exception it raised (a throw
             // with no handler in an async body) is parked on this thread's
             // TLS. Capture it so the thread that joins the goroutine can
@@ -796,16 +801,21 @@ pub(crate) fn shutdown() {
     }
     // Reclaim goroutines that were never joined or driven, releasing their
     // handles now that the workers have stopped.
+    struct Abandoned {
+        gid: i64,
+        exception: i64,
+        result: i64,
+        cleanup: Option<(core::CleanupFn, i64)>,
+    }
     let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
-    let pending: Vec<(i64, i64, i64)> = g
+    let pending: Vec<Abandoned> = g
         .goroutines
         .iter()
-        .map(|(&gid, gr)| {
-            (
-                gid,
-                gr.pending_exception,
-                if gr.done { gr.result } else { NULL },
-            )
+        .map(|(&gid, gr)| Abandoned {
+            gid,
+            exception: gr.pending_exception,
+            result: if gr.done { gr.result } else { NULL },
+            cleanup: gr.cleanup,
         })
         .collect();
     g.goroutines.clear();
@@ -814,13 +824,21 @@ pub(crate) fn shutdown() {
     g.ops.clear();
     core::timers_reset();
     drop(g);
-    for (gid, exception, result) in pending {
-        crate::registry::remove_goroutine_by_core(gid);
-        if exception != NULL {
-            let _ = crate::registry::remove(exception);
+    for abandoned in pending {
+        crate::registry::remove_goroutine_by_core(abandoned.gid);
+        if abandoned.exception != NULL {
+            let _ = crate::registry::remove(abandoned.exception);
         }
-        if result != NULL {
-            let _ = crate::registry::remove(result);
+        if abandoned.result != NULL {
+            let _ = crate::registry::remove(abandoned.result);
+        }
+        // A goroutine that never completed still owns its future: run the
+        // future's drop and free it, or the handles its slots hold (locals,
+        // parameters, an armed `async.sleep`) outlive the program. The global
+        // lock is released first because the drop reaches back into the
+        // scheduler through channel handles.
+        if let Some((cleanup, future)) = abandoned.cleanup {
+            cleanup(future);
         }
     }
     QUEUES.lock().unwrap_or_else(|p| p.into_inner()).clear();

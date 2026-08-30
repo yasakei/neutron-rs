@@ -20,6 +20,39 @@ pub(crate) enum AsyncFieldTy {
 
     /// A sub-future slot holding the child's future struct (one per await).
     Future(String),
+
+    /// A sub-future slot holding an `i64` handle to a runtime-owned future
+    /// (`async.sleep`, `http.*_async`). The handle must be released when the
+    /// awaiting future is dropped mid-flight, or the registry entry outlives
+    /// the program.
+    RuntimeFuture(RuntimeFutureKind),
+}
+
+/// A runtime-owned awaited future, identified by the function that releases
+/// its registry handle.
+#[derive(Clone, Copy)]
+pub(crate) enum RuntimeFutureKind {
+    Sleep,
+    Http,
+}
+
+impl RuntimeFutureKind {
+    /// The name of this kind's awaited callee, or `None` when the callee is a
+    /// user async function whose future is embedded inline.
+    fn of_child(child_name: &str) -> Option<Self> {
+        match child_name {
+            "sleep" => Some(Self::Sleep),
+            name if name.starts_with("http.") => Some(Self::Http),
+            _ => None,
+        }
+    }
+
+    fn drop_fn_name(self) -> &'static str {
+        match self {
+            Self::Sleep => "ntsc_async_sleep_drop",
+            Self::Http => "ntsc_async_http_drop",
+        }
+    }
 }
 
 /// One `await` point in an async body.
@@ -376,14 +409,13 @@ pub(crate) fn build_async_layout(
             // values.
             field_names.push(format!("sub_{child_name}"));
 
-            // `async.sleep` futures live in the runtime registry behind an
-            // i64 handle, so its slot is a plain integer; awaited user
-            // functions embed their child future struct inline. Offloaded
-            // runtime futures (`http.*_async`) are also bare i64 handles.
-            if child_name == "sleep" || child_name.starts_with("http.") {
-                field_tys.push(AsyncFieldTy::Native(Ty::Int));
-            } else {
-                field_tys.push(AsyncFieldTy::Future(child_name.clone()));
+            // `async.sleep` and offloaded `http.*_async` futures live in the
+            // runtime registry behind an i64 handle, so their slot is a
+            // handle the drop path must release; awaited user functions embed
+            // their child future struct inline.
+            match RuntimeFutureKind::of_child(&child_name) {
+                Some(kind) => field_tys.push(AsyncFieldTy::RuntimeFuture(kind)),
+                None => field_tys.push(AsyncFieldTy::Future(child_name.clone())),
             }
             await_state_index.push(suspension_points);
             suspension_points += 1;
@@ -942,6 +974,7 @@ pub(crate) fn declare_async_future<'ctx>(
         .iter()
         .map(|field| match field {
             AsyncFieldTy::Native(ty) => Ok(ty_to_llvm(ty, context)),
+            AsyncFieldTy::RuntimeFuture(_) => Ok(context.i64_type().as_basic_type_enum()),
             AsyncFieldTy::Future(child) => module
                 .get_struct_type(&format!("ntsc_future_{child}"))
                 .ok_or_else(|| {
@@ -1231,6 +1264,23 @@ fn emit_async_drop<'ctx>(
                     builder.build_store(ptr, default_llvm_value(ty, context))?;
                 }
             }
+            AsyncFieldTy::RuntimeFuture(kind) => {
+                // A runtime-owned awaited future (`async.sleep`,
+                // `http.*_async`) is a registry handle: release it here so a
+                // future dropped while parked on it — a `go` still sleeping
+                // when the program ends — does not leave the entry behind.
+                // The slot is zero until the await arms it, and every drop
+                // function is null-safe, so dropping an unarmed slot is a
+                // no-op.
+                let drop_fn = module.get_function(kind.drop_fn_name()).ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!("{} not declared", kind.drop_fn_name()))
+                })?;
+                let handle = builder
+                    .build_load(context.i64_type(), ptr, "runtime_future_drop")?
+                    .into_int_value();
+                builder.build_call(drop_fn, &[handle.into()], "runtime_future_drop_call")?;
+                builder.build_store(ptr, context.i64_type().const_zero())?;
+            }
             AsyncFieldTy::Future(child) => {
                 let child_fn = module
                     .get_function(&format!("ntsc_future_{child}_drop"))
@@ -1288,7 +1338,7 @@ pub(crate) fn emit_async_segment<'ctx>(
         }
         let ty = match &layout.field_tys[*index as usize] {
             AsyncFieldTy::Native(ty) => ty.clone(),
-            AsyncFieldTy::Future(_) => continue,
+            AsyncFieldTy::Future(_) | AsyncFieldTy::RuntimeFuture(_) => continue,
         };
         let ptr = fn_ctx.future_field(*index)?;
         fn_ctx.define_var(name, ptr, ty);
@@ -2156,6 +2206,33 @@ pub(crate) fn emit_go_program_spawn<'ctx>(
         fn_ctx
             .builder
             .build_ptr_to_int(child_ptr, fn_ctx.context.i64_type(), "go_handle")?;
+    // Hand the scheduler the future's cleanup thunk: a goroutine that never
+    // completes (still parked when the program ends) is reclaimed at shutdown
+    // instead of leaking whatever its future's slots own.
+    let cleanup_fn = fn_ctx
+        .module
+        .get_function(&format!("ntsc_future_{child_name}_go_cleanup"));
+    if let Some(cleanup_fn) = cleanup_fn {
+        let cleanup_ptr = fn_ctx.builder.build_pointer_cast(
+            cleanup_fn.as_global_value().as_pointer_value(),
+            fn_ctx.context.ptr_type(AddressSpace::default()),
+            "go_cleanup_fn",
+        )?;
+        let go_owned_fn = fn_ctx
+            .module
+            .get_function("ntask_go_owned")
+            .ok_or_else(|| crate::CodegenError::LLVMError("ntask_go_owned not declared".into()))?;
+        let goroutine = fn_ctx.builder.build_call(
+            go_owned_fn,
+            &[poll_ptr.into(), child_handle.into(), cleanup_ptr.into()],
+            "go_spawn",
+        )?;
+        // Fire and forget: the goroutine's registry entry outlives the spawn
+        // site (the scheduler drives it to completion; the entry is reclaimed
+        // when the runtime state is reset).
+        let _ = call_result_to_value(fn_ctx, &goroutine).into_int_value();
+        return Ok(());
+    }
     let go_fn = fn_ctx
         .module
         .get_function("ntask_go")
@@ -2172,8 +2249,8 @@ pub(crate) fn emit_go_program_spawn<'ctx>(
 }
 
 /// Emit `ntsc_future_<name>_go_poll(i64 future) -> i8`: the goroutine entry
-/// wrapper. Drives the child's poll; on completion it runs the child's drop
-/// function and frees the heap-allocated future, since the scheduler does
+/// wrapper. Drives the child's poll; on completion it reclaims the
+/// heap-allocated future through the cleanup thunk, since the scheduler does
 /// not know how the future was allocated.
 pub(crate) fn emit_goroutine_trampoline<'ctx>(
     context: &'ctx Context,
@@ -2191,16 +2268,7 @@ pub(crate) fn emit_goroutine_trampoline<'ctx>(
                 "internal: go callee poll ntsc_future_{child_name}_poll not declared"
             ))
         })?;
-    let child_drop = module
-        .get_function(&format!("ntsc_future_{child_name}_drop"))
-        .ok_or_else(|| {
-            crate::CodegenError::LLVMError(format!(
-                "internal: go callee drop ntsc_future_{child_name}_drop not declared"
-            ))
-        })?;
-    let free_fn = module
-        .get_function("free")
-        .ok_or_else(|| crate::CodegenError::LLVMError("free not declared".into()))?;
+    let cleanup_fn = get_or_create_goroutine_cleanup(context, module, child_name)?;
 
     let trampoline = module.add_function(
         &trampoline_name,
@@ -2235,6 +2303,66 @@ pub(crate) fn emit_goroutine_trampoline<'ctx>(
     builder.build_conditional_branch(is_done, cleanup, exit)?;
 
     builder.position_at_end(cleanup);
+    builder.build_call(cleanup_fn, &[handle.into()], "go_future_cleanup")?;
+    builder.build_unconditional_branch(exit)?;
+
+    builder.position_at_end(exit);
+    builder.build_return(Some(&done_val))?;
+    Ok(())
+}
+
+/// Get (or emit) `ntsc_future_<name>_go_cleanup(i64 future)`: reclaims one
+/// heap-allocated goroutine future by running its drop function and freeing
+/// it. The trampoline calls it when the future completes; the scheduler calls
+/// it at shutdown for a goroutine that never completed, so an abandoned
+/// future's owned handles (locals, parameters, an armed `async.sleep`) are
+/// still released.
+fn get_or_create_goroutine_cleanup<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    child_name: &str,
+) -> Result<FunctionValue<'ctx>, crate::CodegenError> {
+    let name = format!("ntsc_future_{child_name}_go_cleanup");
+    if let Some(existing) = module.get_function(&name) {
+        return Ok(existing);
+    }
+    let child_drop = module
+        .get_function(&format!("ntsc_future_{child_name}_drop"))
+        .ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!(
+                "internal: go callee drop ntsc_future_{child_name}_drop not declared"
+            ))
+        })?;
+    let free_fn = module
+        .get_function("free")
+        .ok_or_else(|| crate::CodegenError::LLVMError("free not declared".into()))?;
+
+    let function = module.add_function(
+        &name,
+        context
+            .void_type()
+            .fn_type(&[context.i64_type().into()], false),
+        Some(inkwell::module::Linkage::External),
+    );
+    let entry = context.append_basic_block(function, "entry");
+    let builder = context.create_builder();
+    builder.position_at_end(entry);
+
+    let handle = function
+        .get_nth_param(0)
+        .ok_or_else(|| crate::CodegenError::LLVMError("missing cleanup param".into()))?
+        .into_int_value();
+    let is_null = builder.build_int_compare(
+        inkwell::IntPredicate::EQ,
+        handle,
+        context.i64_type().const_zero(),
+        "go_cleanup_null",
+    )?;
+    let body = context.append_basic_block(function, "body");
+    let done = context.append_basic_block(function, "done");
+    builder.build_conditional_branch(is_null, done, body)?;
+
+    builder.position_at_end(body);
     let ptr = builder.build_int_to_ptr(
         handle,
         context.ptr_type(AddressSpace::default()),
@@ -2242,11 +2370,11 @@ pub(crate) fn emit_goroutine_trampoline<'ctx>(
     )?;
     builder.build_call(child_drop, &[ptr.into()], "go_future_drop")?;
     builder.build_call(free_fn, &[ptr.into()], "go_future_free")?;
-    builder.build_unconditional_branch(exit)?;
+    builder.build_unconditional_branch(done)?;
 
-    builder.position_at_end(exit);
-    builder.build_return(Some(&done_val))?;
-    Ok(())
+    builder.position_at_end(done);
+    builder.build_return(None)?;
+    Ok(function)
 }
 
 /// Convert a checker type back to a param annotation. Capture types are

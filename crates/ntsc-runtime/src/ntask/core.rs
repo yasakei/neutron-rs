@@ -19,6 +19,9 @@ use crate::registry::{self, NULL};
 /// completed, `0` when it is still pending. See [`crate::AsyncPollFn`].
 pub(crate) type PollFn = crate::AsyncPollFn;
 
+/// Reclaims one abandoned future. See [`crate::AsyncCleanupFn`].
+pub(crate) type CleanupFn = crate::AsyncCleanupFn;
+
 /// A per-goroutine wait target set by generated code before a poll returns
 /// `0`. The worker's driver reads it after the poll to decide whether to
 /// requeue, park on a channel, park on a timer, or park on a descriptor.
@@ -53,6 +56,10 @@ pub(crate) enum ChanOp {
 pub(crate) struct Goroutine {
     /// Nested async task stack. It moves with the goroutine between workers.
     pub(crate) tasks: Vec<(PollFn, i64)>,
+    /// Reclaims the root future if this goroutine never completes, so an
+    /// abandoned future's owned handles are released at shutdown. `None` for a
+    /// goroutine whose future is not heap-allocated by generated code.
+    pub(crate) cleanup: Option<(CleanupFn, i64)>,
     /// The pending wait target, set by the last park call.
     pub(crate) park: Park,
     /// The value a blocked sender is handing off, or `NULL`.
@@ -375,6 +382,7 @@ mod tests {
         }
         let core = register_goroutine(Goroutine {
             tasks: vec![(never_done as PollFn, NULL)],
+            cleanup: None,
             park: Park::None,
             pending_send: NULL,
             recv_result: NULL,
@@ -411,6 +419,7 @@ mod tests {
         let chan_core = register_chan(0, false);
         let core = register_goroutine(Goroutine {
             tasks: vec![(never_done as PollFn, NULL)],
+            cleanup: None,
             park: Park::Chan {
                 core: chan_core,
                 op: ChanOp::Send,
