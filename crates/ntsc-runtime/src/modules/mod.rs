@@ -2,15 +2,21 @@
 //! Stdlib modules are compiled into `libntsc_runtime.a`; `ntsc-codegen`
 //! forward-declares their extern "C" functions and the linker resolves them.
 
+#[cfg(feature = "archive")]
 pub mod archive;
 pub mod arrays;
 pub mod collections;
+#[cfg(feature = "crypto")]
 pub mod crypto;
 pub mod csv;
+#[cfg(feature = "crypto")]
 pub mod encoding;
 pub mod fmt;
+#[cfg(feature = "regex")]
 pub mod glob;
+#[cfg(feature = "crypto")]
 pub mod hash;
+#[cfg(feature = "http")]
 pub mod http;
 pub mod io;
 pub mod json;
@@ -21,6 +27,7 @@ pub mod os;
 pub mod paths;
 pub mod process;
 pub mod random;
+#[cfg(feature = "regex")]
 pub mod regex;
 pub mod slices;
 pub mod sort;

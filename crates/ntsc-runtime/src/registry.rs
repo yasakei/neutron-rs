@@ -122,8 +122,12 @@ pub(crate) enum Handle {
     /// A scheduled virtual goroutine owned by the task scheduler.
     Goroutine { core: i64 },
 
-    /// A channel core owned by the task scheduler.
-    Chan { core: i64 },
+    /// A channel core owned by the task scheduler, reference counted
+    /// like `Shared` so `go` and assignments can borrow the handle
+    /// without destroying the channel for peers. `core` is the
+    /// scheduler's `Chan` id, `count` is the number of live `Handle`
+    /// copies.
+    Chan { core: i64, count: u64 },
 
     /// A reactor registration for timers or descriptor readiness.
     ReactorReg { core: i64 },
@@ -1467,15 +1471,53 @@ pub(crate) fn goroutine_drop(id: i64) {
     crate::ntask::scheduler::drop_goroutine(core);
 }
 
-/// Drop a channel handle and reclaim its buffered elements.
+pub(crate) fn chan_retain(id: i64) -> i64 {
+    with_chan_mut(id, |handle| {
+        if let Handle::Chan { count, .. } = handle {
+            *count = count.saturating_add(1);
+        }
+    });
+    id
+}
+
+fn with_chan_mut<R>(id: i64, f: impl FnOnce(&mut Handle) -> R) -> Option<R> {
+    borrow_mut(id, |h| match h {
+        Handle::Chan { .. } => Some(f(h)),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Drop a channel handle. Like Go, dropping a `chan` variable does **not**
+/// close the channel — `close(ch)` is explicit. Reference counted like
+/// `Shared`: the `Chan` core stays alive until the last handle is gone.
+/// Previously this did `chan_close` + `drop_chan`, which woke a parked
+/// sender as a no-op after the peer's `ch` went out of scope and made
+/// `go sender(ch)` appear to complete after `main` returned, unlike Go
+/// where it stays blocked.
 pub(crate) fn chan_drop(id: i64) {
-    let Some(Handle::Chan { core }) =
-        remove_kind(id, |handle| matches!(handle, Handle::Chan { .. }))
-    else {
+    if id == NULL {
         return;
+    }
+    let mut guard = lock();
+    let count = match guard.get_mut(&id) {
+        Some(Handle::Chan { count, .. }) => {
+            *count = count.saturating_sub(1);
+            *count
+        }
+        _ => return,
     };
-    crate::ntask::scheduler::chan_close(core);
-    crate::ntask::scheduler::drop_chan(core);
+    if count > 0 {
+        return;
+    }
+    let taken = guard.remove(&id);
+    if taken.is_some() {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+    drop(guard);
+    if let Some(Handle::Chan { core, .. }) = taken {
+        crate::ntask::scheduler::drop_chan(core);
+    }
 }
 
 /// Drop a reactor registration handle.
@@ -1485,6 +1527,9 @@ pub(crate) fn reactor_reg_drop(id: i64) {
     else {
         return;
     };
+    // Unwatch the fd before the core is removed so the reactor never polls a
+    // stale descriptor.
+    crate::ntask::reactor::detach_fd(core);
     crate::ntask::scheduler::drop_io(core);
 }
 
@@ -1495,13 +1540,16 @@ pub(crate) fn async_io_drop(id: i64) {
     else {
         return;
     };
+    // Unwatch the fd before the core is removed so the reactor never polls a
+    // stale descriptor.
+    crate::ntask::reactor::detach_fd(core);
     crate::ntask::scheduler::drop_io(core);
 }
 
 pub(crate) fn task_core(id: i64) -> Option<i64> {
     borrow(id, |handle| match handle {
         Handle::Goroutine { core }
-        | Handle::Chan { core }
+        | Handle::Chan { core, .. }
         | Handle::ReactorReg { core }
         | Handle::AsyncIo { core } => Some(*core),
         _ => None,
@@ -1560,6 +1608,35 @@ pub(crate) fn take_opaque<T: Any + Send>(id: i64) -> Option<T> {
         }
         _ => None,
     }
+}
+
+/// Run `f` over the opaque value behind `id` with the registry lock released,
+/// then put the (possibly modified) value back at the same `id`. Blocking
+/// socket operations must use this so they do not hold the registry lock for
+/// the whole wait.
+pub(crate) fn with_opaque_io<T: Any + Send, R>(id: i64, f: impl FnOnce(T) -> (T, R)) -> Option<R> {
+    if id == NULL {
+        return None;
+    }
+    let taken = {
+        let mut guard = lock();
+        match guard.get(&id) {
+            Some(Handle::Opaque(opaque)) if opaque.is::<T>() => guard.remove(&id),
+            _ => return None,
+        }
+    };
+    let (t, r) = match taken {
+        Some(Handle::Opaque(opaque)) => match opaque.downcast::<T>() {
+            Ok(boxed) => f(*boxed),
+            Err(opaque) => {
+                lock().insert(id, Handle::Opaque(opaque));
+                return None;
+            }
+        },
+        _ => return None,
+    };
+    lock().insert(id, Handle::Opaque(Box::new(t)));
+    Some(r)
 }
 
 // ── High-level array operations used by lib.rs / modules ───────────────────
@@ -1889,5 +1966,56 @@ mod tests {
         assert!(is_registered(id));
         assert_eq!(get_string(id), Some("literal".to_string()));
         assert_counters_agree_with_map("insert_permanent");
+    }
+
+    /// A channel handle is reference counted: `go f(ch)` and `var b = ch`
+    /// retain it, so the core survives until the last holder drops it, and
+    /// only the removing drop touches `LIVE`.
+    #[test]
+    fn chan_handles_are_reference_counted_and_balance_the_live_counter() {
+        let core = crate::ntask::scheduler::register_chan(1, false);
+        let id = insert(Handle::Chan { core, count: 1 });
+        assert_counters_agree_with_map("chan insert");
+
+        assert_eq!(chan_retain(id), id);
+        assert_eq!(chan_retain(id), id);
+        assert_counters_agree_with_map("two chan retains");
+
+        chan_drop(id);
+        assert!(is_registered(id));
+        assert_counters_agree_with_map("chan drop with copies left");
+        chan_drop(id);
+        assert!(is_registered(id));
+        assert_counters_agree_with_map("second chan drop with a copy left");
+
+        chan_drop(id);
+        assert!(!is_registered(id));
+        assert_counters_agree_with_map("final chan drop");
+
+        chan_drop(id);
+        assert_counters_agree_with_map("chan drop of a stale handle");
+    }
+
+    /// Dropping a channel handle must not close the channel: `close(ch)` is
+    /// explicit, so a peer parked on a send stays parked when the other side
+    /// goes out of scope, as in Go.
+    #[test]
+    fn dropping_a_chan_handle_does_not_close_the_channel() {
+        let core = crate::ntask::scheduler::register_chan(0, false);
+        let id = insert(Handle::Chan { core, count: 1 });
+        chan_retain(id);
+
+        chan_drop(id);
+
+        let closed = crate::ntask::core::GLOBAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chans
+            .get(&core)
+            .map(|chan| chan.closed);
+        assert_eq!(closed, Some(false));
+
+        chan_drop(id);
+        assert!(!is_registered(id));
     }
 }

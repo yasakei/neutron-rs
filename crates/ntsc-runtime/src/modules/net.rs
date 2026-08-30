@@ -27,10 +27,16 @@ fn stream_mut<R>(
     handle: i64,
     f: impl FnOnce(&mut TcpStream) -> Result<R, String>,
 ) -> Result<R, String> {
-    match registry::with_opaque_mut(handle, |net: &mut NetHandle| match net {
-        NetHandle::TcpStream(stream) => Some(f(stream)),
-        _ => None,
-    }) {
+    match registry::with_opaque_io::<NetHandle, Option<Result<R, String>>>(
+        handle,
+        |net| match net {
+            NetHandle::TcpStream(mut stream) => {
+                let result = f(&mut stream);
+                (NetHandle::TcpStream(stream), Some(result))
+            }
+            other => (other, None),
+        },
+    ) {
         Some(Some(result)) => result,
         Some(None) => Err(format!("net.{fn_name}: handle is not a TCP stream")),
         None => Err(format!("net.{fn_name}: invalid (null) socket handle")),
@@ -42,10 +48,16 @@ fn udp_mut<R>(
     handle: i64,
     f: impl FnOnce(&mut UdpSocket) -> Result<R, String>,
 ) -> Result<R, String> {
-    match registry::with_opaque_mut(handle, |net: &mut NetHandle| match net {
-        NetHandle::UdpSocket(socket) => Some(f(socket)),
-        _ => None,
-    }) {
+    match registry::with_opaque_io::<NetHandle, Option<Result<R, String>>>(
+        handle,
+        |net| match net {
+            NetHandle::UdpSocket(mut socket) => {
+                let result = f(&mut socket);
+                (NetHandle::UdpSocket(socket), Some(result))
+            }
+            other => (other, None),
+        },
+    ) {
         Some(Some(result)) => result,
         Some(None) => Err(format!("net.{fn_name}: handle is not a UDP socket")),
         None => Err(format!("net.{fn_name}: invalid (null) socket handle")),
@@ -104,13 +116,22 @@ pub extern "C" fn ntsc_net_local_port(handle: i64) -> i64 {
 /// stream handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_net_tcp_accept(handle: i64) -> i64 {
-    let outcome = registry::with_opaque_mut(handle, |net: &mut NetHandle| match net {
-        NetHandle::TcpListener(listener) => Some(listener.accept()),
-        _ => None,
-    });
+    let outcome =
+        registry::with_opaque_io::<NetHandle, Option<Result<TcpStream, String>>>(handle, |net| {
+            match net {
+                NetHandle::TcpListener(listener) => match listener.accept() {
+                    Ok((stream, _peer)) => (NetHandle::TcpListener(listener), Some(Ok(stream))),
+                    Err(e) => (
+                        NetHandle::TcpListener(listener),
+                        Some(Err(format!("cannot accept connection: {e}"))),
+                    ),
+                },
+                other => (other, None),
+            }
+        });
     match outcome {
-        Some(Some(Ok((stream, _peer)))) => registry::put_opaque(NetHandle::TcpStream(stream)),
-        Some(Some(Err(e))) => fail("tcp_accept", format!("cannot accept connection: {e}")),
+        Some(Some(Ok(stream))) => registry::put_opaque(NetHandle::TcpStream(stream)),
+        Some(Some(Err(msg))) => fail("tcp_accept", msg),
         Some(None) => fail("tcp_accept", "handle is not a TCP listener"),
         None => fail("tcp_accept", "invalid (null) socket handle"),
     }

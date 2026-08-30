@@ -190,6 +190,7 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
     declare!("ntask_join_park", i8_ty, i64_ty);
     declare!("ntask_goroutine_drop", void_ty, i64_ty);
     declare!("ntask_chan_new", i64_ty, i64_ty, i8_ty);
+    declare!("ntask_chan_retain", i64_ty, i64_ty);
     declare!("ntask_chan_send", i8_ty, i64_ty, i64_ty);
     declare!("ntask_chan_recv", i8_ty, i64_ty);
     declare!("ntask_chan_recv_result", i64_ty);

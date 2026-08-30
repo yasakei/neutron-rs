@@ -105,11 +105,6 @@ pub(crate) struct AsyncLayout {
     susp_order: Vec<SuspKind>,
     ret_ty: Ty,
 
-    /// Number of parameter slots (indices 1..=param_count). Handle-typed
-    /// parameters of handle kinds shared across a thread boundary
-    /// (`Ty::Chan`) are borrowed by the future, never dropped by it.
-    param_count: u32,
-
     /// Anonymous async blocks compiled as part of this layout. Maps the
     /// generated function name to the block body.
     pub(crate) anon_async_blocks: Vec<(
@@ -458,7 +453,6 @@ pub(crate) fn build_async_layout(
         suspension_count: suspension_points,
         susp_order,
         ret_ty,
-        param_count: params.len() as u32,
         anon_async_blocks,
         block_span_to_name,
     };
@@ -1231,12 +1225,6 @@ fn emit_async_drop<'ctx>(
         let ptr = fn_ctx.future_field(index as u32)?;
         match field {
             AsyncFieldTy::Native(ty) if index != 0 && index as u32 != layout.result_index => {
-                // A channel parameter is a shared, registry-synchronized
-                // handle: the spawner keeps ownership, so the future must
-                // not drop its copy.
-                if matches!(ty, Ty::Chan(_)) && (index as u32) <= layout.param_count {
-                    continue;
-                }
                 if ty_is_owned_handle(ty) {
                     let value = builder.build_load(ty_to_llvm(ty, context), ptr, "future_drop")?;
                     emit_drop_value(&mut fn_ctx, &TypedValue::new(value, ty.clone()))?;
@@ -1521,6 +1509,11 @@ pub(crate) fn emit_await_suspend<'ctx>(
 
     let arg_values = emit_call_arguments(fn_ctx, arguments)?;
     for (i, arg_val) in arg_values.iter().enumerate() {
+        // The child future releases its parameter references in its drop, so
+        // a `chan` handle is retained for it.
+        if let Some(arg) = arguments.get(i) {
+            retain_chan_value(fn_ctx, arg, arg_val)?;
+        }
         let slot = fn_ctx.builder.build_struct_gep(
             child_struct_ty,
             child_ptr,
@@ -2122,6 +2115,9 @@ pub(crate) fn emit_go_program_spawn<'ctx>(
 
     let arg_values = emit_call_arguments(fn_ctx, &arguments)?;
     for (i, arg_val) in arg_values.iter().enumerate() {
+        // The goroutine's future releases its own `chan` reference when it
+        // drops, so the spawner retains one for it and keeps its own.
+        retain_chan_value(fn_ctx, &arguments[i], arg_val)?;
         let slot =
             fn_ctx
                 .builder

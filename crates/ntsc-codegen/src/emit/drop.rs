@@ -650,6 +650,12 @@ pub(crate) fn expr_is_fresh<'ctx>(
                             // `to_array` materializes a fresh array.
                             || (name.lexeme() == "slices"
                                 && matches!(tv.ntsc_type, Ty::Slice(_) | Ty::Array(_)))
+
+                            // `chan.new(cap)` hands over the channel's first
+                            // reference, so its destination adopts it.
+                            || (name.lexeme() == "chan"
+                                && prop == "new"
+                                && matches!(tv.ntsc_type, Ty::Chan(_)))
                     }
 
                     // User methods return by move, so any owned-handle
@@ -766,6 +772,14 @@ pub(crate) fn prepare_call_args<'ctx>(
             }
             continue;
         }
+        // A `chan` parameter holds a reference of its own, released by the
+        // callee's exit drop. The caller keeps its reference: a peer may
+        // still be sending on the channel.
+        if matches!(val.ntsc_type, Ty::Chan(_)) {
+            retain_chan_value(fn_ctx, arg, val)?;
+            prepared.push(val.clone());
+            continue;
+        }
         let takes_ownership = param_ty
             .map(|t| !matches!(t, Ty::View(..)))
             .unwrap_or(false);
@@ -853,6 +867,31 @@ pub(crate) fn copy_owned_value<'ctx>(
         )),
         _ => Ok(val.clone()),
     }
+}
+
+/// Record another live copy of a channel handle. A `chan` is a
+/// reference-counted registry handle: every owning slot, future field, and
+/// parameter holds one reference, and the channel core outlives the last of
+/// them. `chan.new(...)` hands over the first reference, so a fresh channel
+/// is adopted without retaining.
+pub(crate) fn retain_chan_value<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    expr: &Expr,
+    val: &TypedValue<'ctx>,
+) -> Result<(), crate::CodegenError> {
+    if !matches!(val.ntsc_type, Ty::Chan(_)) || expr_is_fresh(fn_ctx, expr, val) {
+        return Ok(());
+    }
+    let retain_fn = fn_ctx
+        .module
+        .get_function("ntask_chan_retain")
+        .ok_or_else(|| crate::CodegenError::LLVMError("ntask_chan_retain not declared".into()))?;
+    fn_ctx.builder.build_call(
+        retain_fn,
+        &[BasicMetadataValueEnum::IntValue(val.value.into_int_value())],
+        "chan_retain",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn expr_is_string_literal(expr: &Expr) -> bool {
@@ -1097,6 +1136,17 @@ pub(crate) fn store_into_owned_slot<'ctx>(
         }
         return Ok(true);
     }
+    // A `chan` slot holds one reference: `var b = a` gives `b` its own, so
+    // each slot's drop releases exactly what it took. The new reference is
+    // taken before the slot's previous one is released, so a redeclaration
+    // reading its own slot cannot destroy the channel.
+    if matches!(ty, Ty::Chan(_)) {
+        retain_chan_value(fn_ctx, expr, val)?;
+        emit_drop_replaced_value(fn_ctx, ptr, ty, val)?;
+        fn_ctx.builder.build_store(ptr, val.value)?;
+        return Ok(true);
+    }
+
     let mut owned = expr_is_owned(fn_ctx, expr, val);
     let is_str_lit = expr_is_string_literal(expr);
     if is_str_lit && matches!(ty, Ty::String) {

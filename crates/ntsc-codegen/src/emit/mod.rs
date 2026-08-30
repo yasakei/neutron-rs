@@ -543,6 +543,7 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
                 | Ty::String
                 | Ty::Object
                 | Ty::Shared(_)
+                | Ty::Chan(_)
                 | Ty::Option(_)
                 | Ty::Result { .. }
                 | Ty::Pointer
@@ -562,7 +563,9 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
     /// and result slots *are* nulled: both are owned cells, so a move that
     /// left the slot intact would let both the destination and this scope's
     /// exit free the same cell. A `dyn` fat pointer owns its header, so it
-    /// is nulled on move for the same reason.
+    /// is nulled on move for the same reason. A `chan` slot holds one
+    /// reference of a counted handle: `return ch` hands that reference to
+    /// the caller, so the slot must not release it again.
     fn null_var_slot(&mut self, name: &str) {
         if let Some((ptr, ty)) = self.lookup_var(name)
             && matches!(
@@ -570,6 +573,7 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
                 Ty::Array(_)
                     | Ty::String
                     | Ty::Object
+                    | Ty::Chan(_)
                     | Ty::Option(_)
                     | Ty::Dyn(_)
                     | Ty::Result { .. }

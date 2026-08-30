@@ -161,11 +161,12 @@ pub(crate) fn park_op(core_id: i64) {
     park_self(Park::Job { core: core_id });
 }
 
-/// Spawn a goroutine running `poll` over the future `future`; returns its id.
-/// The goroutine is scheduled immediately.
-pub(crate) fn spawn(poll: core::PollFn, future: i64) -> i64 {
+/// Register a goroutine running `poll` over the future `future`; returns its
+/// id without scheduling it. Call with a registry wrapper already published
+/// so a goroutine that finishes on its first poll can be reclaimed.
+pub(crate) fn register(poll: core::PollFn, future: i64) -> i64 {
     start();
-    let gid = core::register_goroutine(Goroutine {
+    core::register_goroutine(Goroutine {
         tasks: vec![(poll, future)],
         park: Park::None,
         pending_send: NULL,
@@ -175,9 +176,7 @@ pub(crate) fn spawn(poll: core::PollFn, future: i64) -> i64 {
         result: NULL,
         pending_exception: NULL,
         joiners: Vec::new(),
-    });
-    make_runnable(gid);
-    gid
+    })
 }
 
 /// Push a goroutine onto the ready queue and wake a worker.
@@ -369,6 +368,7 @@ fn drive(gid: i64) {
         Park::Chan { core, op } => woke = chan_op(&mut g, gid, core, op),
         Park::Timer { at } => {
             g.timers.entry(at).or_default().push(gid);
+            core::timers_pending_offset(1);
             let pending = !g.ready.is_empty();
             drop(g);
             super::reactor::wake_reactor();
@@ -380,7 +380,7 @@ fn drive(gid: i64) {
         Park::Fd { io, read } => {
             let fd = g.ios.get_mut(&io).map(|slot| {
                 slot.parked = true;
-                slot.ready = false;
+                // `ready` stays set; consumed via `io_ready` when it re-polls.
                 slot.waiters.push(gid);
                 slot.fd
             });
@@ -488,7 +488,6 @@ fn chan_send(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
         return true;
     }
     if cap > 0 && chan.buf.len() < cap {
-        // Buffered: room available. Push the value.
         chan.buf.push_back(value);
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.pending_send = NULL;
@@ -496,8 +495,6 @@ fn chan_send(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
         g.ready.push_back(gid);
         return false;
     }
-    // Buffer full (or unbuffered with no receiver) — park as a sender, keeping
-    // the value ready for handoff.
     chan.senders.push_back(gid);
     false
 }
@@ -518,7 +515,6 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
             gr.recv_result = v;
             gr.recv_ok = true;
         }
-        // Refill the freed slot from a parked sender.
         if let Some(s) = chan.senders.pop_front() {
             let sv = g
                 .goroutines
@@ -572,6 +568,7 @@ pub(crate) fn chan_close(core_id: i64) {
     let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
     let (drained, senders, owns_elements, count) = {
         let Some(chan) = g.chans.get_mut(&core_id) else {
+            eprintln!("[sched] chan_close: not found");
             return;
         };
         if chan.closed {
@@ -797,11 +794,35 @@ pub(crate) fn shutdown() {
         OFFLOADING.store(false, Ordering::SeqCst);
         OFFLOAD_STOP.store(false, Ordering::Relaxed);
     }
+    // Reclaim goroutines that were never joined or driven, releasing their
+    // handles now that the workers have stopped.
     let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let pending: Vec<(i64, i64, i64)> = g
+        .goroutines
+        .iter()
+        .map(|(&gid, gr)| {
+            (
+                gid,
+                gr.pending_exception,
+                if gr.done { gr.result } else { NULL },
+            )
+        })
+        .collect();
+    g.goroutines.clear();
     g.ready.clear();
     g.timers.clear();
     g.ops.clear();
+    core::timers_reset();
     drop(g);
+    for (gid, exception, result) in pending {
+        crate::registry::remove_goroutine_by_core(gid);
+        if exception != NULL {
+            let _ = crate::registry::remove(exception);
+        }
+        if result != NULL {
+            let _ = crate::registry::remove(result);
+        }
+    }
     QUEUES.lock().unwrap_or_else(|p| p.into_inner()).clear();
     SHUTDOWN.store(false, Ordering::Relaxed);
 }
@@ -824,6 +845,14 @@ pub(crate) use core::register_chan;
 pub(crate) use core::register_io;
 pub(crate) use core::register_op;
 
-pub(crate) fn wake_workers_all() {
-    notify_all();
+/// Wake up to `count` idle workers.
+pub(crate) fn wake_workers(count: usize) {
+    if count == 0 {
+        return;
+    }
+    let (lock, cvar) = &*SIGNAL;
+    let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+    for _ in 0..count {
+        cvar.notify_one();
+    }
 }

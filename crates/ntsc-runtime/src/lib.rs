@@ -53,6 +53,10 @@ pub extern "C" fn ntsc_runtime_shutdown(report: i8) {
     if ntsc_exception_pending() != 0 {
         ntsc_uncaught_exception();
     }
+    // Drain workers before reporting so the final goroutine drives can
+    // reclaim their registry entries.
+    ntask::reactor::shutdown();
+    ntask::scheduler::shutdown();
     let leaks = registry::live_count();
     if report != 0 && leaks > 0 {
         let entries = registry::live_entries();
@@ -86,8 +90,6 @@ pub extern "C" fn ntsc_runtime_shutdown(report: i8) {
         }
         let _ = handle.flush();
     }
-    ntask::reactor::shutdown();
-    ntask::scheduler::shutdown();
 }
 
 /// Attach an NTSC source location to a registry allocation for debug leak
@@ -678,8 +680,12 @@ pub extern "C" fn ntsc_async_op_drop(id: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ntask_go(poll_fn: AsyncPollFn, future: i64) -> i64 {
-    let core = ntask::scheduler::spawn(poll_fn, future);
-    registry::insert(registry::Handle::Goroutine { core })
+    let core = ntask::scheduler::register(poll_fn, future);
+    // Publish the registry wrapper before the goroutine can be driven, so a
+    // child that finishes on its first poll is never orphaned.
+    let handle = registry::insert(registry::Handle::Goroutine { core });
+    ntask::scheduler::make_runnable(core);
+    handle
 }
 
 #[unsafe(no_mangle)]
@@ -707,7 +713,12 @@ pub extern "C" fn ntask_goroutine_drop(goroutine: i64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn ntask_chan_new(capacity: i64, owns_elements: i8) -> i64 {
     let core = ntask::scheduler::register_chan(capacity.max(0) as usize, owns_elements != 0);
-    registry::insert(registry::Handle::Chan { core })
+    registry::insert(registry::Handle::Chan { core, count: 1 })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_retain(channel: i64) -> i64 {
+    registry::chan_retain(channel)
 }
 
 #[unsafe(no_mangle)]

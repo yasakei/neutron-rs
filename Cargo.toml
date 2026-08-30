@@ -18,3 +18,23 @@ members = [
 version = "26.0.0"
 edition = "2024"
 license = "NPL-1.1"
+
+# The dev (test/GATE) profile prioritizes fast compilation and linking over
+# debuggability. Turning off debug info removes the dominant (tens of MB) part
+# of every artifact, most importantly the `ntsc-runtime` staticlib that every
+# Neutron binary links against. Release builds keep full optimization in the
+# separate `release` profile and are unaffected.
+[profile.dev]
+debug = false
+
+# Release: C-like speed + smallest binaries. `lto=thin` lets LLVM drop
+# unused runtime modules that were not imported (`only build what is
+# used`), `codegen-units=1` maximizes optimization, `panic=abort`
+# removes unwinding tables, `strip` drops the 3M of debug symbols that
+# `debug=false` already removed from dev but release never had.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+opt-level = "z"

@@ -10,6 +10,7 @@
 //! pool while I/O-bound goroutines park without tying up a thread.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::registry::{self, NULL};
@@ -158,6 +159,26 @@ pub(crate) static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| {
     })
 });
 
+/// Number of goroutines currently parked on timers.
+static TIMER_PENDING: AtomicI64 = AtomicI64::new(0);
+
+/// Adjust the pending-timer count by `delta` (negative to decrement). The
+/// global lock must be held whenever a timer is parked or fired.
+pub(crate) fn timers_pending_offset(delta: i64) {
+    let _ = TIMER_PENDING.fetch_add(delta, Ordering::Relaxed);
+}
+
+/// Whether any goroutine is parked on a timer. The reactor fast path uses this
+/// to skip the global lock when there is nothing to scan.
+pub(crate) fn has_pending_timers() -> bool {
+    TIMER_PENDING.load(Ordering::Relaxed) > 0
+}
+
+/// Reset the pending-timer count.
+pub(crate) fn timers_reset() {
+    TIMER_PENDING.store(0, Ordering::Relaxed);
+}
+
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -201,10 +222,44 @@ pub(crate) fn register_io() -> i64 {
     id
 }
 
-/// Drop a goroutine core.
+/// Drop a goroutine core and clean up any global wait queues it was
+/// parked on (timers, channels, io, offloaded jobs). Otherwise a
+/// `go` that was parked on `async.sleep` and then dropped (e.g. its
+/// `Handle::Goroutine` was reaped after `main` returned) would keep its
+/// deadline in `timers` and `TIMER_PENDING` would stay >0, keeping the
+/// reactor spinning. The same applies to `chan`/`io`/`job` waiters.
 pub(crate) fn drop_goroutine(core: i64) {
     let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
     guard.goroutines.remove(&core);
+    // Timers: remove this gid from any deadline bucket.
+    let mut removed_timers = 0i64;
+    guard.timers.retain(|_, gids| {
+        let before = gids.len();
+        gids.retain(|&gid| gid != core);
+        removed_timers += (before - gids.len()) as i64;
+        !gids.is_empty()
+    });
+    if removed_timers > 0 {
+        timers_pending_offset(-removed_timers);
+    }
+    // Channels: remove from any senders/receivers queue.
+    for chan in guard.chans.values_mut() {
+        chan.senders.retain(|&gid| gid != core);
+        chan.receivers.retain(|&gid| gid != core);
+    }
+    // Reactor io: remove from any waiters list.
+    for io in guard.ios.values_mut() {
+        io.waiters.retain(|&gid| gid != core);
+        if io.waiters.is_empty() {
+            io.parked = false;
+        }
+    }
+    // Offloaded jobs: clear waiter if it was this gid.
+    for op in guard.ops.values_mut() {
+        if op.waiter == Some(core) {
+            op.waiter = None;
+        }
+    }
 }
 
 /// Drop a channel core, reclaiming any buffered element handles.
@@ -212,8 +267,6 @@ pub(crate) fn drop_chan(core: i64) {
     let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(chan) = guard.chans.remove(&core) {
         for slot in chan.buf {
-            // Slots hold owned handles for heap element types; release them.
-            // For scalar slots the value is dropped by value with no effect.
             if chan.owns_elements {
                 let _ = registry::remove(slot);
             }
@@ -305,5 +358,84 @@ pub(crate) fn drop_op(core: i64) {
         && op.result != NULL
     {
         let _ = registry::remove(op.result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A goroutine dropped while parked on a timer must leave no deadline
+    /// behind: a stale entry would keep `TIMER_PENDING` above zero and the
+    /// reactor scanning forever.
+    #[test]
+    fn dropping_a_timer_parked_goroutine_clears_its_deadline() {
+        extern "C" fn never_done(_: i64) -> i8 {
+            0
+        }
+        let core = register_goroutine(Goroutine {
+            tasks: vec![(never_done as PollFn, NULL)],
+            park: Park::None,
+            pending_send: NULL,
+            recv_result: NULL,
+            recv_ok: false,
+            done: false,
+            result: NULL,
+            pending_exception: NULL,
+            joiners: Vec::new(),
+        });
+        let deadline = now_ms() + 10_000;
+        {
+            let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+            guard.timers.entry(deadline).or_default().push(core);
+        }
+        timers_pending_offset(1);
+        assert!(has_pending_timers());
+
+        drop_goroutine(core);
+
+        let guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!guard.timers.contains_key(&deadline));
+        assert!(!guard.goroutines.contains_key(&core));
+        drop(guard);
+        assert!(!has_pending_timers());
+    }
+
+    /// A goroutine dropped while parked on a channel must be removed from the
+    /// channel's wait queues, or a later handoff would target a dead id.
+    #[test]
+    fn dropping_a_chan_parked_goroutine_clears_its_wait_queues() {
+        extern "C" fn never_done(_: i64) -> i8 {
+            0
+        }
+        let chan_core = register_chan(0, false);
+        let core = register_goroutine(Goroutine {
+            tasks: vec![(never_done as PollFn, NULL)],
+            park: Park::Chan {
+                core: chan_core,
+                op: ChanOp::Send,
+            },
+            pending_send: NULL,
+            recv_result: NULL,
+            recv_ok: false,
+            done: false,
+            result: NULL,
+            pending_exception: NULL,
+            joiners: Vec::new(),
+        });
+        {
+            let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+            let chan = guard.chans.get_mut(&chan_core).expect("channel");
+            chan.senders.push_back(core);
+        }
+
+        drop_goroutine(core);
+
+        let guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+        let chan = guard.chans.get(&chan_core).expect("channel");
+        assert!(chan.senders.is_empty());
+        assert!(chan.receivers.is_empty());
+        drop(guard);
+        drop_chan(chan_core);
     }
 }

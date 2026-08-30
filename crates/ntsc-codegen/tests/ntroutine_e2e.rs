@@ -106,6 +106,41 @@ async fun main() -> int {
 }
 
 #[test]
+fn chan_handle_copies_keep_the_channel_alive() {
+    let source = r#"
+async fun worker(chan[int] done) {
+    1 |> done
+}
+
+fun make_chan() -> chan[int] {
+    var chan[int] c = chan.new(8)
+    return c
+}
+
+async fun main() -> int {
+    var chan[int] done = make_chan()
+    var chan[int] alias = done
+    var int i = 0
+    while (i < 8) {
+        go worker(alias)
+        i = i + 1
+    }
+    var int received = 0
+    for count in done {
+        received = received + count
+        if (received == 8) {
+            close(done)
+        }
+    }
+    say("fanout " + received)
+    return 0
+}
+"#;
+    let (stdout, stderr, output) = build_and_run(source, "ntroutine_chan_copies");
+    assert_clean(&stdout, &stderr, &output, &["fanout 8"]);
+}
+
+#[test]
 fn go_block_scalar_capture() {
     let source = r#"
 async fun main() -> int {

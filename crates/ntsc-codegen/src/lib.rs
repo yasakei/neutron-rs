@@ -257,20 +257,29 @@ pub fn link_binary(
 
 #[cfg(not(target_os = "windows"))]
 fn link_unix(obj_path: &Path, runtime_lib: &Path, output_path: &Path) -> Result<(), CodegenError> {
-    let use_lld = command_available("clang") && command_available("ld.lld");
-    let mut command = if use_lld {
-        let mut command = std::process::Command::new("clang");
-        command.arg("-fuse-ld=lld");
-        command
-    } else {
-        std::process::Command::new("cc")
+    // Pick the fastest available linker. The runtime archive statically
+    // bundles the whole stdlib (net/TLS, regex, archive, ...), so linking
+    // against it is the dominant cost of building a program; a fast linker
+    // (mold/lld/gold) cuts that down substantially where one is installed.
+    let mut command = match select_unix_linker() {
+        UnixLinker::FuseLd { driver, flavor } => {
+            let mut command = std::process::Command::new(driver);
+            command.arg(format!("-fuse-ld={flavor}"));
+            command
+        }
+        UnixLinker::System => std::process::Command::new("cc"),
     };
     command
         .arg("-o")
         .arg(output_path)
         .arg(obj_path)
         .arg(runtime_lib)
-        .arg("-lm");
+        .arg("-lm")
+        // Strip the produced binary: the runtime archive carries the full
+        // stdlib, so an unstripped executable balloons into tens of megabytes
+        // of symbols and debug info. Local symbols and .eh_frame are kept as
+        // needed for unwinding; only the debug/global symbol tables go away.
+        .arg("-s");
 
     // macOS links pthread and dl into libSystem, so the flags are
     // unnecessary there; on other Unix hosts they name real libraries.
@@ -278,6 +287,52 @@ fn link_unix(obj_path: &Path, runtime_lib: &Path, output_path: &Path) -> Result<
         command.arg("-lpthread").arg("-ldl");
     }
     run_linker(&mut command)
+}
+
+/// A linker configuration for non-Windows hosts.
+#[cfg(not(target_os = "windows"))]
+enum UnixLinker {
+    /// A fast ELF linker selected via the C driver's `-fuse-ld=<flavor>`.
+    FuseLd {
+        driver: &'static str,
+        flavor: &'static str,
+    },
+    /// The system default linker (GNU ld on Linux, ld64 on macOS).
+    System,
+}
+
+#[cfg(not(target_os = "windows"))]
+fn select_unix_linker() -> UnixLinker {
+    // On macOS the system linker is ld64, which `-fuse-ld=gold` etc. do not
+    // target; keep the prior Clang-vs-ld.lld behaviour there.
+    if !cfg!(target_os = "macos") {
+        // Prefer the fastest ELF linkers first: mold, then lld, then gold.
+        if command_available("mold") {
+            return UnixLinker::FuseLd {
+                driver: "cc",
+                flavor: "mold",
+            };
+        }
+        if command_available("ld.lld") {
+            return UnixLinker::FuseLd {
+                driver: "cc",
+                flavor: "lld",
+            };
+        }
+        if command_available("ld.gold") {
+            return UnixLinker::FuseLd {
+                driver: "cc",
+                flavor: "gold",
+            };
+        }
+    }
+    if command_available("clang") && command_available("ld.lld") {
+        return UnixLinker::FuseLd {
+            driver: "clang",
+            flavor: "lld",
+        };
+    }
+    UnixLinker::System
 }
 
 #[cfg(not(target_os = "windows"))]

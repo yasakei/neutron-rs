@@ -118,6 +118,16 @@ pub(crate) fn emit_assign<'ctx>(
                 return Ok(val);
             }
 
+            // A `chan` slot holds one reference: take the new one before
+            // releasing the old, so `ch = ch` cannot destroy the channel it
+            // stores back.
+            if matches!(ty, Ty::Chan(_)) {
+                retain_chan_value(fn_ctx, value, &val)?;
+                emit_drop_replaced_value(fn_ctx, ptr, &ty, &val)?;
+                fn_ctx.builder.build_store(ptr, val.value)?;
+                return Ok(val);
+            }
+
             correct_empty_array_flag(fn_ctx, value, &val, &ty)?;
             // A string literal assigned into a `string` slot is heap-copied
             // (the slot must never free an immutable global); an owned

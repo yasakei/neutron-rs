@@ -50,6 +50,11 @@ enum ValueKind {
     /// Aliasing is the point of `shared`, so copies are always permitted.
     Shared,
 
+    /// A channel handle — reference counted like `Shared`, so copying it is
+    /// what `var b = a` and `go f(ch)` do, but unlike `shared` its count is
+    /// synchronized, so a copy may cross into a goroutine.
+    Chan,
+
     /// Function/closure references — immutable, copyable.
     Function,
 
@@ -1445,8 +1450,10 @@ impl OwnershipChecker {
                 }
                 let target_kind = self.lookup_kind(name.lexeme());
 
-                if matches!(target_kind, Some(ValueKind::Heap | ValueKind::Shared))
-                    && self.is_viewed(name.lexeme()).is_some()
+                if matches!(
+                    target_kind,
+                    Some(ValueKind::Heap | ValueKind::Shared | ValueKind::Chan)
+                ) && self.is_viewed(name.lexeme()).is_some()
                 {
                     self.error(
                         format!("cannot assign to `{}` while it is viewed", name.lexeme()),
@@ -1802,7 +1809,10 @@ impl OwnershipChecker {
     }
 
     fn is_borrowable_kind(&self, kind: Option<ValueKind>) -> bool {
-        matches!(kind, Some(ValueKind::Heap | ValueKind::Shared))
+        matches!(
+            kind,
+            Some(ValueKind::Heap | ValueKind::Shared | ValueKind::Chan)
+        )
     }
 
     fn check_call(
@@ -2085,8 +2095,9 @@ fn kind_of_annotation(annotation: &TypeAnnotation) -> ValueKind {
         TypeAnnotation::Dyn(_) | TypeAnnotation::ImplTrait(_) => ValueKind::Heap,
         // Tuples are stack-allocated value types.
         TypeAnnotation::Tuple(_) => ValueKind::Scalar,
-        // A channel is a heap handle owning its underlying queue.
-        TypeAnnotation::Chan(_) => ValueKind::Heap,
+        // A channel handle is reference counted: a copy is a new reference,
+        // never a move, so both the spawner and the goroutine can use it.
+        TypeAnnotation::Chan(_) => ValueKind::Chan,
     }
 }
 
@@ -2120,6 +2131,9 @@ fn root_source(expr: Option<&Expr>) -> Option<&ntsc_ast::token::Token> {
 fn thread_unsafe_reason(kind: ValueKind, heap: HeapPolicy) -> Option<&'static str> {
     match kind {
         ValueKind::Scalar | ValueKind::Function | ValueKind::Unknown => None,
+        // A channel handle is exactly what is meant to cross a thread
+        // boundary: its reference count is synchronized.
+        ValueKind::Chan => None,
         ValueKind::Heap => match heap {
             HeapPolicy::Copies => None,
             HeapPolicy::Rejects(reason) => Some(reason),
