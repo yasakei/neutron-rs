@@ -336,6 +336,62 @@ fn notify_all_unconditional() {
     cvar.notify_all();
 }
 
+/// Per-worker scheduler statistics, reported at shutdown when the environment
+/// variable `NTS_SCHED_STATS` is set. Diagnostic only: the counters are plain
+/// relaxed atomics on the worker's own slot, so they cost one increment per
+/// poll and never synchronize between workers.
+const MAX_TRACKED_WORKERS: usize = 64;
+static STAT_POLLS: [AtomicUsize; MAX_TRACKED_WORKERS] =
+    [const { AtomicUsize::new(0) }; MAX_TRACKED_WORKERS];
+static STAT_STEALS: [AtomicUsize; MAX_TRACKED_WORKERS] =
+    [const { AtomicUsize::new(0) }; MAX_TRACKED_WORKERS];
+static STAT_SPIN_NS: [AtomicUsize; MAX_TRACKED_WORKERS] =
+    [const { AtomicUsize::new(0) }; MAX_TRACKED_WORKERS];
+static STAT_PARK_NS: [AtomicUsize; MAX_TRACKED_WORKERS] =
+    [const { AtomicUsize::new(0) }; MAX_TRACKED_WORKERS];
+static STAT_BUSY_NS: [AtomicUsize; MAX_TRACKED_WORKERS] =
+    [const { AtomicUsize::new(0) }; MAX_TRACKED_WORKERS];
+
+fn stats_enabled() -> bool {
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("NTS_SCHED_STATS").is_some());
+    *ENABLED
+}
+
+/// Print per-worker distribution and idle time. Called from [`shutdown`].
+fn report_stats() {
+    if !stats_enabled() {
+        return;
+    }
+    let workers = queues().len().min(MAX_TRACKED_WORKERS);
+    let total_polls: usize = (0..workers)
+        .map(|i| STAT_POLLS[i].load(Ordering::Relaxed))
+        .sum();
+    eprintln!("[sched] worker  polls    share   steals   busy_ms  spin_ms  park_ms  idle%");
+    for index in 0..workers {
+        let polls = STAT_POLLS[index].load(Ordering::Relaxed);
+        let steals = STAT_STEALS[index].load(Ordering::Relaxed);
+        let busy_ms = STAT_BUSY_NS[index].load(Ordering::Relaxed) / 1_000_000;
+        let spin_ms = STAT_SPIN_NS[index].load(Ordering::Relaxed) / 1_000_000;
+        let park_ms = STAT_PARK_NS[index].load(Ordering::Relaxed) / 1_000_000;
+        let share = if total_polls > 0 {
+            polls as f64 * 100.0 / total_polls as f64
+        } else {
+            0.0
+        };
+        let live = busy_ms + spin_ms + park_ms;
+        let idle_pct = if live > 0 {
+            (spin_ms + park_ms) as f64 * 100.0 / live as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[sched] {index:>6} {polls:>7} {share:>6.1}% {steals:>8} {busy_ms:>9} {spin_ms:>8} {park_ms:>8} {idle_pct:>5.1}%"
+        );
+    }
+    eprintln!("[sched] total polls {total_polls}");
+}
+
 /// The worker loop: pull a runnable goroutine and drive it, sleeping when
 /// there is nothing to do.
 fn worker_loop(index: usize) {
@@ -350,7 +406,17 @@ fn worker_loop(index: usize) {
         }
         tick = tick.wrapping_add(1);
         match pop_ready(index, tick) {
-            Some(gid) => drive(gid),
+            Some(gid) => {
+                if stats_enabled() && index < MAX_TRACKED_WORKERS {
+                    STAT_POLLS[index].fetch_add(1, Ordering::Relaxed);
+                    let started = std::time::Instant::now();
+                    drive(gid);
+                    STAT_BUSY_NS[index]
+                        .fetch_add(started.elapsed().as_nanos() as usize, Ordering::Relaxed);
+                } else {
+                    drive(gid);
+                }
+            }
             None => wait_for_work(index),
         }
     }
@@ -403,6 +469,9 @@ fn steal_from_peers(queue: &RunQueue, index: usize, all: &'static [RunQueue]) ->
     for offset in 1..count {
         let victim = (index + offset) % count;
         if let Some(gid) = all[victim].steal_into(queue) {
+            if stats_enabled() && index < MAX_TRACKED_WORKERS {
+                STAT_STEALS[index].fetch_add(1, Ordering::Relaxed);
+            }
             return Some(gid);
         }
     }
@@ -416,6 +485,8 @@ const SPIN_BEFORE_PARK: u32 = 64;
 
 /// Sleep until a goroutine becomes runnable or we are asked to stop.
 fn wait_for_work(index: usize) {
+    let track = stats_enabled() && index < MAX_TRACKED_WORKERS;
+    let spin_started = track.then(std::time::Instant::now);
     // Counted as searching while spinning, so a concurrent spawn skips its wake:
     // this worker will see the work itself within the spin budget.
     IDLE_STATE.fetch_add(1, Ordering::SeqCst);
@@ -428,6 +499,9 @@ fn wait_for_work(index: usize) {
         std::hint::spin_loop();
     }
     let was_last_searcher = IDLE_STATE.fetch_sub(1, Ordering::SeqCst) & SEARCHING_MASK == 1;
+    if let Some(started) = spin_started {
+        STAT_SPIN_NS[index].fetch_add(started.elapsed().as_nanos() as usize, Ordering::Relaxed);
+    }
     if found {
         return;
     }
@@ -440,6 +514,7 @@ fn wait_for_work(index: usize) {
     }
 
     let (lock, cvar) = &*SIGNAL;
+    let park_started = track.then(std::time::Instant::now);
     IDLE_STATE.fetch_sub(1 << UNPARKED_SHIFT, Ordering::SeqCst);
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) || has_work() {
@@ -451,7 +526,9 @@ fn wait_for_work(index: usize) {
             .unwrap_or_else(|p| p.into_inner());
     }
     IDLE_STATE.fetch_add(1 << UNPARKED_SHIFT, Ordering::SeqCst);
-    let _ = index;
+    if let Some(started) = park_started {
+        STAT_PARK_NS[index].fetch_add(started.elapsed().as_nanos() as usize, Ordering::Relaxed);
+    }
 }
 
 /// Whether any queue holds a runnable goroutine. Every check is an atomic load,
@@ -1043,6 +1120,7 @@ pub(crate) fn shutdown() {
     for queue in queues() {
         let _ = queue.drain();
     }
+    report_stats();
     IDLE_STATE.store(0, Ordering::SeqCst);
     STARTED.store(false, Ordering::Release);
     SHUTDOWN.store(false, Ordering::Relaxed);

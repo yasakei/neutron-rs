@@ -33,6 +33,7 @@ pub(crate) enum RuntimeFutureKind {
     Sleep,
     Http,
     NetAccept,
+    NetRecvLine,
 }
 
 impl RuntimeFutureKind {
@@ -42,6 +43,7 @@ impl RuntimeFutureKind {
         match child_name {
             "sleep" => Some(Self::Sleep),
             "net.accept_async" => Some(Self::NetAccept),
+            "net.recv_line_async" => Some(Self::NetRecvLine),
             name if name.starts_with("http.") => Some(Self::Http),
             _ => None,
         }
@@ -52,7 +54,38 @@ impl RuntimeFutureKind {
             Self::Sleep => "ntsc_async_sleep_drop",
             Self::Http => "ntsc_async_http_drop",
             Self::NetAccept => "ntsc_async_net_accept_drop",
+            Self::NetRecvLine => "ntsc_async_net_recv_line_drop",
         }
+    }
+}
+
+/// The runtime ABI of an awaitable `net` future: the four entry points and the
+/// NTSC type its result carries.
+struct NetFutureAbi {
+    new_fn: &'static str,
+    poll_fn: &'static str,
+    result_fn: &'static str,
+    drop_fn: &'static str,
+    result_ty: Ty,
+}
+
+fn net_future_abi(child_name: &str) -> Option<NetFutureAbi> {
+    match child_name {
+        "net.accept_async" => Some(NetFutureAbi {
+            new_fn: "ntsc_async_net_accept",
+            poll_fn: "ntsc_async_net_accept_poll",
+            result_fn: "ntsc_async_net_accept_result",
+            drop_fn: "ntsc_async_net_accept_drop",
+            result_ty: Ty::Int,
+        }),
+        "net.recv_line_async" => Some(NetFutureAbi {
+            new_fn: "ntsc_async_net_recv_line",
+            poll_fn: "ntsc_async_net_recv_line_poll",
+            result_fn: "ntsc_async_net_recv_line_result",
+            drop_fn: "ntsc_async_net_recv_line_drop",
+            result_ty: Ty::String,
+        }),
+        _ => None,
     }
 }
 
@@ -802,6 +835,14 @@ pub(crate) fn await_callee_info(
         Expr::Member { object, property }
             if matches!(
                 object.as_ref(),
+                Expr::Variable { name } if name.lexeme() == "net"
+            ) && property.lexeme() == "recv_line_async" =>
+        {
+            Ok(("net.recv_line_async".to_string(), Ty::String, None, None))
+        }
+        Expr::Member { object, property }
+            if matches!(
+                object.as_ref(),
                 Expr::Variable { name } if name.lexeme() == "http"
             ) && property.lexeme().ends_with("_async") =>
         {
@@ -835,7 +876,10 @@ pub(crate) fn await_callee_param_count(
         Option<ntsc_ast::expr::ReturnTypeAnnotation>,
     )],
 ) -> Result<usize, crate::CodegenError> {
-    if child_name == "sleep" || child_name == "net.accept_async" {
+    if child_name == "sleep"
+        || child_name == "net.accept_async"
+        || child_name == "net.recv_line_async"
+    {
         return Ok(1);
     }
     // Offloaded http futures: 1 arg (get/delete/head) or 2 (post/put/patch).
@@ -1057,6 +1101,7 @@ pub(crate) fn emit_async_function<'ctx>(
     for info in &layout.await_infos {
         if info.child_name == "sleep"
             || info.child_name == "net.accept_async"
+            || info.child_name == "net.recv_line_async"
             || info.child_name.starts_with("http.")
         {
             continue;
@@ -1434,13 +1479,10 @@ pub(crate) fn emit_await_suspend<'ctx>(
 
     // Offloaded accept: create the op, store its handle in the slot, and park
     // on its poll function (same shape as the offloaded http futures).
-    if info.child_name == "net.accept_async" {
-        let new_fn = fn_ctx
-            .module
-            .get_function("ntsc_async_net_accept")
-            .ok_or_else(|| {
-                crate::CodegenError::LLVMError("ntsc_async_net_accept not declared".into())
-            })?;
+    if let Some(abi) = net_future_abi(&info.child_name) {
+        let new_fn = fn_ctx.module.get_function(abi.new_fn).ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!("{} not declared", abi.new_fn))
+        })?;
         let arg_values = emit_call_arguments(fn_ctx, arguments)?;
         let llvm_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
             arg_values.iter().map(|arg| arg.value.into()).collect();
@@ -1450,12 +1492,9 @@ pub(crate) fn emit_await_suspend<'ctx>(
         let handle = call_result_to_value(fn_ctx, &op);
         fn_ctx.builder.build_store(child_slot, handle)?;
 
-        let poll_fn = fn_ctx
-            .module
-            .get_function("ntsc_async_net_accept_poll")
-            .ok_or_else(|| {
-                crate::CodegenError::LLVMError("ntsc_async_net_accept_poll not declared".into())
-            })?;
+        let poll_fn = fn_ctx.module.get_function(abi.poll_fn).ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!("{} not declared", abi.poll_fn))
+        })?;
         let poll_i8 = fn_ctx.builder.build_pointer_cast(
             poll_fn.as_global_value().as_pointer_value(),
             fn_ctx.context.ptr_type(AddressSpace::default()),
@@ -1689,28 +1728,22 @@ pub(crate) fn emit_await_resume<'ctx>(
 
     // Offloaded accept: reap the client socket handle, then drop the op. The
     // result is an `int` socket handle, not a string.
-    if info.child_name == "net.accept_async" {
+    if let Some(abi) = net_future_abi(&info.child_name) {
         let child_slot = fn_ctx.future_field(layout.sub_field_base + await_idx as u32)?;
         let handle = fn_ctx
             .builder
-            .build_load(fn_ctx.context.i64_type(), child_slot, "accept_handle")?
+            .build_load(fn_ctx.context.i64_type(), child_slot, "net_handle")?
             .into_int_value();
-        let result_fn = fn_ctx
-            .module
-            .get_function("ntsc_async_net_accept_result")
-            .ok_or_else(|| {
-                crate::CodegenError::LLVMError("ntsc_async_net_accept_result not declared".into())
-            })?;
+        let result_fn = fn_ctx.module.get_function(abi.result_fn).ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!("{} not declared", abi.result_fn))
+        })?;
         let result = fn_ctx
             .builder
             .build_call(result_fn, &[handle.into()], "net_accept_result")?;
         let socket = call_result_to_value(fn_ctx, &result);
-        let drop_fn = fn_ctx
-            .module
-            .get_function("ntsc_async_net_accept_drop")
-            .ok_or_else(|| {
-                crate::CodegenError::LLVMError("ntsc_async_net_accept_drop not declared".into())
-            })?;
+        let drop_fn = fn_ctx.module.get_function(abi.drop_fn).ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!("{} not declared", abi.drop_fn))
+        })?;
         fn_ctx
             .builder
             .build_call(drop_fn, &[handle.into()], "net_accept_drop")?;
@@ -1719,7 +1752,11 @@ pub(crate) fn emit_await_resume<'ctx>(
             .build_store(child_slot, fn_ctx.context.i64_type().const_zero())?;
 
         match stmt {
-            Stmt::Expression { .. } => {}
+            Stmt::Expression { .. } => {
+                if matches!(abi.result_ty, Ty::String) {
+                    emit_drop_value(fn_ctx, &TypedValue::new(socket, Ty::String))?;
+                }
+            }
             Stmt::Var {
                 name,
                 type_annotation,
@@ -1727,7 +1764,7 @@ pub(crate) fn emit_await_resume<'ctx>(
             } => {
                 let slot_ty = match type_annotation {
                     Some(_) => type_annotation_to_ty(type_annotation),
-                    None => Ty::Int,
+                    None => abi.result_ty.clone(),
                 };
                 let field_index = layout.fields.get(name.lexeme()).copied().ok_or_else(|| {
                     crate::CodegenError::LLVMError(format!(
@@ -1737,12 +1774,19 @@ pub(crate) fn emit_await_resume<'ctx>(
                 })?;
                 let slot = fn_ctx.future_field(field_index)?;
                 fn_ctx.define_var(name.lexeme(), slot, slot_ty.clone());
-                let coerced = coerce_value(fn_ctx, TypedValue::new(socket, Ty::Int), &slot_ty)?;
+                let coerced = coerce_value(
+                    fn_ctx,
+                    TypedValue::new(socket, abi.result_ty.clone()),
+                    &slot_ty,
+                )?;
                 fn_ctx.builder.build_store(slot, coerced.value)?;
             }
             Stmt::Return { .. } => {
-                let coerced =
-                    coerce_value(fn_ctx, TypedValue::new(socket, Ty::Int), &layout.ret_ty)?;
+                let coerced = coerce_value(
+                    fn_ctx,
+                    TypedValue::new(socket, abi.result_ty.clone()),
+                    &layout.ret_ty,
+                )?;
                 emit_async_return(fn_ctx, layout, Some(coerced.value))?;
             }
             _ => {
@@ -2331,39 +2375,26 @@ pub(crate) fn emit_go_program_spawn<'ctx>(
             .build_ptr_to_int(child_ptr, fn_ctx.context.i64_type(), "go_handle")?;
     // `go f(x)` discards the handle, so spawn detached: no registry wrapper is
     // allocated for something nothing can join. The cleanup thunk still lets
-    // the scheduler reclaim a future that never completes.
-    let cleanup_fn = fn_ctx
+    // the scheduler reclaim a future that never completes. It is created on
+    // demand here, so a spawn that runs before the callee's trampoline was
+    // emitted still hands the scheduler a cleanup — a missing thunk used to
+    // fall back to a spawn without cleanup, leaking the future and every
+    // handle its slots hold at shutdown.
+    let cleanup_fn = get_or_create_goroutine_cleanup(fn_ctx.context, fn_ctx.module, &child_name)?;
+    let cleanup_ptr = fn_ctx.builder.build_pointer_cast(
+        cleanup_fn.as_global_value().as_pointer_value(),
+        fn_ctx.context.ptr_type(AddressSpace::default()),
+        "go_cleanup_fn",
+    )?;
+    let go_detached_fn = fn_ctx
         .module
-        .get_function(&format!("ntsc_future_{child_name}_go_cleanup"));
-    if let Some(cleanup_fn) = cleanup_fn {
-        let cleanup_ptr = fn_ctx.builder.build_pointer_cast(
-            cleanup_fn.as_global_value().as_pointer_value(),
-            fn_ctx.context.ptr_type(AddressSpace::default()),
-            "go_cleanup_fn",
-        )?;
-        let go_detached_fn = fn_ctx
-            .module
-            .get_function("ntask_go_detached")
-            .ok_or_else(|| {
-                crate::CodegenError::LLVMError("ntask_go_detached not declared".into())
-            })?;
-        fn_ctx.builder.build_call(
-            go_detached_fn,
-            &[poll_ptr.into(), child_handle.into(), cleanup_ptr.into()],
-            "go_spawn",
-        )?;
-        return Ok(());
-    }
-    let go_fn = fn_ctx
-        .module
-        .get_function("ntask_go")
-        .ok_or_else(|| crate::CodegenError::LLVMError("ntask_go not declared".into()))?;
-    let goroutine =
-        fn_ctx
-            .builder
-            .build_call(go_fn, &[poll_ptr.into(), child_handle.into()], "go_spawn")?;
-    // The scheduler drives it to completion and reclaims the entry then.
-    let _ = call_result_to_value(fn_ctx, &goroutine).into_int_value();
+        .get_function("ntask_go_detached")
+        .ok_or_else(|| crate::CodegenError::LLVMError("ntask_go_detached not declared".into()))?;
+    fn_ctx.builder.build_call(
+        go_detached_fn,
+        &[poll_ptr.into(), child_handle.into(), cleanup_ptr.into()],
+        "go_spawn",
+    )?;
     Ok(())
 }
 

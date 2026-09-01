@@ -2833,6 +2833,29 @@ impl TypeChecker {
             }
             Expr::Member { object, property }
                 if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "net")
+                    && property.lexeme() == "recv_line_async" =>
+            {
+                // Awaiting a socket read: the runtime tries the read first and
+                // parks the goroutine only when the socket has nothing pending,
+                // so a handler never holds a worker waiting on a client.
+                if arguments.len() != 1 {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: format!(
+                            "net.recv_line_async expects 1 argument (a socket), got {}",
+                            arguments.len()
+                        ),
+                        span,
+                    });
+                }
+                for argument in arguments {
+                    let _ = self.check_expression(argument);
+                }
+                Some(Ty::String)
+            }
+            Expr::Member { object, property }
+                if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "net")
                     && property.lexeme() == "accept_async" =>
             {
                 // Awaiting an offloaded accept: the runtime runs the blocking

@@ -176,6 +176,85 @@ async fun main() -> int {
     );
 }
 
+/// A server whose clients connect and stay silent for a while before sending.
+/// `recv_line_async` must let each handler park instead of pinning a worker, so
+/// 32 concurrent slow clients are all served; with a blocking read only four
+/// (one per worker) could be mid-read at once and the rest would time out.
+#[test]
+fn awaitable_recv_line_serves_many_slow_clients() {
+    // Pick a port by binding and dropping: the NTSC server must bind the same
+    // address, so the probe listener cannot stay alive.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    };
+    let clients = std::thread::spawn(move || {
+        // The NTSC server compiles and starts while this thread waits; connect
+        // attempts before the bind would be refused.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            handles.push(std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                let mut stream = stream;
+                // Silent for a while: the server's read has nothing yet.
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                let _ = writeln!(stream, "{}", i);
+                let _ = stream.flush();
+                let mut line = String::new();
+                let _ = BufReader::new(&mut stream).read_line(&mut line);
+                line.trim() == format!("ok:{}", i + 1)
+            }));
+        }
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .filter(|ok| *ok)
+            .count()
+    });
+
+    let source = format!(
+        r#"
+use net
+use fmt
+
+async fun handle_client(int sock) {{
+    var string line = await net.recv_line_async(sock)
+    net.send_line(sock, "ok:" + fmt.i64_to_str(fmt.to_int(line) + 1))
+    net.close(sock)
+}}
+
+async fun accept_loop(int listener) {{
+    var int sock = await net.accept_async(listener)
+    go handle_client(sock)
+    go accept_loop(listener)
+}}
+
+async fun main() -> int {{
+    var int listener = net.tcp_listen({port})
+    go accept_loop(listener)
+    await async.sleep(6000)
+    net.close(listener)
+    return 0
+}}
+"#
+    );
+    let (stdout, stderr, output) = build_and_run(&source, "ntroutine_recv_line_async");
+    assert!(
+        output.status.success(),
+        "binary exited with non-zero status:\n{stdout}\n{stderr}"
+    );
+    let served = clients.join().expect("clients");
+    assert_eq!(served, 32, "every slow client must be served");
+    assert!(
+        !stderr.contains("memory leak detected"),
+        "awaitable reads must be reclaimed:\n{stderr}"
+    );
+}
+
 #[test]
 fn go_block_scalar_capture() {
     let source = r#"
