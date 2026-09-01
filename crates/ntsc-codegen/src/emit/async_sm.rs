@@ -32,6 +32,7 @@ pub(crate) enum AsyncFieldTy {
 pub(crate) enum RuntimeFutureKind {
     Sleep,
     Http,
+    NetAccept,
 }
 
 impl RuntimeFutureKind {
@@ -40,6 +41,7 @@ impl RuntimeFutureKind {
     fn of_child(child_name: &str) -> Option<Self> {
         match child_name {
             "sleep" => Some(Self::Sleep),
+            "net.accept_async" => Some(Self::NetAccept),
             name if name.starts_with("http.") => Some(Self::Http),
             _ => None,
         }
@@ -49,6 +51,7 @@ impl RuntimeFutureKind {
         match self {
             Self::Sleep => "ntsc_async_sleep_drop",
             Self::Http => "ntsc_async_http_drop",
+            Self::NetAccept => "ntsc_async_net_accept_drop",
         }
     }
 }
@@ -791,6 +794,14 @@ pub(crate) fn await_callee_info(
         Expr::Member { object, property }
             if matches!(
                 object.as_ref(),
+                Expr::Variable { name } if name.lexeme() == "net"
+            ) && property.lexeme() == "accept_async" =>
+        {
+            Ok(("net.accept_async".to_string(), Ty::Int, None, None))
+        }
+        Expr::Member { object, property }
+            if matches!(
+                object.as_ref(),
                 Expr::Variable { name } if name.lexeme() == "http"
             ) && property.lexeme().ends_with("_async") =>
         {
@@ -824,7 +835,7 @@ pub(crate) fn await_callee_param_count(
         Option<ntsc_ast::expr::ReturnTypeAnnotation>,
     )],
 ) -> Result<usize, crate::CodegenError> {
-    if child_name == "sleep" {
+    if child_name == "sleep" || child_name == "net.accept_async" {
         return Ok(1);
     }
     // Offloaded http futures: 1 arg (get/delete/head) or 2 (post/put/patch).
@@ -1044,7 +1055,10 @@ pub(crate) fn emit_async_function<'ctx>(
     // built-in `async.sleep` has no emitted callee: its future struct and
     // poll function are declared as part of the runtime.
     for info in &layout.await_infos {
-        if info.child_name == "sleep" || info.child_name.starts_with("http.") {
+        if info.child_name == "sleep"
+            || info.child_name == "net.accept_async"
+            || info.child_name.starts_with("http.")
+        {
             continue;
         }
         // Anonymous async blocks were already emitted above.
@@ -1418,6 +1432,56 @@ pub(crate) fn emit_await_suspend<'ctx>(
 
     let child_slot = fn_ctx.future_field(layout.sub_field_base + await_idx as u32)?;
 
+    // Offloaded accept: create the op, store its handle in the slot, and park
+    // on its poll function (same shape as the offloaded http futures).
+    if info.child_name == "net.accept_async" {
+        let new_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_net_accept")
+            .ok_or_else(|| {
+                crate::CodegenError::LLVMError("ntsc_async_net_accept not declared".into())
+            })?;
+        let arg_values = emit_call_arguments(fn_ctx, arguments)?;
+        let llvm_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+            arg_values.iter().map(|arg| arg.value.into()).collect();
+        let op = fn_ctx
+            .builder
+            .build_call(new_fn, &llvm_args, "net_accept_new")?;
+        let handle = call_result_to_value(fn_ctx, &op);
+        fn_ctx.builder.build_store(child_slot, handle)?;
+
+        let poll_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_net_accept_poll")
+            .ok_or_else(|| {
+                crate::CodegenError::LLVMError("ntsc_async_net_accept_poll not declared".into())
+            })?;
+        let poll_i8 = fn_ctx.builder.build_pointer_cast(
+            poll_fn.as_global_value().as_pointer_value(),
+            fn_ctx.context.ptr_type(AddressSpace::default()),
+            "net_accept_poll_fn",
+        )?;
+        let push_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_push")
+            .ok_or_else(|| crate::CodegenError::LLVMError("ntsc_async_push not declared".into()))?;
+        fn_ctx.builder.build_call(
+            push_fn,
+            &[poll_i8.into(), handle.into_int_value().into()],
+            "async_push",
+        )?;
+        let state_ptr = fn_ctx.future_field(0)?;
+        let next_state = fn_ctx
+            .context
+            .i32_type()
+            .const_int((layout.await_state_index[await_idx] as u64) + 1, false);
+        fn_ctx.builder.build_store(state_ptr, next_state)?;
+        fn_ctx
+            .builder
+            .build_return(Some(&fn_ctx.context.i8_type().const_int(0, false)))?;
+        return Ok(());
+    }
+
     // Offloaded runtime futures: create the op, store its handle in the
     // slot, and park on its poll function.
     if let Some(method) = info.child_name.strip_prefix("http.") {
@@ -1622,6 +1686,73 @@ pub(crate) fn emit_await_resume<'ctx>(
 ) -> Result<(), crate::CodegenError> {
     let info = &layout.await_infos[await_idx];
     let stmt = &body[info.stmt_idx];
+
+    // Offloaded accept: reap the client socket handle, then drop the op. The
+    // result is an `int` socket handle, not a string.
+    if info.child_name == "net.accept_async" {
+        let child_slot = fn_ctx.future_field(layout.sub_field_base + await_idx as u32)?;
+        let handle = fn_ctx
+            .builder
+            .build_load(fn_ctx.context.i64_type(), child_slot, "accept_handle")?
+            .into_int_value();
+        let result_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_net_accept_result")
+            .ok_or_else(|| {
+                crate::CodegenError::LLVMError("ntsc_async_net_accept_result not declared".into())
+            })?;
+        let result = fn_ctx
+            .builder
+            .build_call(result_fn, &[handle.into()], "net_accept_result")?;
+        let socket = call_result_to_value(fn_ctx, &result);
+        let drop_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_net_accept_drop")
+            .ok_or_else(|| {
+                crate::CodegenError::LLVMError("ntsc_async_net_accept_drop not declared".into())
+            })?;
+        fn_ctx
+            .builder
+            .build_call(drop_fn, &[handle.into()], "net_accept_drop")?;
+        fn_ctx
+            .builder
+            .build_store(child_slot, fn_ctx.context.i64_type().const_zero())?;
+
+        match stmt {
+            Stmt::Expression { .. } => {}
+            Stmt::Var {
+                name,
+                type_annotation,
+                ..
+            } => {
+                let slot_ty = match type_annotation {
+                    Some(_) => type_annotation_to_ty(type_annotation),
+                    None => Ty::Int,
+                };
+                let field_index = layout.fields.get(name.lexeme()).copied().ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "internal: awaited variable `{}` has no future field",
+                        name.lexeme()
+                    ))
+                })?;
+                let slot = fn_ctx.future_field(field_index)?;
+                fn_ctx.define_var(name.lexeme(), slot, slot_ty.clone());
+                let coerced = coerce_value(fn_ctx, TypedValue::new(socket, Ty::Int), &slot_ty)?;
+                fn_ctx.builder.build_store(slot, coerced.value)?;
+            }
+            Stmt::Return { .. } => {
+                let coerced =
+                    coerce_value(fn_ctx, TypedValue::new(socket, Ty::Int), &layout.ret_ty)?;
+                emit_async_return(fn_ctx, layout, Some(coerced.value))?;
+            }
+            _ => {
+                return Err(crate::CodegenError::LLVMError(
+                    "internal: unexpected await statement shape".into(),
+                ));
+            }
+        }
+        return Ok(());
+    }
 
     // Offloaded http futures: reap the response handle from the op, then
     // drop the completed op.

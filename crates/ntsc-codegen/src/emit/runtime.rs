@@ -224,6 +224,11 @@ pub(crate) fn declare_runtime_functions(module: &Module<'_>) {
     declare!("ntsc_async_http_poll", i8_ty, i64_ty);
     declare!("ntsc_async_http_result", i64_ty, i64_ty);
     declare!("ntsc_async_http_drop", void_ty, i64_ty);
+    // ── Offloaded net accept ────────────────────────────────────────────
+    declare!("ntsc_async_net_accept", i64_ty, i64_ty);
+    declare!("ntsc_async_net_accept_poll", i8_ty, i64_ty);
+    declare!("ntsc_async_net_accept_result", i64_ty, i64_ty);
+    declare!("ntsc_async_net_accept_drop", void_ty, i64_ty);
     declare!("ntask_io_new", i64_ty);
     declare!("ntask_io_attach", void_ty, i64_ty, i64_ty, i8_ty);
     declare!("ntask_io_park", i8_ty, i64_ty, i8_ty);

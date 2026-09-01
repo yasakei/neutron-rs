@@ -64,6 +64,17 @@ fn udp_mut<R>(
     }
 }
 
+/// Register a connected TCP socket as a handle.
+///
+/// `TCP_NODELAY` is set on every stream, matching Go (`net` sets it on all TCP
+/// connections by default). Without it Nagle's algorithm holds a small response
+/// waiting for an ACK of the previous segment, which for a request/response
+/// exchange of two short lines adds a delayed-ACK stall to every round trip.
+fn adopt_stream(stream: TcpStream) -> i64 {
+    let _ = stream.set_nodelay(true);
+    registry::put_opaque(NetHandle::TcpStream(stream))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_net_tcp_connect(host: i64, port: i64) -> i64 {
     let host = match registry::get_string(host) {
@@ -72,7 +83,7 @@ pub extern "C" fn ntsc_net_tcp_connect(host: i64, port: i64) -> i64 {
     };
     let addr = format!("{host}:{port}");
     match TcpStream::connect(&addr) {
-        Ok(stream) => registry::put_opaque(NetHandle::TcpStream(stream)),
+        Ok(stream) => adopt_stream(stream),
         Err(e) => fail("tcp_connect", format!("cannot connect to '{addr}': {e}")),
     }
 }
@@ -130,7 +141,7 @@ pub extern "C" fn ntsc_net_tcp_accept(handle: i64) -> i64 {
             }
         });
     match outcome {
-        Some(Some(Ok(stream))) => registry::put_opaque(NetHandle::TcpStream(stream)),
+        Some(Some(Ok(stream))) => adopt_stream(stream),
         Some(Some(Err(msg))) => fail("tcp_accept", msg),
         Some(None) => fail("tcp_accept", "handle is not a TCP listener"),
         None => fail("tcp_accept", "invalid (null) socket handle"),
@@ -201,14 +212,32 @@ pub extern "C" fn ntsc_net_recv(handle: i64, count: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_net_recv_line(handle: i64) -> i64 {
     match stream_mut("recv_line", handle, |stream| -> Result<String, String> {
+        // Read in blocks and keep what follows the newline for the next call:
+        // one byte per `read` syscall made a short line cost as many syscalls
+        // as it had characters.
         let mut bytes = Vec::with_capacity(64);
-        let mut byte = [0u8; 1];
+        let mut chunk = [0u8; 512];
         loop {
-            match stream.read(&mut byte) {
+            match stream.peek(&mut chunk) {
                 Ok(0) => break,
-                Ok(_) => {
-                    bytes.push(byte[0]);
-                    if byte[0] == b'\n' {
+                Ok(available) => {
+                    let upto = chunk[..available]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map(|index| index + 1)
+                        .unwrap_or(available);
+                    // Consume exactly the bytes taken, so anything after the
+                    // newline stays queued for the next read.
+                    let mut taken = vec![0u8; upto];
+                    match stream.read_exact(&mut taken) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            return Err(format!("net.recv_line: cannot read from stream: {e}"));
+                        }
+                    }
+                    let hit_newline = taken.last() == Some(&b'\n');
+                    bytes.extend_from_slice(&taken);
+                    if hit_newline {
                         break;
                     }
                 }
@@ -291,6 +320,148 @@ pub extern "C" fn ntsc_net_udp_recv(handle: i64, count: i64) -> i64 {
     }
 }
 
+// ── Awaitable accept ───────────────────────────────────────────────────────
+//
+// `net.tcp_accept` blocks the OS thread it runs on. In an accept loop that
+// starves the worker pool: the goroutine holding the loop never yields, so the
+// per-client goroutines it spawns are not polled.
+//
+// `accept_async` is reactor-backed rather than offloaded. The listener is set
+// non-blocking and its descriptor registered with the reactor; each poll tries
+// a non-blocking `accept` on the worker itself and parks on readiness when
+// there is nothing pending. Nothing is handed to the offload pool, so a single
+// accept loop is limited only by the accept syscall rate — an offloaded accept
+// cost a job dispatch plus a park/wake per connection and capped out at the
+// pool's thread count.
+
+/// A pending reactor-backed accept: the reactor registration watching the
+/// listener, the listener handle to accept from, and the accepted socket once
+/// a poll has taken it.
+struct PendingAccept {
+    io: i64,
+    listener: i64,
+    accepted: Option<TcpStream>,
+    error: Option<String>,
+}
+
+/// Set the listener non-blocking and return its raw descriptor. A listener used
+/// with `accept_async` stays non-blocking; the reactor reports its readiness, so
+/// a blocking accept would only risk stalling a worker.
+fn listener_watch_fd(handle: i64) -> Option<i64> {
+    registry::with_opaque(handle, |net: &NetHandle| match net {
+        NetHandle::TcpListener(listener) => {
+            if listener.set_nonblocking(true).is_err() {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                Some(std::os::fd::AsRawFd::as_raw_fd(listener) as i64)
+            }
+            // Windows has no reactor descriptor backend yet: the registration
+            // still exists, and the poll below falls back to retrying the
+            // non-blocking accept when it is woken.
+            #[cfg(not(unix))]
+            {
+                Some(0)
+            }
+        }
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Try one non-blocking accept on `listener`. `Ok(None)` means "nothing
+/// pending", which is not an error: the caller parks and retries.
+fn try_accept(listener: i64) -> Result<Option<TcpStream>, String> {
+    registry::with_opaque(listener, |net: &NetHandle| match net {
+        NetHandle::TcpListener(listener) => match listener.accept() {
+            Ok((stream, _peer)) => Ok(Some(stream)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(format!("net.accept_async: cannot accept connection: {e}")),
+        },
+        _ => Err("net.accept_async: handle is not a TCP listener".to_string()),
+    })
+    .unwrap_or_else(|| Err("net.accept_async: invalid (null) socket handle".to_string()))
+}
+
+/// `net.accept_async(listener)` — a future that completes with the next client
+/// socket. Await it; the goroutine parks on listener readiness meanwhile.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_net_accept(listener: i64) -> i64 {
+    let Some(fd) = listener_watch_fd(listener) else {
+        return fail("accept_async", "handle is not a TCP listener");
+    };
+    let io = crate::ntask_io_new();
+    crate::ntask_io_attach(io, fd, 1);
+    registry::put_opaque(PendingAccept {
+        io,
+        listener,
+        accepted: None,
+        error: None,
+    })
+}
+
+/// Poll a pending accept: take a connection if one is pending, else park on the
+/// listener's readiness. The accept runs on the worker, so a ready listener is
+/// served without a thread handoff.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_net_accept_poll(id: i64) -> i8 {
+    let Some((io, listener, done)) = registry::with_opaque(id, |state: &PendingAccept| {
+        (
+            state.io,
+            state.listener,
+            state.accepted.is_some() || state.error.is_some(),
+        )
+    }) else {
+        return 1;
+    };
+    if done {
+        return 1;
+    }
+    // Consume any recorded readiness so a later park re-arms the interest.
+    let _ = crate::ntask_io_ready(io);
+    match try_accept(listener) {
+        Ok(Some(stream)) => {
+            registry::with_opaque_mut(id, |state: &mut PendingAccept| {
+                state.accepted = Some(stream)
+            });
+            1
+        }
+        Ok(None) => {
+            crate::ntask_io_park(io, 1);
+            0
+        }
+        Err(message) => {
+            registry::with_opaque_mut(id, |state: &mut PendingAccept| state.error = Some(message));
+            1
+        }
+    }
+}
+
+/// Deliver the accepted socket handle, or throw the recorded error. Releases the
+/// reactor registration and the pending-accept state either way.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_net_accept_result(id: i64) -> i64 {
+    let Some(state) = registry::take_opaque::<PendingAccept>(id) else {
+        return fail("accept_async", "invalid (null) future handle");
+    };
+    crate::ntask_io_drop(state.io);
+    match (state.accepted, state.error) {
+        (Some(stream), _) => adopt_stream(stream),
+        (None, Some(message)) => super::throw_str(message),
+        (None, None) => fail("accept_async", "future completed without a connection"),
+    }
+}
+
+/// Drop a pending accept, releasing its reactor registration and any socket it
+/// already took (the awaiting goroutine went away before reaping it).
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_net_accept_drop(id: i64) {
+    if let Some(state) = registry::take_opaque::<PendingAccept>(id) {
+        crate::ntask_io_drop(state.io);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +474,55 @@ mod tests {
         let s = registry::get_string(id).unwrap_or_default();
         let _ = registry::take_string(id);
         s
+    }
+
+    /// A short line must cost one block read, and anything after the newline
+    /// must stay queued for the next call rather than being swallowed.
+    #[test]
+    fn recv_line_reads_in_blocks_and_keeps_the_remainder() {
+        let listener = ntsc_net_tcp_listen(0);
+        let port = ntsc_net_local_port(listener);
+        let host = put("127.0.0.1");
+        let client = ntsc_net_tcp_connect(host, port);
+        let _ = registry::take_string(host);
+        let conn = ntsc_net_tcp_accept(listener);
+
+        // Two lines in one write: the first read must return only the first.
+        let payload = put("alpha\nbeta\n");
+        assert!(ntsc_net_send(conn, payload) > 0);
+        let _ = registry::take_string(payload);
+
+        assert_eq!(read(ntsc_net_recv_line(client)), "alpha\n");
+        assert_eq!(read(ntsc_net_recv_line(client)), "beta\n");
+
+        assert_eq!(ntsc_net_close(client), 1);
+        assert_eq!(ntsc_net_close(conn), 1);
+        assert_eq!(ntsc_net_close(listener), 1);
+    }
+
+    /// Every accepted and connected stream has Nagle disabled, matching Go's
+    /// default, so a small response is not held waiting for an ACK.
+    #[test]
+    fn streams_are_created_with_tcp_nodelay() {
+        let listener = ntsc_net_tcp_listen(0);
+        let port = ntsc_net_local_port(listener);
+        let host = put("127.0.0.1");
+        let client = ntsc_net_tcp_connect(host, port);
+        let _ = registry::take_string(host);
+        let conn = ntsc_net_tcp_accept(listener);
+
+        for handle in [client, conn] {
+            let nodelay = registry::with_opaque(handle, |net: &NetHandle| match net {
+                NetHandle::TcpStream(stream) => stream.nodelay().ok(),
+                _ => None,
+            })
+            .flatten();
+            assert_eq!(nodelay, Some(true));
+        }
+
+        assert_eq!(ntsc_net_close(client), 1);
+        assert_eq!(ntsc_net_close(conn), 1);
+        assert_eq!(ntsc_net_close(listener), 1);
     }
 
     #[test]

@@ -2832,6 +2832,30 @@ impl TypeChecker {
                 Some(Ty::Void)
             }
             Expr::Member { object, property }
+                if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "net")
+                    && property.lexeme() == "accept_async" =>
+            {
+                // Awaiting an offloaded accept: the runtime runs the blocking
+                // `accept` on the worker pool and the goroutine parks until a
+                // client socket is ready, so an accept loop never pins a
+                // worker thread.
+                if arguments.len() != 1 {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: format!(
+                            "net.accept_async expects 1 argument (a listener), got {}",
+                            arguments.len()
+                        ),
+                        span,
+                    });
+                }
+                for argument in arguments {
+                    let _ = self.check_expression(argument);
+                }
+                Some(Ty::Int)
+            }
+            Expr::Member { object, property }
                 if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "http")
                     && property.lexeme().ends_with("_async") =>
             {
