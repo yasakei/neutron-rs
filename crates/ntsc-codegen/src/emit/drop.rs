@@ -772,9 +772,8 @@ pub(crate) fn prepare_call_args<'ctx>(
             }
             continue;
         }
-        // A `chan` parameter holds a reference of its own, released by the
-        // callee's exit drop. The caller keeps its reference: a peer may
-        // still be sending on the channel.
+        // A `chan` parameter holds its own reference, released by the callee's
+        // exit drop; the caller keeps its own.
         if matches!(val.ntsc_type, Ty::Chan(_)) {
             retain_chan_value(fn_ctx, arg, val)?;
             prepared.push(val.clone());
@@ -869,11 +868,9 @@ pub(crate) fn copy_owned_value<'ctx>(
     }
 }
 
-/// Record another live copy of a channel handle. A `chan` is a
-/// reference-counted registry handle: every owning slot, future field, and
-/// parameter holds one reference, and the channel core outlives the last of
-/// them. `chan.new(...)` hands over the first reference, so a fresh channel
-/// is adopted without retaining.
+/// Record another live copy of a channel handle: every owning slot, future
+/// field, and parameter holds one reference. `chan.new(...)` hands over the
+/// first reference, so a fresh channel is adopted without retaining.
 pub(crate) fn retain_chan_value<'ctx>(
     fn_ctx: &mut FunctionContext<'ctx, '_>,
     expr: &Expr,
@@ -1136,10 +1133,8 @@ pub(crate) fn store_into_owned_slot<'ctx>(
         }
         return Ok(true);
     }
-    // A `chan` slot holds one reference: `var b = a` gives `b` its own, so
-    // each slot's drop releases exactly what it took. The new reference is
-    // taken before the slot's previous one is released, so a redeclaration
-    // reading its own slot cannot destroy the channel.
+    // A `chan` slot holds one reference, taken before the slot's previous one
+    // is released so a redeclaration reading its own slot is safe.
     if matches!(ty, Ty::Chan(_)) {
         retain_chan_value(fn_ctx, expr, val)?;
         emit_drop_replaced_value(fn_ctx, ptr, ty, val)?;

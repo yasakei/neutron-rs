@@ -22,7 +22,9 @@
 //! deadlock and must never happen.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+use crate::idmap::IdMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -34,25 +36,17 @@ pub(crate) const NULL: i64 = 0;
 /// slots).
 pub(crate) const PTR_SIZE: usize = std::mem::size_of::<i64>();
 
-static REGISTRY: LazyLock<Mutex<HashMap<i64, Handle>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static REGISTRY: LazyLock<Mutex<IdMap<Handle>>> = LazyLock::new(|| Mutex::new(IdMap::default()));
 static NEXT_ID: AtomicI64 = AtomicI64::new(1);
 static LIVE: AtomicI64 = AtomicI64::new(0);
-
-/// Registry ids of `Handle::Goroutine` wrappers, grouped by the goroutine core
-/// they wrap. Kept so a goroutine's wrappers can be dropped in O(wrappers)
-/// instead of scanning the whole registry when the goroutine is reclaimed.
-/// Lock ordering is always REGISTRY first, then this map.
-static GOROUTINE_CORES: LazyLock<Mutex<HashMap<i64, HashSet<i64>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Handles registered as permanent (compile-time constants such as string
 /// literals). They are owned by the program for its whole lifetime, are
 /// never removed, and are excluded from leak reporting.
 static PERMANENT: AtomicI64 = AtomicI64::new(0);
 static PERMANENT_IDS: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-static LEAK_SITES: LazyLock<Mutex<HashMap<i64, (i64, i64)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static LEAK_SITES: LazyLock<Mutex<IdMap<(i64, i64)>>> =
+    LazyLock::new(|| Mutex::new(IdMap::default()));
 
 /// Bumped whenever an entry is removed. A cached capability is only reused
 /// while this is unchanged, so a dropped handle can never be served from a
@@ -446,7 +440,7 @@ pub(crate) struct SharedData {
     pub(crate) count: u64,
 }
 
-fn lock() -> std::sync::MutexGuard<'static, HashMap<i64, Handle>> {
+fn lock() -> std::sync::MutexGuard<'static, IdMap<Handle>> {
     REGISTRY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -456,19 +450,8 @@ fn next_id() -> i64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn insert_locked(
-    guard: &mut std::sync::MutexGuard<'_, HashMap<i64, Handle>>,
-    handle: Handle,
-) -> i64 {
+fn insert_locked(guard: &mut std::sync::MutexGuard<'_, IdMap<Handle>>, handle: Handle) -> i64 {
     let id = next_id();
-    if let Handle::Goroutine { core } = &handle {
-        GOROUTINE_CORES
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(*core)
-            .or_default()
-            .insert(id);
-    }
     guard.insert(id, handle);
     // Bumped under the lock, like every other counter mutation, so the two
     // can never be observed out of step (see `counters_agree_with_map`).
@@ -479,6 +462,20 @@ fn insert_locked(
 /// Register an owned value and return its fresh handle.
 pub(crate) fn insert(handle: Handle) -> i64 {
     insert_locked(&mut lock(), handle)
+}
+
+/// Reserve a handle id before its value exists, for a caller that must know the
+/// id up front (a goroutine records its own wrapper id).
+pub(crate) fn reserve_id() -> i64 {
+    next_id()
+}
+
+/// Register `handle` under an id previously taken from [`reserve_id`].
+pub(crate) fn insert_reserved(id: i64, handle: Handle) {
+    let mut guard = lock();
+    if guard.insert(id, handle).is_none() {
+        LIVE.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Register an owned value as permanent: it lives for the whole program
@@ -504,15 +501,6 @@ pub(crate) fn remove(id: i64) -> Option<Handle> {
     }
     let mut guard = lock();
     let taken = guard.remove(&id);
-    if let Some(Handle::Goroutine { core }) = &taken {
-        let mut cores = GOROUTINE_CORES.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(ids) = cores.get_mut(core) {
-            ids.remove(&id);
-            if ids.is_empty() {
-                cores.remove(core);
-            }
-        }
-    }
     if taken.is_some() {
         LIVE.fetch_sub(1, Ordering::Relaxed);
         REGISTRY_GEN.fetch_add(1, Ordering::Release);
@@ -1439,26 +1427,18 @@ pub(crate) fn async_op_drop(id: i64) {
 
 // ── Goroutine handles ───────────────────────────────────────────────────
 
-/// Drop a scheduled goroutine handle and its task core.
-/// Remove the `Handle::Goroutine` wrapper whose core id is `core`.
-/// Called by the scheduler when a goroutine completes, so fire-and-forget
-/// spawns do not leak their registry entry.
-pub(crate) fn remove_goroutine_by_core(core: i64) {
-    let stale: Vec<i64> = GOROUTINE_CORES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&core)
-        .map(|ids| ids.into_iter().collect())
-        .unwrap_or_default();
-    let mut guard = lock();
-    let mut removed = 0;
-    for id in stale {
-        if guard.remove(&id).is_some() {
-            removed += 1;
-        }
+/// Remove the `Handle::Goroutine` wrapper `handle`, so a fire-and-forget spawn
+/// does not leak its entry. A `NULL` or already-dropped handle is a no-op.
+pub(crate) fn remove_goroutine_handle(handle: i64) {
+    if handle == NULL {
+        return;
     }
-    if removed > 0 {
-        LIVE.fetch_sub(removed, Ordering::Relaxed);
+    let mut guard = lock();
+    if !matches!(guard.get(&handle), Some(Handle::Goroutine { .. })) {
+        return;
+    }
+    if guard.remove(&handle).is_some() {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

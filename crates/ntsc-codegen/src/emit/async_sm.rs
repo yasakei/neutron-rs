@@ -22,14 +22,12 @@ pub(crate) enum AsyncFieldTy {
     Future(String),
 
     /// A sub-future slot holding an `i64` handle to a runtime-owned future
-    /// (`async.sleep`, `http.*_async`). The handle must be released when the
-    /// awaiting future is dropped mid-flight, or the registry entry outlives
-    /// the program.
+    /// (`async.sleep`, `http.*_async`), released when the awaiting future
+    /// drops mid-flight.
     RuntimeFuture(RuntimeFutureKind),
 }
 
-/// A runtime-owned awaited future, identified by the function that releases
-/// its registry handle.
+/// A runtime-owned awaited future, keyed by its release function.
 #[derive(Clone, Copy)]
 pub(crate) enum RuntimeFutureKind {
     Sleep,
@@ -37,8 +35,8 @@ pub(crate) enum RuntimeFutureKind {
 }
 
 impl RuntimeFutureKind {
-    /// The name of this kind's awaited callee, or `None` when the callee is a
-    /// user async function whose future is embedded inline.
+    /// `None` when the callee is a user async function, whose future is
+    /// embedded inline instead.
     fn of_child(child_name: &str) -> Option<Self> {
         match child_name {
             "sleep" => Some(Self::Sleep),
@@ -1265,13 +1263,9 @@ fn emit_async_drop<'ctx>(
                 }
             }
             AsyncFieldTy::RuntimeFuture(kind) => {
-                // A runtime-owned awaited future (`async.sleep`,
-                // `http.*_async`) is a registry handle: release it here so a
-                // future dropped while parked on it — a `go` still sleeping
-                // when the program ends — does not leave the entry behind.
-                // The slot is zero until the await arms it, and every drop
-                // function is null-safe, so dropping an unarmed slot is a
-                // no-op.
+                // Release the handle so a future dropped while parked on it
+                // does not leave the entry behind. The slot is zero until the
+                // await arms it and the drops are null-safe.
                 let drop_fn = module.get_function(kind.drop_fn_name()).ok_or_else(|| {
                     crate::CodegenError::LLVMError(format!("{} not declared", kind.drop_fn_name()))
                 })?;
@@ -1559,8 +1553,7 @@ pub(crate) fn emit_await_suspend<'ctx>(
 
     let arg_values = emit_call_arguments(fn_ctx, arguments)?;
     for (i, arg_val) in arg_values.iter().enumerate() {
-        // The child future releases its parameter references in its drop, so
-        // a `chan` handle is retained for it.
+        // The child releases its parameter references in its drop.
         if let Some(arg) = arguments.get(i) {
             retain_chan_value(fn_ctx, arg, arg_val)?;
         }
@@ -2165,8 +2158,7 @@ pub(crate) fn emit_go_program_spawn<'ctx>(
 
     let arg_values = emit_call_arguments(fn_ctx, &arguments)?;
     for (i, arg_val) in arg_values.iter().enumerate() {
-        // The goroutine's future releases its own `chan` reference when it
-        // drops, so the spawner retains one for it and keeps its own.
+        // The goroutine's future releases its own `chan` reference on drop.
         retain_chan_value(fn_ctx, &arguments[i], arg_val)?;
         let slot =
             fn_ctx
@@ -2206,9 +2198,8 @@ pub(crate) fn emit_go_program_spawn<'ctx>(
         fn_ctx
             .builder
             .build_ptr_to_int(child_ptr, fn_ctx.context.i64_type(), "go_handle")?;
-    // Hand the scheduler the future's cleanup thunk: a goroutine that never
-    // completes (still parked when the program ends) is reclaimed at shutdown
-    // instead of leaking whatever its future's slots own.
+    // Hand the scheduler the cleanup thunk so a goroutine still parked when
+    // the program ends is reclaimed at shutdown.
     let cleanup_fn = fn_ctx
         .module
         .get_function(&format!("ntsc_future_{child_name}_go_cleanup"));
@@ -2312,11 +2303,8 @@ pub(crate) fn emit_goroutine_trampoline<'ctx>(
 }
 
 /// Get (or emit) `ntsc_future_<name>_go_cleanup(i64 future)`: reclaims one
-/// heap-allocated goroutine future by running its drop function and freeing
-/// it. The trampoline calls it when the future completes; the scheduler calls
-/// it at shutdown for a goroutine that never completed, so an abandoned
-/// future's owned handles (locals, parameters, an armed `async.sleep`) are
-/// still released.
+/// heap-allocated goroutine future. The trampoline calls it on completion; the
+/// scheduler calls it at shutdown for a goroutine that never completed.
 fn get_or_create_goroutine_cleanup<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,

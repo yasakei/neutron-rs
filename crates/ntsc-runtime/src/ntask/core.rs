@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
+use crate::idmap::IdMap;
 use crate::registry::{self, NULL};
 
 /// A poll function for one async future. Returns `1` when the future
@@ -56,6 +57,9 @@ pub(crate) enum ChanOp {
 pub(crate) struct Goroutine {
     /// Nested async task stack. It moves with the goroutine between workers.
     pub(crate) tasks: Vec<(PollFn, i64)>,
+    /// Registry id of this goroutine's `Handle::Goroutine` wrapper, so it is
+    /// reclaimed by one removal when the goroutine finishes.
+    pub(crate) handle: i64,
     /// Reclaims the root future if this goroutine never completes, so an
     /// abandoned future's owned handles are released at shutdown. `None` for a
     /// goroutine whose future is not heap-allocated by generated code.
@@ -145,11 +149,11 @@ pub(crate) struct Global {
     /// keeps the block/unblock path deadlock-free and still lets many workers
     /// run CPU-bound goroutines in parallel.
     pub(crate) ready: VecDeque<i64>,
-    pub(crate) goroutines: std::collections::HashMap<i64, Goroutine>,
-    pub(crate) chans: std::collections::HashMap<i64, Chan>,
-    pub(crate) ios: std::collections::HashMap<i64, AsyncIo>,
+    pub(crate) goroutines: IdMap<Goroutine>,
+    pub(crate) chans: IdMap<Chan>,
+    pub(crate) ios: IdMap<AsyncIo>,
     /// Offloaded blocking jobs not yet completed (or awaiting a reader).
-    pub(crate) ops: std::collections::HashMap<i64, AsyncOp>,
+    pub(crate) ops: IdMap<AsyncOp>,
     /// wall-clock ms deadline -> woken goroutine ids.
     pub(crate) timers: std::collections::BTreeMap<i64, Vec<i64>>,
 }
@@ -158,10 +162,10 @@ pub(crate) static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| {
     Mutex::new(Global {
         next_core: 1,
         ready: VecDeque::new(),
-        goroutines: std::collections::HashMap::new(),
-        chans: std::collections::HashMap::new(),
-        ios: std::collections::HashMap::new(),
-        ops: std::collections::HashMap::new(),
+        goroutines: IdMap::default(),
+        chans: IdMap::default(),
+        ios: IdMap::default(),
+        ops: IdMap::default(),
         timers: std::collections::BTreeMap::new(),
     })
 });
@@ -382,6 +386,7 @@ mod tests {
         }
         let core = register_goroutine(Goroutine {
             tasks: vec![(never_done as PollFn, NULL)],
+            handle: NULL,
             cleanup: None,
             park: Park::None,
             pending_send: NULL,
@@ -419,6 +424,7 @@ mod tests {
         let chan_core = register_chan(0, false);
         let core = register_goroutine(Goroutine {
             tasks: vec![(never_done as PollFn, NULL)],
+            handle: NULL,
             cleanup: None,
             park: Park::Chan {
                 core: chan_core,

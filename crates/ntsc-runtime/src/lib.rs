@@ -29,6 +29,7 @@
 //! `ntsc_rethrow` re-arms it (used after a `finally` that ran with a clean
 //! flag).
 
+mod idmap;
 pub mod modules;
 mod ntask;
 mod registry;
@@ -612,11 +613,9 @@ fn throw_string(message: &str) -> i64 {
 /// registry handle.
 pub type AsyncPollFn = extern "C" fn(i64) -> i8;
 
-/// Reclaims one heap-allocated future: runs its drop function, then frees it.
-/// A goroutine keeps its root future's cleanup so the scheduler can reclaim a
-/// future that never completed — a `go` still parked on `async.sleep` or a
-/// channel when the program ends. The goroutine trampoline performs the same
-/// cleanup itself on the completion path.
+/// Reclaims one heap-allocated future: runs its drop, then frees it. A
+/// goroutine keeps its root future's cleanup so the scheduler can reclaim a
+/// future that never completed; the trampoline does the same on completion.
 pub type AsyncCleanupFn = extern "C" fn(i64);
 
 thread_local! {
@@ -704,10 +703,11 @@ pub extern "C" fn ntask_go_owned(
 }
 
 fn spawn_goroutine(poll_fn: AsyncPollFn, future: i64, cleanup: Option<AsyncCleanupFn>) -> i64 {
-    let core = ntask::scheduler::register(poll_fn, future, cleanup);
-    // Publish the registry wrapper before the goroutine can be driven, so a
-    // child that finishes on its first poll is never orphaned.
-    let handle = registry::insert(registry::Handle::Goroutine { core });
+    // Reserve the wrapper id first so the goroutine can record it: a child
+    // that finishes on its first poll must find its wrapper.
+    let handle = registry::reserve_id();
+    let core = ntask::scheduler::register(poll_fn, future, cleanup, handle);
+    registry::insert_reserved(handle, registry::Handle::Goroutine { core });
     ntask::scheduler::make_runnable(core);
     handle
 }
