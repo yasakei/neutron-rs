@@ -15,12 +15,12 @@
 //! wakeup. Idle workers sleep on a condition variable; any spawn, channel
 //! handoff, timer expiry, or fd-ready event re-notifies them.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, RwLock, mpsc};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
 
 use super::core::{self, ChanOp, Goroutine, Park};
+use super::runqueue::RunQueue;
 use crate::registry::NULL;
 
 /// Idle-worker sleep signal. Workers wait on this when the ready queue is
@@ -44,22 +44,63 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static CURRENT_GID: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+
+    /// The running goroutine's suspension state, held on the worker for the
+    /// duration of one poll. `park_self`, `park_chan_send` and the `recv_*`
+    /// readers are called from generated code on every suspension and every
+    /// channel receive; going through the global lock for each made the poll
+    /// path take it three or four times instead of twice. [`drive`] loads this
+    /// when it picks the goroutine up and flushes it back when the poll returns,
+    /// so the shared table still sees exactly the same transitions.
+    static CURRENT_STATE: std::cell::Cell<TaskState> = const {
+        std::cell::Cell::new(TaskState::IDLE)
+    };
+}
+
+/// Per-poll suspension state mirrored onto the worker thread. Every field is a
+/// scalar, so this is `Copy` and lives in a `Cell` with no borrow bookkeeping.
+#[derive(Clone, Copy)]
+struct TaskState {
+    park: Park,
+    pending_send: i64,
+    recv_result: i64,
+    recv_ok: bool,
+}
+
+impl TaskState {
+    const IDLE: TaskState = TaskState {
+        park: Park::None,
+        pending_send: NULL,
+        recv_result: NULL,
+        recv_ok: false,
+    };
 }
 
 /// Workers launched by [`start`]; kept so [`shutdown`] can join them.
 static WORKERS: LazyLock<Mutex<Vec<JoinHandle<()>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static REACTOR: LazyLock<Mutex<Option<JoinHandle<()>>>> = LazyLock::new(|| Mutex::new(None));
-type WorkerQueue = Arc<Mutex<VecDeque<i64>>>;
-/// Per-worker ready queues. Rebuilt only by [`start`] and [`shutdown`], so
-/// spawns and pops take the read side and never clone the vector.
-static QUEUES: LazyLock<RwLock<Vec<WorkerQueue>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Per-worker lock-free run queues, allocated once for the process. A `OnceLock`
+/// rather than a lock: the hot paths (spawn, pop, steal, emptiness check) only
+/// index it, so putting a lock in front would reintroduce the contention the
+/// queues exist to avoid. `shutdown` drains the queues instead of freeing them,
+/// so a later `start` reuses the same allocation.
+static QUEUES: OnceLock<Box<[RunQueue]>> = OnceLock::new();
+
+fn queues() -> &'static [RunQueue] {
+    QUEUES.get().map(|queues| &**queues).unwrap_or(&[])
+}
 
 /// Whether the worker pool is running, so a spawn need not lock [`WORKERS`].
 static STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Workers currently blocked in [`wait_for_work`]. With none parked, a wake is
-/// pure overhead: a busy worker re-checks the queues when it finishes anyway.
-static IDLE: AtomicUsize = AtomicUsize::new(0);
+/// Searching and unparked worker counts, packed into one word so both are read
+/// with a single atomic operation. Go (`sched.nmspinning`) and Tokio
+/// (`idle::State`) both require this: a wake is only worth its futex syscall
+/// when no worker is already hunting for work and one is actually parked.
+static IDLE_STATE: AtomicUsize = AtomicUsize::new(0);
+const SEARCHING_MASK: usize = 0xffff;
+const UNPARKED_SHIFT: u32 = 16;
 
 thread_local! {
     static WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -75,14 +116,15 @@ pub(crate) fn start() {
     if !workers.is_empty() {
         return;
     }
-    let count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .max(1);
-    let queues: Vec<_> = (0..count)
-        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
-        .collect();
-    *QUEUES.write().unwrap_or_else(|p| p.into_inner()) = queues;
+    let count = QUEUES
+        .get_or_init(|| {
+            let count = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .max(1);
+            (0..count).map(|_| RunQueue::new()).collect()
+        })
+        .len();
     for index in 0..count {
         if let Ok(worker) = std::thread::Builder::new()
             .name(format!("ntask-worker-{index}"))
@@ -213,7 +255,6 @@ fn new_goroutine(
         tasks: vec![(poll, future)],
         handle,
         cleanup: cleanup.map(|f| (f, future)),
-        park: Park::None,
         pending_send: NULL,
         recv_result: NULL,
         recv_ok: false,
@@ -225,31 +266,53 @@ fn new_goroutine(
 }
 
 /// Push a goroutine onto the ready queue and wake a worker if one is asleep.
+/// From a worker, the goroutine goes into that worker's LIFO slot: a channel
+/// handoff or an immediate requeue then stays on the core that produced it, with
+/// its state still in cache.
 pub(crate) fn make_runnable(gid: i64) {
-    let local = WORKER_INDEX.with(|index| index.get());
-    if let Some(index) = local {
-        let queues = QUEUES.read().unwrap_or_else(|p| p.into_inner());
-        if let Some(queue) = queues.get(index) {
-            queue
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push_back(gid);
-            drop(queues);
-            notify_one();
-            return;
+    if let Some(queue) = local_queue() {
+        if let Some(displaced) = queue.push_next(gid)
+            && !queue.push(displaced)
+        {
+            overflow_to_shared(queue, displaced);
         }
+        notify_one();
+        return;
     }
-    core::GLOBAL
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .ready
-        .push_back(gid);
+    core::push_ready(gid);
     notify_one();
 }
 
-/// Notify a single idle worker; a no-op when every worker is busy.
+/// This worker's run queue, or `None` when called from outside the pool.
+fn local_queue() -> Option<&'static RunQueue> {
+    let index = WORKER_INDEX.with(|index| index.get())?;
+    queues().get(index)
+}
+
+/// Move half of a full local ring to the shared queue along with `gid`, so the
+/// per-spawn cost of a full queue is one shared-lock acquisition per 128
+/// goroutines rather than one per goroutine (Go's `runqputslow`).
+fn overflow_to_shared(queue: &RunQueue, gid: i64) {
+    let mut batch = queue.take_half();
+    batch.push(gid);
+    core::push_ready_batch(batch);
+}
+
+/// Whether a wake is worth its futex syscall: only when no worker is already
+/// hunting for work and at least one is parked. `fetch_add(0, SeqCst)` is the
+/// store-load barrier this check requires — `Acquire` would let the queue push
+/// and this load both read stale, losing the wakeup. Go's `wakep` and Tokio's
+/// `notify_should_wakeup` use exactly this pattern.
+fn should_wake() -> bool {
+    let state = IDLE_STATE.fetch_add(0, Ordering::SeqCst);
+    let searching = state & SEARCHING_MASK;
+    let unparked = state >> UNPARKED_SHIFT;
+    searching == 0 && unparked < queues().len()
+}
+
+/// Notify a single idle worker, if waking one can help.
 fn notify_one() {
-    if IDLE.load(Ordering::Acquire) == 0 {
+    if !should_wake() {
         return;
     }
     let (lock, cvar) = &*SIGNAL;
@@ -259,14 +322,14 @@ fn notify_one() {
 
 /// Notify all workers (used when a burst of goroutines became runnable).
 pub(crate) fn notify_all() {
-    if IDLE.load(Ordering::Acquire) == 0 {
+    if !should_wake() {
         return;
     }
     notify_all_unconditional();
 }
 
 /// Notify all workers even when none is counted idle: a worker between its
-/// queue check and its wait is not yet in `IDLE` but must see the stop flag.
+/// queue check and its wait is not yet parked but must see the stop flag.
 fn notify_all_unconditional() {
     let (lock, cvar) = &*SIGNAL;
     let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -277,59 +340,73 @@ fn notify_all_unconditional() {
 /// there is nothing to do.
 fn worker_loop(index: usize) {
     WORKER_INDEX.with(|worker| worker.set(Some(index)));
+    // Workers start unparked; parking decrements this.
+    IDLE_STATE.fetch_add(1 << UNPARKED_SHIFT, Ordering::SeqCst);
+    let mut tick: u32 = 0;
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
+            IDLE_STATE.fetch_sub(1 << UNPARKED_SHIFT, Ordering::SeqCst);
             return;
         }
-        let gid = pop_ready(index);
-        match gid {
-            Some(gid) => {
-                drive(gid);
-            }
-            None => wait_for_work(),
+        tick = tick.wrapping_add(1);
+        match pop_ready(index, tick) {
+            Some(gid) => drive(gid),
+            None => wait_for_work(index),
         }
     }
 }
 
-/// Goroutines a worker moves from the shared queue into its own per pop. A
-/// spawn loop in `main` fills the shared queue far faster than workers drain
-/// it, and taking one id per lock acquisition made the global mutex the
-/// bottleneck: four workers plus the spawner contended on it 100k times.
-const STEAL_BATCH: usize = 64;
+/// Polls between forced checks of the shared queue. Without it, two goroutines
+/// that keep re-readying each other on one worker starve every goroutine in the
+/// shared queue. Go uses 61 for the same reason.
+const GLOBAL_CHECK_INTERVAL: u32 = 61;
 
-/// Pop a runnable goroutine, or `None` when every queue is empty.
-fn pop_ready(index: usize) -> Option<i64> {
-    let queues = QUEUES.read().unwrap_or_else(|p| p.into_inner());
-    if let Some(queue) = queues.get(index) {
-        if let Some(gid) = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front() {
-            return Some(gid);
-        }
-        // Local queue empty: refill it from the shared queue in one pass.
-        let mut batch: Vec<i64> = {
-            let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
-            let take = g.ready.len().min(STEAL_BATCH);
-            g.ready.drain(..take).collect()
-        };
-        if let Some(gid) = batch.pop() {
-            if !batch.is_empty() {
-                let mut local = queue.lock().unwrap_or_else(|p| p.into_inner());
-                local.extend(batch);
-            }
-            return Some(gid);
-        }
-    } else {
-        drop(queues);
-        return core::GLOBAL
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .ready
-            .pop_front();
+/// Pop a runnable goroutine: the local queue first, the shared queue when it is
+/// dry (or every `GLOBAL_CHECK_INTERVAL` polls, for fairness), then steal.
+fn pop_ready(index: usize, tick: u32) -> Option<i64> {
+    let all = queues();
+    let Some(queue) = all.get(index) else {
+        return core::pop_ready();
+    };
+    if tick.is_multiple_of(GLOBAL_CHECK_INTERVAL)
+        && let Some(gid) = core::pop_ready()
+    {
+        return Some(gid);
     }
-    queues.iter().enumerate().find_map(|(other, queue)| {
-        (other != index)
-            .then(|| queue.lock().unwrap_or_else(|p| p.into_inner()).pop_back())
-            .flatten()
-    })
+    if let Some(gid) = queue.pop() {
+        return Some(gid);
+    }
+    if let Some(gid) = refill_from_shared(queue, all.len()) {
+        return Some(gid);
+    }
+    steal_from_peers(queue, index, all)
+}
+
+/// Move a share of the shared queue into `queue`, returning one id to run now.
+/// The share is bounded by the worker count so one worker cannot swallow a burst
+/// that the others could be running in parallel.
+fn refill_from_shared(queue: &RunQueue, workers: usize) -> Option<i64> {
+    let mut batch = core::pop_ready_batch(workers);
+    let gid = batch.pop()?;
+    for id in batch {
+        if !queue.push(id) {
+            core::push_ready(id);
+        }
+    }
+    Some(gid)
+}
+
+/// Take half of a peer's queue. The scan starts at a rotating offset so every
+/// thief does not hammer worker 0, as in Go's randomized `stealOrder`.
+fn steal_from_peers(queue: &RunQueue, index: usize, all: &'static [RunQueue]) -> Option<i64> {
+    let count = all.len();
+    for offset in 1..count {
+        let victim = (index + offset) % count;
+        if let Some(gid) = all[victim].steal_into(queue) {
+            return Some(gid);
+        }
+    }
+    None
 }
 
 /// Queue checks a worker makes before it parks. A spawn loop hands out work
@@ -338,20 +415,34 @@ fn pop_ready(index: usize) -> Option<i64> {
 const SPIN_BEFORE_PARK: u32 = 64;
 
 /// Sleep until a goroutine becomes runnable or we are asked to stop.
-fn wait_for_work() {
+fn wait_for_work(index: usize) {
+    // Counted as searching while spinning, so a concurrent spawn skips its wake:
+    // this worker will see the work itself within the spin budget.
+    IDLE_STATE.fetch_add(1, Ordering::SeqCst);
+    let mut found = false;
     for _ in 0..SPIN_BEFORE_PARK {
         if SHUTDOWN.load(Ordering::Relaxed) || has_work() {
-            return;
+            found = true;
+            break;
         }
         std::hint::spin_loop();
     }
+    let was_last_searcher = IDLE_STATE.fetch_sub(1, Ordering::SeqCst) & SEARCHING_MASK == 1;
+    if found {
+        return;
+    }
+    // The last searcher to give up must re-check every queue before sleeping,
+    // and wake a peer if it finds anything: a spawn that ran concurrently with
+    // the decrement above may have skipped its notification.
+    if was_last_searcher && has_work() {
+        notify_one();
+        return;
+    }
+
     let (lock, cvar) = &*SIGNAL;
-    IDLE.fetch_add(1, Ordering::Release);
+    IDLE_STATE.fetch_sub(1 << UNPARKED_SHIFT, Ordering::SeqCst);
     loop {
-        if SHUTDOWN.load(Ordering::Relaxed) {
-            break;
-        }
-        if has_work() {
+        if SHUTDOWN.load(Ordering::Relaxed) || has_work() {
             break;
         }
         let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -359,23 +450,15 @@ fn wait_for_work() {
             .wait_timeout(guard, std::time::Duration::from_millis(10))
             .unwrap_or_else(|p| p.into_inner());
     }
-    IDLE.fetch_sub(1, Ordering::Release);
+    IDLE_STATE.fetch_add(1 << UNPARKED_SHIFT, Ordering::SeqCst);
+    let _ = index;
 }
 
+/// Whether any queue holds a runnable goroutine. Every check is an atomic load,
+/// so the pre-park spin can run it thousands of times without contending with
+/// the spawner it is waiting on.
 fn has_work() -> bool {
-    if QUEUES
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .any(|queue| !queue.lock().unwrap_or_else(|p| p.into_inner()).is_empty())
-    {
-        return true;
-    }
-    !core::GLOBAL
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .ready
-        .is_empty()
+    queues().iter().any(|queue| !queue.is_empty()) || core::has_ready()
 }
 
 /// Drive one goroutine to a suspension/completion point. The poll function
@@ -384,7 +467,19 @@ fn drive(gid: i64) {
     let tasks = {
         let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
         match g.goroutines.get_mut(&gid) {
-            Some(g) => std::mem::take(&mut g.tasks),
+            Some(gr) => {
+                // Take the suspension state onto this worker for the poll, so
+                // the runtime calls the poll makes stay lock-free.
+                CURRENT_STATE.with(|state| {
+                    state.set(TaskState {
+                        park: Park::None,
+                        pending_send: gr.pending_send,
+                        recv_result: gr.recv_result,
+                        recv_ok: gr.recv_ok,
+                    })
+                });
+                std::mem::take(&mut gr.tasks)
+            }
             None => return,
         }
     };
@@ -394,7 +489,27 @@ fn drive(gid: i64) {
     let tasks = crate::take_async_tasks();
     let done = tasks.is_empty();
     CURRENT_GID.with(|cur| cur.set(None));
+    let state = CURRENT_STATE.with(|state| state.replace(TaskState::IDLE));
 
+    // A goroutine that yielded without a wait target needs no shared state at
+    // all: requeue it straight onto this worker's LIFO slot. That is the
+    // spawn-heavy path (a `go` body that runs to completion in one poll never
+    // reaches here, but a multi-poll body hits it every turn), so keeping the
+    // global lock out of it removes one acquisition per poll.
+    if !done && matches!(state.park, Park::None) {
+        {
+            let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(gr) = g.goroutines.get_mut(&gid) else {
+                return;
+            };
+            gr.tasks = tasks;
+            gr.pending_send = state.pending_send;
+            gr.recv_result = state.recv_result;
+            gr.recv_ok = state.recv_ok;
+        }
+        make_runnable(gid);
+        return;
+    }
     let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
     if done {
         let (joiners, reclaim, handle) = {
@@ -426,6 +541,7 @@ fn drive(gid: i64) {
         for j in &joiners {
             g.ready.push_back(*j);
         }
+        core::sync_ready_len(&g);
         if reclaim {
             g.goroutines.remove(&gid);
         }
@@ -443,9 +559,12 @@ fn drive(gid: i64) {
             return;
         };
         gr.tasks = tasks;
-        let park = gr.park;
-        gr.park = Park::None;
-        park
+        // Flush the state the poll produced; `park` is consumed here, so the
+        // stored copy always reads `Park::None` between polls.
+        gr.pending_send = state.pending_send;
+        gr.recv_result = state.recv_result;
+        gr.recv_ok = state.recv_ok;
+        state.park
     };
     let mut woke = false;
     let mut requeue_local = false;
@@ -491,6 +610,7 @@ fn drive(gid: i64) {
             }
         }
     }
+    core::sync_ready_len(&g);
     drop(g);
     if requeue_local {
         make_runnable(gid);
@@ -707,6 +827,7 @@ pub(crate) fn chan_close(core_id: i64) {
         }
         g.ready.push_back(s);
     }
+    core::sync_ready_len(&g);
     drop(g);
     if owns_elements {
         for value in abandoned {
@@ -723,45 +844,49 @@ pub(crate) fn current_gid() -> Option<i64> {
     CURRENT_GID.with(|cur| cur.get())
 }
 
-/// The id of the goroutine this code is running in; panics if none.
 /// Park the current goroutine with the given wait target (does not requeue).
+/// Writes the worker-local state; [`drive`] flushes it after the poll returns.
 pub(crate) fn park_self(park: Park) {
-    let Some(gid) = current_gid() else {
+    if current_gid().is_none() {
         return;
-    };
-    let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(gr) = g.goroutines.get_mut(&gid) {
-        gr.park = park;
     }
+    CURRENT_STATE.with(|state| {
+        let mut current = state.get();
+        current.park = park;
+        state.set(current);
+    });
 }
 
 /// Park the current goroutine on a channel send with the given value.
 pub(crate) fn park_chan_send(core_id: i64, value: i64) {
-    let Some(gid) = current_gid() else {
+    if current_gid().is_none() {
         return;
-    };
-    let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(gr) = g.goroutines.get_mut(&gid) {
-        gr.pending_send = value;
-        gr.park = Park::Chan {
+    }
+    CURRENT_STATE.with(|state| {
+        let mut current = state.get();
+        current.pending_send = value;
+        current.park = Park::Chan {
             core: core_id,
             op: ChanOp::Send,
         };
-    }
+        state.set(current);
+    });
 }
 
 /// Park the current goroutine on a channel receive.
 pub(crate) fn park_chan_recv(core_id: i64) {
-    if let Some(gid) = current_gid() {
-        let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(gr) = g.goroutines.get_mut(&gid) {
-            gr.recv_result = NULL;
-            gr.recv_ok = false;
-        }
+    if current_gid().is_none() {
+        return;
     }
-    park_self(Park::Chan {
-        core: core_id,
-        op: ChanOp::Recv,
+    CURRENT_STATE.with(|state| {
+        let mut current = state.get();
+        current.recv_result = NULL;
+        current.recv_ok = false;
+        current.park = Park::Chan {
+            core: core_id,
+            op: ChanOp::Recv,
+        };
+        state.set(current);
     });
 }
 
@@ -782,30 +907,18 @@ pub(crate) fn park_join(target: i64) {
 
 /// The result handle recorded on the current goroutine by its last receive.
 pub(crate) fn recv_result() -> i64 {
-    current_gid()
-        .and_then(|gid| {
-            core::GLOBAL
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .goroutines
-                .get(&gid)
-                .map(|gr| gr.recv_result)
-        })
-        .unwrap_or(NULL)
+    if current_gid().is_none() {
+        return NULL;
+    }
+    CURRENT_STATE.with(|state| state.get().recv_result)
 }
 
 /// Whether the last receive on this goroutine delivered a real value.
 pub(crate) fn recv_ok() -> bool {
-    current_gid()
-        .and_then(|gid| {
-            core::GLOBAL
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .goroutines
-                .get(&gid)
-                .map(|gr| gr.recv_ok)
-        })
-        .unwrap_or(false)
+    if current_gid().is_none() {
+        return false;
+    }
+    CURRENT_STATE.with(|state| state.get().recv_ok)
 }
 
 /// Block the calling *OS thread* until the goroutine completes, then return its
@@ -829,13 +942,13 @@ pub(crate) fn join_blocking(gid: i64) -> i64 {
             Some((false, _, _)) => {
                 // Counted as idle so the completing worker still wakes us,
                 // instead of this thread sitting out the full quantum.
-                IDLE.fetch_add(1, Ordering::Release);
+                IDLE_STATE.fetch_sub(1 << UNPARKED_SHIFT, Ordering::SeqCst);
                 let (lock, cvar) = &*SIGNAL;
                 let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
                 let _ = cvar
                     .wait_timeout(guard, std::time::Duration::from_millis(10))
                     .unwrap_or_else(|p| p.into_inner());
-                IDLE.fetch_sub(1, Ordering::Release);
+                IDLE_STATE.fetch_add(1 << UNPARKED_SHIFT, Ordering::SeqCst);
             }
             None => return NULL,
         }
@@ -906,7 +1019,7 @@ pub(crate) fn shutdown() {
         })
         .collect();
     g.goroutines.clear();
-    g.ready.clear();
+    core::clear_ready(&mut g);
     g.timers.clear();
     g.ops.clear();
     core::timers_reset();
@@ -925,8 +1038,12 @@ pub(crate) fn shutdown() {
             cleanup(future);
         }
     }
-    QUEUES.write().unwrap_or_else(|p| p.into_inner()).clear();
-    IDLE.store(0, Ordering::Release);
+    // The queues outlive the pool (a later `start` reuses them), so drain any
+    // goroutine still queued rather than freeing the rings.
+    for queue in queues() {
+        let _ = queue.drain();
+    }
+    IDLE_STATE.store(0, Ordering::SeqCst);
     STARTED.store(false, Ordering::Release);
     SHUTDOWN.store(false, Ordering::Relaxed);
 }
@@ -951,7 +1068,7 @@ pub(crate) use core::register_op;
 
 /// Wake up to `count` idle workers.
 pub(crate) fn wake_workers(count: usize) {
-    if count == 0 || IDLE.load(Ordering::Acquire) == 0 {
+    if count == 0 || !should_wake() {
         return;
     }
     let (lock, cvar) = &*SIGNAL;

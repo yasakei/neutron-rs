@@ -10,7 +10,7 @@
 //! pool while I/O-bound goroutines park without tying up a thread.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::idmap::IdMap;
@@ -64,8 +64,6 @@ pub(crate) struct Goroutine {
     /// abandoned future's owned handles are released at shutdown. `None` for a
     /// goroutine whose future is not heap-allocated by generated code.
     pub(crate) cleanup: Option<(CleanupFn, i64)>,
-    /// The pending wait target, set by the last park call.
-    pub(crate) park: Park,
     /// The value a blocked sender is handing off, or `NULL`.
     pub(crate) pending_send: i64,
     /// The value a receiver picked up (or the zero value on close), or `NULL`.
@@ -197,6 +195,74 @@ pub(crate) fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Length of `Global::ready`, mirrored outside the lock so a parking worker can
+/// test the shared queue with one atomic load instead of taking the mutex.
+static READY_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the shared ready queue holds anything.
+pub(crate) fn has_ready() -> bool {
+    READY_LEN.load(Ordering::Acquire) > 0
+}
+
+/// Push a goroutine onto the shared ready queue. The overflow path for a full
+/// worker ring, and the wakeup path from outside the pool.
+pub(crate) fn push_ready(gid: i64) {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    guard.ready.push_back(gid);
+    READY_LEN.store(guard.ready.len(), Ordering::Release);
+}
+
+/// Push a batch onto the shared ready queue under one lock acquisition.
+pub(crate) fn push_ready_batch(ids: Vec<i64>) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    guard.ready.extend(ids);
+    READY_LEN.store(guard.ready.len(), Ordering::Release);
+}
+
+/// Take one goroutine from the shared ready queue.
+pub(crate) fn pop_ready() -> Option<i64> {
+    if !has_ready() {
+        return None;
+    }
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let gid = guard.ready.pop_front();
+    READY_LEN.store(guard.ready.len(), Ordering::Release);
+    gid
+}
+
+/// Take a share of the shared ready queue: `len / workers + 1`, capped so one
+/// worker cannot swallow a burst the others could run in parallel.
+pub(crate) fn pop_ready_batch(workers: usize) -> Vec<i64> {
+    if !has_ready() {
+        return Vec::new();
+    }
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let share = guard.ready.len() / workers.max(1) + 1;
+    let take = share.min(guard.ready.len()).min(READY_BATCH_CAP);
+    let batch: Vec<i64> = guard.ready.drain(..take).collect();
+    READY_LEN.store(guard.ready.len(), Ordering::Release);
+    batch
+}
+
+/// Upper bound on one refill, so a worker never holds the shared lock long.
+const READY_BATCH_CAP: usize = 128;
+
+/// Clear the shared ready queue, keeping [`READY_LEN`] in step.
+pub(crate) fn clear_ready(guard: &mut Global) {
+    guard.ready.clear();
+    READY_LEN.store(0, Ordering::Release);
+}
+
+/// Republish [`READY_LEN`] after a direct mutation of `Global::ready` made
+/// while the caller already held the lock (the channel and reactor wake paths
+/// push onto it as part of a larger critical section).
+pub(crate) fn sync_ready_len(guard: &Global) {
+    READY_LEN.store(guard.ready.len(), Ordering::Release);
+}
+
 /// Register a new goroutine and return its core id. The goroutine is not
 /// scheduled until [`crate::ntask::scheduler::make_runnable`] is called for it.
 pub(crate) fn register_goroutine(g: Goroutine) -> i64 {
@@ -216,6 +282,7 @@ pub(crate) fn register_goroutine_runnable(g: Goroutine) -> i64 {
     guard.next_core = guard.next_core.saturating_add(1);
     guard.goroutines.insert(id, g);
     guard.ready.push_back(id);
+    sync_ready_len(&guard);
     id
 }
 
@@ -343,6 +410,7 @@ pub(crate) fn complete_op(core: i64, result: i64) {
     let waiter = op.waiter.take();
     if let Some(gid) = waiter {
         guard.ready.push_back(gid);
+        sync_ready_len(&guard);
     }
     drop(guard);
     if waiter.is_some() {
@@ -400,7 +468,6 @@ mod tests {
             tasks: vec![(never_done as PollFn, NULL)],
             handle: NULL,
             cleanup: None,
-            park: Park::None,
             pending_send: NULL,
             recv_result: NULL,
             recv_ok: false,
@@ -438,10 +505,6 @@ mod tests {
             tasks: vec![(never_done as PollFn, NULL)],
             handle: NULL,
             cleanup: None,
-            park: Park::Chan {
-                core: chan_core,
-                op: ChanOp::Send,
-            },
             pending_send: NULL,
             recv_result: NULL,
             recv_ok: false,

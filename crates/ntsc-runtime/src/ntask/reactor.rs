@@ -368,6 +368,7 @@ fn wake_ready_ios(ios: Vec<i64>) {
             slot.parked = false;
             for waiter in std::mem::take(&mut slot.waiters) {
                 g.ready.push_back(waiter);
+                core::sync_ready_len(&g);
                 woken += 1;
             }
         }

@@ -2,4 +2,5 @@
 
 pub(crate) mod core;
 pub(crate) mod reactor;
+pub(crate) mod runqueue;
 pub(crate) mod scheduler;
