@@ -211,10 +211,22 @@ pub(crate) fn reset() {
     INTERESTS_DIRTY.store(true, Ordering::Release);
 }
 
+/// The readiness wait set, rebuilt by [`readiness_wait`]. On Unix it is a
+/// `pollfd` array; on Windows no `pollfd` type exists (descriptor readiness is
+/// not wired to the reactor yet), so it is an empty marker vector.
+#[cfg(unix)]
+type PollBuf = Vec<libc::pollfd>;
+
+/// Windows has no `pollfd`: the backend waits on the wake event alone, so the
+/// buffer is never populated. It still exists so [`reactor_loop`] has one
+/// caller-owned reuse buffer across platforms.
+#[cfg(windows)]
+type PollBuf = Vec<u8>;
+
 /// The reactor thread: wait for timers and fd readiness, waking goroutines.
 fn reactor_loop() {
-    // The pollfd array is reused; rebuilt only when the interest table changes.
-    let mut fds: Vec<libc::pollfd> = Vec::new();
+    // The readiness buffer is reused; rebuilt only when the interest table changes.
+    let mut fds: PollBuf = Vec::new();
     let mut index_of_core: Vec<i64> = Vec::new();
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
@@ -328,11 +340,7 @@ fn readiness_wait(
 /// readiness is not wired to a Windows backend yet (no language construct
 /// registers fd interests there), so no io core is ever reported ready.
 #[cfg(windows)]
-fn readiness_wait(
-    timeout_ms: i64,
-    _fds: &mut Vec<libc::pollfd>,
-    _index_of_core: &mut Vec<i64>,
-) -> Vec<i64> {
+fn readiness_wait(timeout_ms: i64, _fds: &mut PollBuf, _index_of_core: &mut Vec<i64>) -> Vec<i64> {
     let timeout_c = if timeout_ms < 0 {
         win::INFINITE
     } else {
