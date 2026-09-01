@@ -207,6 +207,18 @@ pub(crate) fn register_goroutine(g: Goroutine) -> i64 {
     id
 }
 
+/// Register a goroutine and queue it as runnable in one critical section.
+/// A spawn from outside the worker pool (`main` spawning in a loop) would
+/// otherwise take the global lock twice per goroutine.
+pub(crate) fn register_goroutine_runnable(g: Goroutine) -> i64 {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let id = guard.next_core;
+    guard.next_core = guard.next_core.saturating_add(1);
+    guard.goroutines.insert(id, g);
+    guard.ready.push_back(id);
+    id
+}
+
 /// Register a new channel and return its core id.
 pub(crate) fn register_chan(cap: usize, owns_elements: bool) -> i64 {
     let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());

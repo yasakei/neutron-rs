@@ -180,7 +180,36 @@ pub(crate) fn register(
     handle: i64,
 ) -> i64 {
     start();
-    core::register_goroutine(Goroutine {
+    core::register_goroutine(new_goroutine(poll, future, cleanup, handle))
+}
+
+/// Register a goroutine and queue it as runnable. A spawn from outside the
+/// worker pool takes the global lock once instead of twice.
+pub(crate) fn spawn_runnable(
+    poll: core::PollFn,
+    future: i64,
+    cleanup: Option<core::CleanupFn>,
+    handle: i64,
+) -> i64 {
+    start();
+    let goroutine = new_goroutine(poll, future, cleanup, handle);
+    if WORKER_INDEX.with(|index| index.get()).is_some() {
+        let gid = core::register_goroutine(goroutine);
+        make_runnable(gid);
+        return gid;
+    }
+    let gid = core::register_goroutine_runnable(goroutine);
+    notify_one();
+    gid
+}
+
+fn new_goroutine(
+    poll: core::PollFn,
+    future: i64,
+    cleanup: Option<core::CleanupFn>,
+    handle: i64,
+) -> Goroutine {
+    Goroutine {
         tasks: vec![(poll, future)],
         handle,
         cleanup: cleanup.map(|f| (f, future)),
@@ -192,7 +221,7 @@ pub(crate) fn register(
         result: NULL,
         pending_exception: NULL,
         joiners: Vec::new(),
-    })
+    }
 }
 
 /// Push a goroutine onto the ready queue and wake a worker if one is asleep.
@@ -262,25 +291,40 @@ fn worker_loop(index: usize) {
     }
 }
 
+/// Goroutines a worker moves from the shared queue into its own per pop. A
+/// spawn loop in `main` fills the shared queue far faster than workers drain
+/// it, and taking one id per lock acquisition made the global mutex the
+/// bottleneck: four workers plus the spawner contended on it 100k times.
+const STEAL_BATCH: usize = 64;
+
 /// Pop a runnable goroutine, or `None` when every queue is empty.
 fn pop_ready(index: usize) -> Option<i64> {
     let queues = QUEUES.read().unwrap_or_else(|p| p.into_inner());
-    if let Some(gid) = queues
-        .get(index)
-        .and_then(|queue| queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front())
-    {
-        return Some(gid);
+    if let Some(queue) = queues.get(index) {
+        if let Some(gid) = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front() {
+            return Some(gid);
+        }
+        // Local queue empty: refill it from the shared queue in one pass.
+        let mut batch: Vec<i64> = {
+            let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+            let take = g.ready.len().min(STEAL_BATCH);
+            g.ready.drain(..take).collect()
+        };
+        if let Some(gid) = batch.pop() {
+            if !batch.is_empty() {
+                let mut local = queue.lock().unwrap_or_else(|p| p.into_inner());
+                local.extend(batch);
+            }
+            return Some(gid);
+        }
+    } else {
+        drop(queues);
+        return core::GLOBAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ready
+            .pop_front();
     }
-    drop(queues);
-    if let Some(gid) = core::GLOBAL
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .ready
-        .pop_front()
-    {
-        return Some(gid);
-    }
-    let queues = QUEUES.read().unwrap_or_else(|p| p.into_inner());
     queues.iter().enumerate().find_map(|(other, queue)| {
         (other != index)
             .then(|| queue.lock().unwrap_or_else(|p| p.into_inner()).pop_back())
@@ -288,8 +332,19 @@ fn pop_ready(index: usize) -> Option<i64> {
     })
 }
 
+/// Queue checks a worker makes before it parks. A spawn loop hands out work
+/// faster than a syscall round trip, so a worker that sleeps the moment its
+/// queue runs dry makes every later spawn pay a futex wake.
+const SPIN_BEFORE_PARK: u32 = 64;
+
 /// Sleep until a goroutine becomes runnable or we are asked to stop.
 fn wait_for_work() {
+    for _ in 0..SPIN_BEFORE_PARK {
+        if SHUTDOWN.load(Ordering::Relaxed) || has_work() {
+            return;
+        }
+        std::hint::spin_loop();
+    }
     let (lock, cvar) = &*SIGNAL;
     IDLE.fetch_add(1, Ordering::Release);
     loop {

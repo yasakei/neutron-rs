@@ -2198,8 +2198,9 @@ pub(crate) fn emit_go_program_spawn<'ctx>(
         fn_ctx
             .builder
             .build_ptr_to_int(child_ptr, fn_ctx.context.i64_type(), "go_handle")?;
-    // Hand the scheduler the cleanup thunk so a goroutine still parked when
-    // the program ends is reclaimed at shutdown.
+    // `go f(x)` discards the handle, so spawn detached: no registry wrapper is
+    // allocated for something nothing can join. The cleanup thunk still lets
+    // the scheduler reclaim a future that never completes.
     let cleanup_fn = fn_ctx
         .module
         .get_function(&format!("ntsc_future_{child_name}_go_cleanup"));
@@ -2209,19 +2210,17 @@ pub(crate) fn emit_go_program_spawn<'ctx>(
             fn_ctx.context.ptr_type(AddressSpace::default()),
             "go_cleanup_fn",
         )?;
-        let go_owned_fn = fn_ctx
+        let go_detached_fn = fn_ctx
             .module
-            .get_function("ntask_go_owned")
-            .ok_or_else(|| crate::CodegenError::LLVMError("ntask_go_owned not declared".into()))?;
-        let goroutine = fn_ctx.builder.build_call(
-            go_owned_fn,
+            .get_function("ntask_go_detached")
+            .ok_or_else(|| {
+                crate::CodegenError::LLVMError("ntask_go_detached not declared".into())
+            })?;
+        fn_ctx.builder.build_call(
+            go_detached_fn,
             &[poll_ptr.into(), child_handle.into(), cleanup_ptr.into()],
             "go_spawn",
         )?;
-        // Fire and forget: the goroutine's registry entry outlives the spawn
-        // site (the scheduler drives it to completion; the entry is reclaimed
-        // when the runtime state is reset).
-        let _ = call_result_to_value(fn_ctx, &goroutine).into_int_value();
         return Ok(());
     }
     let go_fn = fn_ctx
@@ -2232,9 +2231,7 @@ pub(crate) fn emit_go_program_spawn<'ctx>(
         fn_ctx
             .builder
             .build_call(go_fn, &[poll_ptr.into(), child_handle.into()], "go_spawn")?;
-    // Fire and forget: the goroutine's registry entry outlives the spawn
-    // site (the scheduler drives it to completion; the entry is reclaimed
-    // when the runtime state is reset).
+    // The scheduler drives it to completion and reclaims the entry then.
     let _ = call_result_to_value(fn_ctx, &goroutine).into_int_value();
     Ok(())
 }

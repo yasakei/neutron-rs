@@ -702,6 +702,15 @@ pub extern "C" fn ntask_go_owned(
     spawn_goroutine(poll_fn, future, Some(cleanup))
 }
 
+/// Spawn a goroutine whose handle the caller discards (`go f(x)`). No registry
+/// wrapper is created: nothing can join or drop it, so the id would only be
+/// allocated to be reclaimed. `cleanup` reclaims the future if it never
+/// completes.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_go_detached(poll_fn: AsyncPollFn, future: i64, cleanup: AsyncCleanupFn) {
+    ntask::scheduler::spawn_runnable(poll_fn, future, Some(cleanup), NULL);
+}
+
 fn spawn_goroutine(poll_fn: AsyncPollFn, future: i64, cleanup: Option<AsyncCleanupFn>) -> i64 {
     // Reserve the wrapper id first so the goroutine can record it: a child
     // that finishes on its first poll must find its wrapper.
