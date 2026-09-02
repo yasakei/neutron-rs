@@ -294,12 +294,7 @@ mod tests {
     #[test]
     fn test_async_exec_offloads_to_pool() {
         let fut = ntsc_async_process_exec(put("echo offloaded-value >/dev/null"));
-        let mut spins = 0;
-        while ntsc_async_process_exec_poll(fut) == 0 {
-            spins += 1;
-            assert!(spins < 10_000, "offloaded exec never completed");
-            std::thread::yield_now();
-        }
+        wait_offloaded(|| ntsc_async_process_exec_poll(fut), "exec");
         let code = ntsc_async_process_exec_result(fut);
         ntsc_async_process_exec_drop(fut);
         assert_eq!(code, 0);
@@ -308,17 +303,26 @@ mod tests {
     #[test]
     fn test_async_exec_output_offloads_to_pool() {
         let fut = ntsc_async_process_exec_output(put("printf async-offload-stdout"));
-        let mut spins = 0;
-        while ntsc_async_process_exec_output_poll(fut) == 0 {
-            spins += 1;
-            assert!(spins < 10_000, "offloaded exec_output never completed");
-            std::thread::yield_now();
-        }
+        wait_offloaded(|| ntsc_async_process_exec_output_poll(fut), "exec_output");
         let json = ntsc_async_process_exec_output_result(fut);
         ntsc_async_process_exec_output_drop(fut);
         assert!(
             read(json).contains("\"stdout\":\"async-offload-stdout\""),
             "unexpected exec_output result"
         );
+    }
+
+    /// Spin an offloaded future to completion with a generous wall-clock cap.
+    /// Child-process work can take seconds on a slow or antivirus-loaded CI
+    /// host, so a fixed iteration budget would fail before the pool finishes.
+    fn wait_offloaded(poll: impl Fn() -> i8, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while poll() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "offloaded {what} never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
