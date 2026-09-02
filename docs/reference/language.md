@@ -552,7 +552,10 @@ go { ... }
 scheduler (one worker thread per CPU core). The call form runs an `async fun`
 on the scheduler; the block form compiles the block to an anonymous future.
 `go` never blocks the caller and returns nothing; when the process `main`
-returns, outstanding goroutines are simply abandoned (as in Go).
+returns, outstanding goroutines are abandoned (as in Go) — the runtime
+reclaims their futures and owned values at shutdown, so abandonment leaks
+nothing. There is no goroutine `join` in the language yet: coordinate
+completion with channels or `async.sleep`.
 
 Arguments and captured variables cross a thread boundary and are classified
 by the ownership checker: scalars are copied, safe handles (channels, files,

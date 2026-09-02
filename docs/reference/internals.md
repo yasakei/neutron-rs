@@ -31,9 +31,12 @@ reported but do not fail the build.
 
 No pointer crosses the ABI. Every owned heap value lives in the runtime's
 handle registry under an opaque `i64` key, and generated code passes only those
-keys. The registry is a `HashMap<i64, Handle>` behind a mutex; the runtime crate
-contains no `unsafe` code at all. `Ty::View(T)` has the same representation as
-`T` — a view is a borrowed handle, not a distinct value.
+keys. The registry is a map of `i64 -> Handle` sharded 64 ways by id, so
+concurrent handle traffic from different workers does not serialize on one
+mutex; every operation takes exactly one shard and never holds it while
+calling back into the registry. The runtime crate contains no `unsafe` code at
+all. `Ty::View(T)` has the same representation as `T` — a view is a borrowed
+handle, not a distinct value.
 
 The handle kinds are:
 
@@ -69,8 +72,17 @@ its declared destination type (`var array[int] x = []` stores raw scalars).
   `ntsc_shared_release` adjust the count, and the last release removes the box
   and returns the inner handle for the caller to drop.
 - **Futures**: the state machine of an `async.sleep(ms)` future.
-- **Opaque module resources**: values a stdlib module owns (files, sockets,
-  channels) stored as `Box<dyn Any + Send>` and readable only at the type the
+- **Goroutines**: a `go`-spawned task; the wrapper carries the scheduler's
+  core id so `join`/drop can reach the goroutine.
+- **Channels**: a `chan[T]` core, reference counted like `Shared` so copying
+  the handle (`var b = a`, `go f(ch)`) keeps the channel alive for peers; the
+  last handle drop reclaims the core and its buffered elements.
+- **Reactor registrations**: a timer or descriptor-readiness interest
+  (`ReactorReg`/`AsyncIo`), dropped with the future that armed it.
+- **Offloaded futures**: an `http.*_async`/`process.*` call's state machine,
+  holding the blocking closure and the op id of the pool job.
+- **Opaque module resources**: values a stdlib module owns (files, sockets)
+  stored as `Box<dyn Any + Send>` and readable only at the type the
   owning module registered.
 
 ### Handle validity and kind safety
@@ -168,6 +180,122 @@ that arms a deadline on its first poll and completes once the clock passes it.
 thread-local pending-exception flag and propagates to the caller after
 `wait_any`/`wait_all` returns.
 
+## The task runtime
+
+Goroutines, `chan[T]`, and the awaited I/O forms all run on one substrate in
+`crates/ntsc-runtime/src/ntask`: an M:N scheduler that multiplexes stackless
+goroutines onto a fixed pool of OS threads (one per CPU), plus a reactor
+thread for timers and descriptor readiness. There is no per-goroutine stack —
+a goroutine is a poll-based future, so it can be torn off one worker and
+picked up by another, which is what spreads CPU work across the pool.
+
+### Scheduler
+
+Each worker owns a lock-free run queue (`ntask/runqueue.rs`), modeled on Go's
+`runq` and Tokio's `multi_thread::queue`: a 256-slot ring with an atomic head
+and tail plus a single-slot LIFO cell (`next`, Go's `runnext`). The owner is
+the only producer, so a push is two loads and a release store; owners and
+thieves consume the head by compare-exchange. The LIFO slot hands the most
+recently readied goroutine straight back to the same worker, keeping a channel
+ping-pong on one core with its state in cache.
+
+A full ring overflows half its contents to the shared ready queue (one global
+lock acquisition per 128 goroutines, Go's `runqputslow`), and an idle worker
+steals half of a peer's ring, scanning victims from a rotating offset. Workers
+refill from the shared queue in batches bounded by the worker count, so one
+worker cannot swallow a burst the others could run in parallel; the shared
+queue is also polled every 61st tick for fairness (Go uses the same interval).
+
+A worker parks when its queue runs dry: it spins briefly (counted as
+"searching" so concurrent spawns skip their wakeup), re-checks every queue as
+the last searcher, then sleeps on a condition variable. Whether a goroutine
+became runnable is one packed atomic (`searching` + `unparked` counts), so the
+wake decision is a single load; a spawn wakes a peer only when nobody is
+already hunting and someone is actually parked.
+
+`go f(x)` from a worker pushes straight onto that worker's queue. Detached
+spawns (`go` with the handle discarded) are batched: up to 64 goroutines are
+registered under one global lock acquisition and enqueued together, so a
+fan-out loop costs a fraction of the per-child lock traffic. Spawns from
+outside the pool (the main thread before `await`) register and queue in one
+critical section.
+
+A worker drives a goroutine by loading its suspension state into thread-local
+storage, running the poll function without the global lock, then re-locking
+once to flush the state and apply the wait target. Suspension targets
+(`Park`): cooperative yield (requeue on the LIFO slot), channel send/receive,
+timer deadline, descriptor readiness, sibling join, or offloaded job.
+
+### Channels
+
+`chan[T]` is a bounded ring of `i64` slots (raw scalars or owned handles for
+heap element types) plus parked-sender and parked-receiver queues, all under
+the global mutex — so a send that finds room, a handoff to a parked receiver,
+or a close that releases waiters is one atomic critical section and cannot
+lose a wakeup. An unbuffered send parks the sender with its value; a receive
+takes it directly. `close` wakes parked receivers to drain what is buffered
+(then see the zero value) and releases parked senders.
+
+Channel element ownership is tracked end to end: a buffered owned element
+belongs to the channel, transfers to the receiver on receive, and returns to
+the runtime if never received — `close` releases un-received owned elements,
+a dropped channel releases its buffer, and a goroutine dropped while parked
+with an owned send/receive value in flight releases that too. A leaked
+goroutine therefore cannot leak the channel values it held.
+
+### Offload pool
+
+Blocking work that cannot be parked on the reactor — the `http.*_async`
+requests — runs on a small pool of standalone threads (2–8). The calling
+goroutine parks on an op id; the pool thread completes the op with the result
+handle and the scheduler requeues the waiter. A blocked HTTPS request
+therefore costs no scheduler thread. The same op machinery backs the
+`ntsc_async_process_*` ABI (awaited child processes), which the runtime
+implements but the `await` front-end does not lower yet.
+
+### Reactor
+
+One background thread fires timers and watches descriptor readiness so
+workers never block on I/O. Timers live in a deadline-ordered map; the
+reactor computes its wait timeout from the next deadline. Readiness uses
+`poll(2)` on Unix and `WSAPoll` on Windows (sockets only, so the wake channel
+is a loopback TCP socket pair rather than Unix's self-pipe; a wake write from
+any thread unblocks the wait). Interests are registered when a goroutine
+parks on a socket and detached when its future drops, so the reactor never
+polls a closed descriptor; a registered readiness wakes every goroutine
+parked on that io core.
+
+`net.accept_async` and `net.recv_line_async` use this directly: each poll
+tries a non-blocking syscall first (a ready socket costs one syscall with no
+scheduler involvement) and parks on readiness only when it reports
+`WouldBlock`. Sockets are created with `TCP_NODELAY`.
+
+### Join and abandonment
+
+A joinable goroutine stays addressable until its wrapper handle is dropped,
+even if it completes first; a detached goroutine (handle discarded) is
+reclaimed as soon as it finishes. Joining — the synchronous `ntask_join`
+bridge, used by embedders and tests rather than by generated code — transfers
+the goroutine's result and, if its body threw, the pending exception to the
+joining thread, which re-raises it; an uncaught throw in a goroutine is
+therefore observed instead of vanishing with the worker thread. The language
+surface has no goroutine `join` yet: NTSC programs coordinate completion with
+channels.
+
+At shutdown (`ntsc_runtime_shutdown`), goroutines that were never joined or
+driven are reclaimed: their futures run their drop (releasing armed sleeps,
+captured arrays and strings, channel handles), and their in-flight owned
+values are released. Abandoning background goroutines at `main` exit is
+therefore leak-free, matching Go's `go` semantics without Go's leak on the
+debug report.
+
+### Scheduler statistics
+
+Setting `NTS_SCHED_STATS` in the environment prints per-worker counters at
+shutdown — polls, steals, busy/spin/park time, and idle share — to diagnose
+load imbalance. The counters are relaxed atomics on the worker's own slot and
+cost nothing when the variable is unset.
+
 ## Optimization
 
 Debug builds skip optimization and emit no optimization passes. Release builds
@@ -221,9 +349,12 @@ object file, the runtime archive, `-lm`, and on non-macOS hosts `-lpthread`
 and `-ldl`). On Windows it prefers the `ld.lld` bundled next to the ntsc
 executable (MSI installs; links via the MinGW emulation with the bundled
 import libraries and the GNU-flavoured runtime), then falls back to MSVC
-`link.exe` and MinGW `gcc`. Object and archive names are host-dependent:
-`.o`/`.obj`, and `libntsc_runtime.a` versus `ntsc_runtime.lib`, chosen to
-match the linker in use.
+`link.exe` and MinGW `gcc`. The MSVC path names the Windows system libraries
+and the `/MD` CRT set (`ucrt`, `vcruntime`, `msvcrt`) explicitly: a Rust
+staticlib carries no CRT default-lib directives of its own, and rustc emits
+them only when it drives the final link itself. Object and archive names are
+host-dependent: `.o`/`.obj`, and `libntsc_runtime.a` versus
+`ntsc_runtime.lib`, chosen to match the linker in use.
 
 `host_triple()` and `with_executable_extension()` let the build produce
 objects and binaries the local linker can consume, so tests and `ntsc init`

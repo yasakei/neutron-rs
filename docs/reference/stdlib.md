@@ -379,21 +379,34 @@ when given one of these handles.
 ## Networking
 
 Sockets are integer handles. `net.tcp_connect` throws on connection failure.
+Every connected stream has `TCP_NODELAY` enabled (matching Go's default), so a
+small response is not delayed waiting for an ACK.
 
 | Function | Returns | Behavior |
 | --- | --- | --- |
 | `net.tcp_connect(host, port)` | `int` | Connects; returns a socket. |
 | `net.tcp_listen(port)` | `int` | Listens; port `0` picks an ephemeral port. |
 | `net.local_port(handle)` | `int` | Bound port of a listener. |
-| `net.tcp_accept(listener)` | `int` | Accepts a connection. |
+| `net.tcp_accept(listener)` | `int` | Accepts a connection (blocks the calling thread). |
 | `net.send(handle, data)` | `int` | Sends bytes. |
 | `net.send_line(handle, data)` | `int` | Sends a line. |
 | `net.recv(handle, count)` | `string` | Receives up to `count` bytes. |
-| `net.recv_line(handle)` | `string` | Receives a line. |
+| `net.recv_line(handle)` | `string` | Receives a line (blocks the calling thread). |
 | `net.close(handle)` | `bool` | Closes a socket. |
 | `net.udp_bind(port)` | `int` | Binds a UDP socket. |
 | `net.udp_send(handle, host, port, data)` | `int` | Sends a datagram. |
 | `net.udp_recv(handle, count)` | `string` | Receives a datagram. |
+
+The awaitable variants park the goroutine on the reactor instead of holding a
+thread: each poll tries a non-blocking accept/read first, and the goroutine
+sleeps on socket readiness until a client connects or bytes arrive. Because
+nothing is queued to a worker pool, one accept loop can serve an unbounded
+rate of connections, and slow clients never pin a scheduler thread.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `net.accept_async(listener)` | `int` | Awaitable accept; completes with the client socket. |
+| `net.recv_line_async(sock)` | `string` | Awaitable line read; `""` at end of stream. |
 
 ## Operating system
 
@@ -554,6 +567,13 @@ a plain load or store.
 | `process.pid()` | `int` | Current process id. |
 | `process.spawn_thread(body, arg)` | `int` | Starts an OS thread; returns its handle. `arg` must be thread-safe. |
 | `process.thread_join(id)` | `bool` | Waits for a thread to finish. |
+
+Inside an `async fun`, the `http.*_async` calls run on the offload pool
+instead of the calling thread: the goroutine parks until the response is
+ready, so a slow request never pins a scheduler thread. `process.exec` and
+`process.exec_output` have no awaitable variant yet — they block the calling
+thread; the runtime's offload machinery exists but the `await` front-end does
+not lower process calls.
 
 `process.spawn_thread` takes a lambda with one `int` parameter. Its payload
 must be a scalar or a stdlib handle: owned heap values, `shared` values, and

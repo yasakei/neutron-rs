@@ -28,7 +28,14 @@ CPU-bound goroutines spread across the whole pool.
 `go worker(args)` runs an async function on the scheduler; `go { ... }` runs an
 inline block. Spawn is fire-and-forget: `go` returns nothing and never blocks
 the caller. When `main` returns, outstanding goroutines are abandoned (as in
-Go) — hand work a channel or sleep/join if it must finish first.
+Go) — hand work a channel or sleep if it must finish first. Abandonment is
+leak-free: the runtime reclaims an abandoned goroutine's future at shutdown,
+releasing every registry value it still owned (strings, arrays, armed sleep
+deadlines, channel handles), so the debug leak report stays clean. There is
+no goroutine `join` in the language yet — completion is coordinated with
+channels; the runtime's join machinery exists for embedders, and it is what
+keeps a goroutine's result and uncaught exception readable until its handle
+is dropped.
 
 ```ntsc
 async fun drain(chan[string] jobs) {
@@ -222,21 +229,50 @@ re-polls it on a millisecond quantum.
 
 ### Awaitable I/O
 
-Blocking stdlib calls have awaitable variants that offload the blocking work
-to a bounded worker-thread pool; the calling goroutine parks until the result
-is ready, and the scheduler thread is never blocked:
+Blocking stdlib calls have awaitable variants that free the scheduler thread
+while the goroutine waits. They come in two flavors:
+
+- **Reactor-backed** (`net.accept_async`, `net.recv_line_async`): the wait is
+  an I/O readiness wait handled by the reactor. Each poll tries a
+  non-blocking syscall first, and the goroutine parks on socket readiness
+  until a client connects or bytes arrive. A server built this way serves any
+  number of slow clients on a fixed thread pool.
+- **Offloaded** (`http.*_async`): the blocking request runs on a bounded
+  worker-thread pool, and the calling goroutine parks until the result is
+  ready.
 
 ```ntsc
+use net
+use fmt
+
+async fun handle_client(int sock) {
+    var string line = await net.recv_line_async(sock)
+    net.send_line(sock, "ok:" + fmt.i64_to_str(fmt.to_int(line) + 1))
+    net.close(sock)
+}
+
+async fun accept_loop(int listener) {
+    var int sock = await net.accept_async(listener)
+    go handle_client(sock)
+    go accept_loop(listener)   // keep accepting while this client is handled
+}
+
 async fun main() -> int {
-    var resp = await http.get_async("https://example.com/")
-    say(resp)
+    var int listener = net.tcp_listen(8080)
+    say("listening on " + fmt.i64_to_str(net.local_port(listener)))
+    go accept_loop(listener)
+    await async.sleep(60000)   // serve for a while, then exit
+    net.close(listener)
     return 0
 }
 ```
 
-`process.exec` and `process.exec_output` are offloaded the same way when
-awaited, so a goroutine waiting on a child process does not hold a scheduler
-thread hostage.
+`http.get_async` offloads the request to the pool the same way, so a
+goroutine waiting on a response never holds a scheduler thread hostage:
+
+```ntsc
+var resp = await http.get_async("https://example.com/")
+```
 
 ### Inline async blocks
 
