@@ -322,17 +322,14 @@ pub extern "C" fn ntsc_net_udp_recv(handle: i64, count: i64) -> i64 {
 
 // ── Awaitable accept ───────────────────────────────────────────────────────
 //
-// `net.tcp_accept` blocks the OS thread it runs on. In an accept loop that
-// starves the worker pool: the goroutine holding the loop never yields, so the
-// per-client goroutines it spawns are not polled.
+// `net.tcp_accept` blocks the OS thread it runs on, so an accept loop parked
+// in it never yields and the per-client goroutines it spawns are not polled.
 //
-// `accept_async` is reactor-backed rather than offloaded. The listener is set
-// non-blocking and its descriptor registered with the reactor; each poll tries
-// a non-blocking `accept` on the worker itself and parks on readiness when
-// there is nothing pending. Nothing is handed to the offload pool, so a single
-// accept loop is limited only by the accept syscall rate — an offloaded accept
-// cost a job dispatch plus a park/wake per connection and capped out at the
-// pool's thread count.
+// `accept_async` is reactor-backed rather than offloaded: the listener is set
+// non-blocking and registered with the reactor, each poll tries a
+// non-blocking `accept` on the worker itself, and the goroutine parks on
+// readiness when nothing is pending. Handing accepts to the offload pool
+// instead would cap a single accept loop at the pool's thread count.
 
 /// A pending reactor-backed accept: the reactor registration watching the
 /// listener, the listener handle to accept from, and the accepted socket once
@@ -357,8 +354,6 @@ fn listener_watch_fd(handle: i64) -> Option<i64> {
             {
                 Some(std::os::fd::AsRawFd::as_raw_fd(listener) as i64)
             }
-            // The reactor's Windows backend watches sockets with `WSAPoll`, which
-            // keys on the raw `SOCKET` handle rather than a file descriptor.
             #[cfg(windows)]
             {
                 Some(std::os::windows::io::AsRawSocket::as_raw_socket(listener) as i64)
@@ -464,15 +459,12 @@ pub extern "C" fn ntsc_async_net_accept_drop(id: i64) {
 // ── Awaitable line read ────────────────────────────────────────────────────
 //
 // The blocking `recv_line` owns its worker thread until the client's bytes
-// arrive. With one worker per core that is the throughput ceiling of a
-// request/response server: measured on a 4-worker pool serving 64 concurrent
-// clients, the four workers were busy ~180ms each to serve 3000 requests in
-// 205ms of wall time — almost all of it parked inside `read`.
-//
-// `recv_line_async` follows the pattern Go's netpoller and Tokio both use: try
-// the syscall first and only park when it reports `WouldBlock`. A ready socket
-// costs one `recv` with no scheduler involvement at all; a socket with nothing
-// pending releases the worker to run another goroutine.
+// arrive, so with one worker per core a slow client caps the server's
+// concurrency at the worker count. `recv_line_async` follows the pattern Go's
+// netpoller and Tokio both use: try the syscall first and only park when it
+// reports `WouldBlock`. A ready socket costs one `recv` with no scheduler
+// involvement at all; a socket with nothing pending releases the worker to run
+// another goroutine.
 
 /// A pending awaitable line read: the reactor registration watching the socket,
 /// the socket itself, and the line once a poll has completed it.

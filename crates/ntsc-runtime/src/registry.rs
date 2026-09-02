@@ -37,8 +37,8 @@ pub(crate) const NULL: i64 = 0;
 pub(crate) const PTR_SIZE: usize = std::mem::size_of::<i64>();
 
 /// The handle table, sharded by id: a hot request touches several handles
-/// (strings, sockets, futures) across workers, and one global mutex measured
-/// 7x worse than linear scaling under 4-way concurrency.
+/// (strings, sockets, futures) across workers, and one global mutex
+/// serializes exactly that traffic.
 const REGISTRY_SHARDS: usize = 64;
 static REGISTRY: LazyLock<Box<[Mutex<IdMap<Handle>>]>> = LazyLock::new(|| {
     (0..REGISTRY_SHARDS)

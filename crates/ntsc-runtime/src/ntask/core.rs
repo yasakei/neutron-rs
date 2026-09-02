@@ -77,7 +77,7 @@ pub(crate) struct Goroutine {
     /// or a failed receive). `for v in chan` needs the distinction because a
     /// raw scalar `0` is a legal received value.
     pub(crate) recv_ok: bool,
-    /// `1` once the future has completed (its result is in `result`).
+    /// `true` once the future has completed (its result is in `result`).
     pub(crate) done: bool,
     /// The result handle of a completed goroutine.
     pub(crate) result: i64,
@@ -468,7 +468,7 @@ pub(crate) fn op_result(core: i64) -> i64 {
     op.result
 }
 
-/// `1` when the offloaded job is already done, `0` otherwise (or unknown).
+/// Whether the offloaded job is already done (`false` for an unknown id).
 pub(crate) fn op_done(core: i64) -> bool {
     GLOBAL
         .lock()

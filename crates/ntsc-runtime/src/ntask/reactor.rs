@@ -245,9 +245,8 @@ pub(crate) fn reset() {
     INTERESTS_DIRTY.store(true, Ordering::Release);
 }
 
-/// The readiness wait set, rebuilt by [`readiness_wait`]. On Unix it is a
-/// `pollfd` array; on Windows no `pollfd` type exists (descriptor readiness is
-/// not wired to the reactor yet), so it is an empty marker vector.
+/// The Unix readiness wait set, rebuilt by [`readiness_wait`]: a `pollfd`
+/// array with the wake pipe read end first, then every registered interest.
 #[cfg(unix)]
 type PollBuf = Vec<libc::pollfd>;
 

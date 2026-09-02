@@ -1,17 +1,19 @@
 //! M:N task scheduler: a fixed OS-thread pool multiplexing cheap stackless
 //! goroutines onto `num_cpus` workers.
 //!
-//! Runnable goroutines are queued on one shared ready queue under the global
-//! lock ([`crate::ntask::core::GLOBAL`]). Workers pop a goroutine, run its poll
-//! function without the lock held, then re-lock to read its wait target and
-//! requeue it, park it on a channel/timer/descriptor, or finish it. Because a
-//! goroutine is a single stackless future (no worker thread-local async stack),
-//! a torn-out goroutine can be picked up by any worker — that is what lets CPU
-//! work spread across the pool.
+//! Each worker owns a lock-free run queue (see [`super::runqueue`]); a spawn
+//! from a worker lands on that worker's queue, a full ring overflows to the
+//! shared queue under [`core::GLOBAL`], and idle workers steal from peers. A
+//! worker pops a goroutine, runs its poll function without the lock held, then
+//! re-locks to read its wait target and requeue it, park it on a
+//! channel/timer/descriptor, or finish it. Because a goroutine is a single
+//! stackless future (no worker thread-local async stack), a torn-out
+//! goroutine can be picked up by any worker — that is what lets CPU work
+//! spread across the pool.
 //!
 //! Blocking coordination (channel buffers, parked waiters, timers, fd
-//! interests) is all inside the same [`GLOBAL`] mutex as the ready queue, so a
-//! block/unblock decision is one atomic critical section: there is no lost
+//! interests) is all inside the same [`GLOBAL`] mutex as the shared queue, so
+//! a block/unblock decision is one atomic critical section: there is no lost
 //! wakeup. Idle workers sleep on a condition variable; any spawn, channel
 //! handoff, timer expiry, or fd-ready event re-notifies them.
 
