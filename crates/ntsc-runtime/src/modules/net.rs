@@ -357,12 +357,11 @@ fn listener_watch_fd(handle: i64) -> Option<i64> {
             {
                 Some(std::os::fd::AsRawFd::as_raw_fd(listener) as i64)
             }
-            // Windows has no reactor descriptor backend yet: the registration
-            // still exists, and the poll below falls back to retrying the
-            // non-blocking accept when it is woken.
-            #[cfg(not(unix))]
+            // The reactor's Windows backend watches sockets with `WSAPoll`, which
+            // keys on the raw `SOCKET` handle rather than a file descriptor.
+            #[cfg(windows)]
             {
-                Some(0)
+                Some(std::os::windows::io::AsRawSocket::as_raw_socket(listener) as i64)
             }
         }
         _ => None,
@@ -497,9 +496,11 @@ fn stream_watch_fd(handle: i64) -> Option<i64> {
             {
                 Some(std::os::fd::AsRawFd::as_raw_fd(stream) as i64)
             }
-            #[cfg(not(unix))]
+            // The reactor's Windows backend watches sockets with `WSAPoll`, which
+            // keys on the raw `SOCKET` handle rather than a file descriptor.
+            #[cfg(windows)]
             {
-                Some(0)
+                Some(std::os::windows::io::AsRawSocket::as_raw_socket(stream) as i64)
             }
         }
         _ => None,

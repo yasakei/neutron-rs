@@ -10,13 +10,20 @@
 //! * [`register_fd`] — records a goroutine's fd interest for the reactor.
 //!
 //! The readiness backend is selected at compile time: `poll` on Unix (woken
-//! through a non-blocking self-pipe), and a `WaitForSingleObject` wake event
-//! on Windows. All system calls are isolated in this module and wrapped with
-//! documented safety invariants; the rest of the crate stays entirely safe
-//! Rust.
+//! through a non-blocking self-pipe), and `WSAPoll` on Windows (woken through
+//! a loopback socket pair, since `WSAPoll` cannot wait on a kernel event). All
+//! system calls are isolated in this module and wrapped with documented safety
+//! invariants; the rest of the crate stays entirely safe Rust.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
+
+#[cfg(windows)]
+use std::io::{Read as _, Write as _};
+#[cfg(windows)]
+use std::net::{TcpListener, TcpStream};
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 
 use super::core::{self, GLOBAL};
 use super::scheduler;
@@ -49,52 +56,72 @@ static WAKE: LazyLock<WakePipe> = LazyLock::new(|| unsafe {
     }
 });
 
-/// Windows has no `poll`: the reactor waits on a kernel32 event instead, and
-/// `SetEvent` from any thread wakes the wait.
+/// Windows has no `poll(2)`: the reactor waits with `WSAPoll`, the Winsock
+/// equivalent, which accepts one `SOCKET` per entry instead of a file
+/// descriptor. The socket pair in [`super::WAKE`] is included in every wait
+/// set, so a byte written from any thread unblocks a wait, and `SetEvent` is
+/// not needed.
 #[cfg(windows)]
 mod win {
-    use std::ffi::c_void;
+    #[repr(C)]
+    pub(crate) struct PollFd {
+        /// `SOCKET` is a `UINT_PTR`, so `usize` has the right size and
+        /// alignment on both 32- and 64-bit targets.
+        pub(crate) fd: usize,
+        pub(crate) events: i16,
+        pub(crate) revents: i16,
+    }
 
-    pub(crate) const INFINITE: u32 = 0xFFFF_FFFF;
+    pub(crate) const POLLRDNORM: i16 = 0x0100;
+    pub(crate) const POLLWRNORM: i16 = 0x0010;
+    pub(crate) const POLLERR: i16 = 0x0001;
+    pub(crate) const POLLHUP: i16 = 0x0002;
 
-    #[link(name = "kernel32")]
+    #[link(name = "ws2_32")]
     unsafe extern "system" {
-        pub(crate) fn CreateEventW(
-            attributes: *mut c_void,
-            manual_reset: i32,
-            initial_state: i32,
-            name: *const u16,
-        ) -> *mut c_void;
-        pub(crate) fn SetEvent(event: *mut c_void) -> i32;
-        pub(crate) fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        pub(crate) fn WSAPoll(fd_array: *mut PollFd, fds: u32, timeout: i32) -> i32;
     }
 }
 
-/// The wake handle on Windows: an auto-reset event. The wait clears it
-/// atomically, so a `SetEvent` that races the wait re-signals the event and
-/// the wake is never lost.
+/// The wake channel on Windows: a loopback TCP pair whose read end is always
+/// in the reactor's `WSAPoll` set. Writing one byte from any thread unblocks a
+/// poll wait — the direct analogue of the Unix self-pipe, which `WSAPoll` (a
+/// sockets-only wait) cannot replace with a plain event handle.
 #[cfg(windows)]
-struct WakeEvent {
-    // Stored as a plain integer so the static stays `Sync`; only ever handed
-    // back to kernel32 as a HANDLE.
-    event: usize,
+struct WakeSocket {
+    /// The raw `SOCKET` of the read end, cached so building the wait set never
+    /// needs a lock.
+    read_socket: usize,
+    /// The watched end; drained by the reactor thread.
+    read: Mutex<TcpStream>,
+    /// The woken end; written by any thread.
+    write: Mutex<TcpStream>,
 }
 
 #[cfg(windows)]
-static WAKE: LazyLock<WakeEvent> = LazyLock::new(|| {
-    let event = unsafe { win::CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
-    assert!(
-        !event.is_null(),
-        "reactor: failed to create wake event: {}",
-        std::io::Error::last_os_error()
-    );
-    WakeEvent {
-        event: event as usize,
+static WAKE: LazyLock<WakeSocket> = LazyLock::new(|| {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("reactor: failed to create wake socket listener");
+    let addr = listener.local_addr().expect("reactor: wake socket address");
+    let write = TcpStream::connect(addr).expect("reactor: wake socket connect");
+    let (read, _) = listener.accept().expect("reactor: wake socket accept");
+    // Both ends non-blocking: a wake write never stalls its caller, and the
+    // reactor drains a pending byte without blocking.
+    let _ = read.set_nonblocking(true);
+    let _ = write.set_nonblocking(true);
+    let read_socket = AsRawSocket::as_raw_socket(&read) as usize;
+    WakeSocket {
+        read_socket,
+        read: Mutex::new(read),
+        write: Mutex::new(write),
     }
 });
 
 /// The interests the reactor should watch: io-core id -> (fd, read interest).
-static FD_INTERESTS: LazyLock<Mutex<std::collections::HashMap<i64, (i32, bool)>>> =
+/// The fd is the native handle keyed by the platform backend: an `int` fd on
+/// Unix, a `SOCKET` (64-bit) on Windows, so it is kept at full width and cast
+/// when the wait set is built.
+static FD_INTERESTS: LazyLock<Mutex<std::collections::HashMap<i64, (i64, bool)>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// Set when the interest table changed since the reactor last rebuilt its
@@ -132,10 +159,17 @@ fn wake_write() {
     let _ = unsafe { libc::write(pipe.write_fd, std::ptr::addr_of!(byte).cast(), 1) };
 }
 
-/// Signal the wake event so the reactor re-scans.
+/// Signal the wake socket so the reactor re-scans.
 #[cfg(windows)]
 fn wake_write() {
-    let _ = unsafe { win::SetEvent(WAKE.event as *mut std::ffi::c_void) };
+    // One byte wakes the poll; a full socket buffer just means the reactor is
+    // already awake, so a WouldBlock error is ignorable (same contract as the
+    // Unix self-pipe).
+    let _ = WAKE
+        .write
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .write(&[1]);
 }
 
 /// Record (or update) a goroutine's interest in an fd. Called by a worker when
@@ -150,11 +184,11 @@ pub(crate) fn register_fd(io: i64, fd: i64, read: bool) {
     }
     let mut table = FD_INTERESTS.lock().unwrap_or_else(|p| p.into_inner());
     let changed = match table.get(&io) {
-        Some(&(f, r)) => f != fd as i32 || r != read,
+        Some(&(f, r)) => f != fd || r != read,
         None => true,
     };
     if changed {
-        table.insert(io, (fd as i32, read));
+        table.insert(io, (fd, read));
         drop(table);
         INTERESTS_DIRTY.store(true, Ordering::Release);
         wake_reactor();
@@ -177,7 +211,7 @@ pub(crate) fn attach_fd(io: i64, fd: i64, read: bool) {
     if fd <= 0 {
         table.remove(&io);
     } else {
-        table.insert(io, (fd as i32, read));
+        table.insert(io, (fd, read));
     }
     drop(table);
     INTERESTS_DIRTY.store(true, Ordering::Release);
@@ -217,11 +251,12 @@ pub(crate) fn reset() {
 #[cfg(unix)]
 type PollBuf = Vec<libc::pollfd>;
 
-/// Windows has no `pollfd`: the backend waits on the wake event alone, so the
-/// buffer is never populated. It still exists so [`reactor_loop`] has one
-/// caller-owned reuse buffer across platforms.
+/// Windows `WSAPOLLFD` entries. Sockets are `SOCKET` handles (64-bit), so the
+/// buffer is the `win::PollFd` array passed to `WSAPoll`; it mirrors the Unix
+/// `pollfd` array so [`reactor_loop`] has one caller-owned reuse buffer across
+/// platforms.
 #[cfg(windows)]
-type PollBuf = Vec<u8>;
+type PollBuf = Vec<win::PollFd>;
 
 /// The reactor thread: wait for timers and fd readiness, waking goroutines.
 fn reactor_loop() {
@@ -289,7 +324,7 @@ fn readiness_wait(
             let table = FD_INTERESTS.lock().unwrap_or_else(|p| p.into_inner());
             table
                 .iter()
-                .map(|(&io, &(fd, read))| (io, fd, read))
+                .map(|(&io, &(fd, read))| (io, fd as i32, read))
                 .collect()
         };
         // The wake pipe read end is always watched for read readiness.
@@ -336,21 +371,74 @@ fn readiness_wait(
     ready
 }
 
-/// Windows backend: wait on the wake event with the timer timeout. Descriptor
-/// readiness is not wired to a Windows backend yet (no language construct
-/// registers fd interests there), so no io core is ever reported ready.
+/// Windows backend: `WSAPoll` over the registered sockets plus the wake socket,
+/// with the same rebuild-on-dirty behavior as the Unix `poll` path. Sockets are
+/// `SOCKET` handles rather than file descriptors, so only the interest table is
+/// shared between the backends.
 #[cfg(windows)]
-fn readiness_wait(timeout_ms: i64, _fds: &mut PollBuf, _index_of_core: &mut Vec<i64>) -> Vec<i64> {
+fn readiness_wait(
+    timeout_ms: i64,
+    fds: &mut Vec<win::PollFd>,
+    index_of_core: &mut Vec<i64>,
+) -> Vec<i64> {
+    if INTERESTS_DIRTY.swap(false, Ordering::AcqRel) {
+        let interests: Vec<(i64, usize, bool)> = {
+            let table = FD_INTERESTS.lock().unwrap_or_else(|p| p.into_inner());
+            table
+                .iter()
+                .map(|(&io, &(fd, read))| (io, fd as usize, read))
+                .collect()
+        };
+        // The wake socket is always watched for readability.
+        fds.clear();
+        index_of_core.clear();
+        fds.push(win::PollFd {
+            fd: WAKE.read_socket,
+            events: win::POLLRDNORM,
+            revents: 0,
+        });
+        for (io, fd, read) in &interests {
+            fds.push(win::PollFd {
+                fd: *fd,
+                events: if *read {
+                    win::POLLRDNORM
+                } else {
+                    win::POLLWRNORM
+                },
+                revents: 0,
+            });
+            index_of_core.push(*io);
+        }
+    }
+
     let timeout_c = if timeout_ms < 0 {
-        win::INFINITE
+        -1
     } else {
-        timeout_ms.min(i64::from(u32::MAX - 1)) as u32
+        timeout_ms.min(i64::from(i32::MAX)) as i32
     };
-    // The auto-reset event clears itself when the wait returns; a `SetEvent`
-    // that raced the wait re-signals it for the next wait, so there is nothing
-    // to drain.
-    let _ = unsafe { win::WaitForSingleObject(WAKE.event as *mut std::ffi::c_void, timeout_c) };
-    Vec::new()
+    let rc = unsafe { win::WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout_c) };
+    if rc <= 0 {
+        // Timeout (0) or failure (-1). A socket closed mid-wait can make the
+        // whole call fail with `WSAENOTSOCK`; nothing is reported ready and the
+        // dirty flag is re-armed so the next round rebuilds from the interest
+        // table. The shutdown flag still ends the loop promptly.
+        INTERESTS_DIRTY.store(true, Ordering::Release);
+        drain_wake();
+        return Vec::new();
+    }
+
+    // Drain the wake socket (a wake byte may accompany genuine readiness).
+    if fds[0].revents & (win::POLLRDNORM | win::POLLERR | win::POLLHUP) != 0 {
+        drain_wake();
+    }
+
+    let mut ready = Vec::new();
+    for (i, slot) in fds.iter().enumerate().skip(1) {
+        if slot.revents & (win::POLLRDNORM | win::POLLWRNORM | win::POLLERR | win::POLLHUP) != 0 {
+            ready.push(index_of_core[i - 1]);
+        }
+    }
+    ready
 }
 
 /// Drain all pending wake bytes from the self-pipe.
@@ -361,6 +449,24 @@ fn drain_wake() {
         let n = unsafe { libc::read(WAKE.read_fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n <= 0 {
             break;
+        }
+    }
+}
+
+/// Drain all pending wake bytes from the wake socket. The read end is
+/// non-blocking, so an empty socket reports `WouldBlock` and the drain ends.
+#[cfg(windows)]
+fn drain_wake() {
+    let mut buf = [0u8; 64];
+    loop {
+        match WAKE
+            .read
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .read(&mut buf)
+        {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
         }
     }
 }
