@@ -15,6 +15,7 @@
 //! wakeup. Idle workers sleep on a condition variable; any spawn, channel
 //! handoff, timer expiry, or fd-ready event re-notifies them.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
@@ -45,6 +46,19 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 thread_local! {
     static CURRENT_GID: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 
+    /// Number of consecutive local-queue spawns on this worker. Large spawn
+    /// bursts already have runnable work in the owner's queue, so waking an
+    /// idle worker for every child only adds futex traffic and steal races.
+    static LOCAL_SPAWN_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+    /// Detached tasks spawned by the current worker but not yet published to
+    /// the global goroutine table. Publishing in batches amortizes the global
+    /// lock and run-queue operations during large spawn loops.
+    static DETACHED_BATCH: RefCell<Vec<(i64, Goroutine)>> = const { RefCell::new(Vec::new()) };
+    static DETACHED_ID_RANGE: std::cell::Cell<(i64, u32)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+
     /// The running goroutine's suspension state, held on the worker for the
     /// duration of one poll. `park_self`, `park_chan_send` and the `recv_*`
     /// readers are called from generated code on every suspension and every
@@ -63,7 +77,9 @@ thread_local! {
 struct TaskState {
     park: Park,
     pending_send: i64,
+    pending_send_owned: bool,
     recv_result: i64,
+    recv_result_owned: bool,
     recv_ok: bool,
 }
 
@@ -71,7 +87,9 @@ impl TaskState {
     const IDLE: TaskState = TaskState {
         park: Park::None,
         pending_send: NULL,
+        pending_send_owned: false,
         recv_result: NULL,
+        recv_result_owned: false,
         recv_ok: false,
     };
 }
@@ -236,6 +254,9 @@ pub(crate) fn spawn_runnable(
     start();
     let goroutine = new_goroutine(poll, future, cleanup, handle);
     if WORKER_INDEX.with(|index| index.get()).is_some() {
+        if handle == NULL {
+            return spawn_detached_batched(goroutine);
+        }
         let gid = core::register_goroutine(goroutine);
         make_runnable(gid);
         return gid;
@@ -243,6 +264,60 @@ pub(crate) fn spawn_runnable(
     let gid = core::register_goroutine_runnable(goroutine);
     notify_one();
     gid
+}
+
+const DETACHED_BATCH_CAP: usize = 64;
+
+fn spawn_detached_batched(goroutine: Goroutine) -> i64 {
+    let gid = DETACHED_ID_RANGE.with(|range| {
+        let (next, remaining) = range.get();
+        if remaining > 0 {
+            range.set((next + 1, remaining - 1));
+            next
+        } else {
+            let start = core::reserve_core_ids(DETACHED_BATCH_CAP);
+            range.set((start + 1, DETACHED_BATCH_CAP as u32 - 1));
+            start
+        }
+    });
+    let should_flush = DETACHED_BATCH.with(|batch| {
+        let mut batch = batch.borrow_mut();
+        batch.push((gid, goroutine));
+        batch.len() >= DETACHED_BATCH_CAP
+    });
+    if should_flush {
+        flush_detached_batch();
+    }
+    gid
+}
+
+/// Publish the current worker's detached tasks under one global lock and then
+/// enqueue them locally without issuing one wakeup per child.
+fn flush_detached_batch() {
+    let pending = DETACHED_BATCH.with(|batch| std::mem::take(&mut *batch.borrow_mut()));
+    if pending.is_empty() {
+        return;
+    }
+    let ids: Vec<i64> = pending.iter().map(|(gid, _)| *gid).collect();
+    {
+        let mut guard = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+        for (gid, goroutine) in pending {
+            guard.goroutines.insert(gid, goroutine);
+        }
+    }
+    if let Some(queue) = local_queue() {
+        for gid in ids {
+            if let Some(displaced) = queue.push_next(gid)
+                && !queue.push(displaced)
+            {
+                overflow_to_shared(queue, displaced);
+            }
+        }
+        notify_one();
+    } else {
+        core::push_ready_batch(ids);
+        notify_one();
+    }
 }
 
 fn new_goroutine(
@@ -256,7 +331,9 @@ fn new_goroutine(
         handle,
         cleanup: cleanup.map(|f| (f, future)),
         pending_send: NULL,
+        pending_send_owned: false,
         recv_result: NULL,
+        recv_result_owned: false,
         recv_ok: false,
         done: false,
         result: NULL,
@@ -276,11 +353,27 @@ pub(crate) fn make_runnable(gid: i64) {
         {
             overflow_to_shared(queue, displaced);
         }
-        notify_one();
+        notify_spawn_burst();
         return;
     }
     core::push_ready(gid);
     notify_one();
+}
+
+/// Wake workers for a local spawn burst without taking the condition-variable
+/// path on every child. The first few children get immediate wakeups so a
+/// small CPU fan-out starts in parallel; after that, periodic notifications
+/// keep progress if the spawning goroutine later parks itself.
+fn notify_spawn_burst() {
+    const INITIAL: u32 = 32;
+    const INTERVAL: u32 = 64;
+    LOCAL_SPAWN_COUNT.with(|count| {
+        let next = count.get().saturating_add(1);
+        count.set(next);
+        if next <= INITIAL || next.is_multiple_of(INTERVAL) {
+            notify_one();
+        }
+    });
 }
 
 /// This worker's run queue, or `None` when called from outside the pool.
@@ -541,6 +634,7 @@ fn has_work() -> bool {
 /// Drive one goroutine to a suspension/completion point. The poll function
 /// runs without the global lock held, so it may call back into the runtime.
 fn drive(gid: i64) {
+    LOCAL_SPAWN_COUNT.with(|count| count.set(0));
     let tasks = {
         let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
         match g.goroutines.get_mut(&gid) {
@@ -551,7 +645,9 @@ fn drive(gid: i64) {
                     state.set(TaskState {
                         park: Park::None,
                         pending_send: gr.pending_send,
+                        pending_send_owned: gr.pending_send_owned,
                         recv_result: gr.recv_result,
+                        recv_result_owned: gr.recv_result_owned,
                         recv_ok: gr.recv_ok,
                     })
                 });
@@ -563,6 +659,7 @@ fn drive(gid: i64) {
     CURRENT_GID.with(|cur| cur.set(Some(gid)));
     crate::install_async_tasks(tasks);
     crate::poll_async_tasks_once();
+    flush_detached_batch();
     let tasks = crate::take_async_tasks();
     let done = tasks.is_empty();
     CURRENT_GID.with(|cur| cur.set(None));
@@ -581,7 +678,9 @@ fn drive(gid: i64) {
             };
             gr.tasks = tasks;
             gr.pending_send = state.pending_send;
+            gr.pending_send_owned = state.pending_send_owned;
             gr.recv_result = state.recv_result;
+            gr.recv_result_owned = state.recv_result_owned;
             gr.recv_ok = state.recv_ok;
         }
         make_runnable(gid);
@@ -607,12 +706,10 @@ fn drive(gid: i64) {
                 gr.pending_exception = thrown;
             }
             let joiners = std::mem::take(&mut gr.joiners);
-            // A goroutine nobody waits on is reclaimed here: the registry
-            // entry (and its `Handle::Goroutine` wrapper) exists only while a
-            // joiner may still need its result or pending exception. An entry
-            // with joiners or a captured throw stays until an explicit
-            // join/drop consumes it.
-            let reclaim = gr.pending_exception == NULL && joiners.is_empty();
+            // A joinable goroutine must remain addressable even when it
+            // completes before its caller reaches `ntask_join`. Detached
+            // goroutines have a null wrapper and can be reclaimed eagerly.
+            let reclaim = gr.handle == NULL && gr.pending_exception == NULL && joiners.is_empty();
             (joiners, reclaim, gr.handle)
         };
         for j in &joiners {
@@ -639,7 +736,9 @@ fn drive(gid: i64) {
         // Flush the state the poll produced; `park` is consumed here, so the
         // stored copy always reads `Park::None` between polls.
         gr.pending_send = state.pending_send;
+        gr.pending_send_owned = state.pending_send_owned;
         gr.recv_result = state.recv_result;
+        gr.recv_result_owned = state.recv_result_owned;
         gr.recv_ok = state.recv_ok;
         state.park
     };
@@ -745,6 +844,7 @@ fn chan_send(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
         // Channel gone: treat as a no-op send (value released by caller).
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.pending_send = NULL;
+            gr.pending_send_owned = false;
         }
         g.ready.push_back(gid);
         return false;
@@ -755,6 +855,7 @@ fn chan_send(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
         }
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.pending_send = NULL;
+            gr.pending_send_owned = false;
         }
         g.ready.push_back(gid);
         return false;
@@ -763,10 +864,12 @@ fn chan_send(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
     if let Some(receiver) = chan.receivers.pop_front() {
         if let Some(gr) = g.goroutines.get_mut(&receiver) {
             gr.recv_result = value;
+            gr.recv_result_owned = chan.owns_elements;
             gr.recv_ok = true;
         }
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.pending_send = NULL;
+            gr.pending_send_owned = false;
         }
         g.ready.push_back(receiver);
         g.ready.push_back(gid);
@@ -776,9 +879,13 @@ fn chan_send(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
         chan.buf.push_back(value);
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.pending_send = NULL;
+            gr.pending_send_owned = false;
         }
         g.ready.push_back(gid);
         return false;
+    }
+    if let Some(gr) = g.goroutines.get_mut(&gid) {
+        gr.pending_send_owned = chan.owns_elements;
     }
     chan.senders.push_back(gid);
     false
@@ -789,6 +896,7 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
         // Channel gone: receive returns the zero value.
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.recv_result = NULL;
+            gr.recv_result_owned = false;
             gr.recv_ok = false;
         }
         g.ready.push_back(gid);
@@ -798,6 +906,7 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
     if let Some(v) = chan.buf.pop_front() {
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.recv_result = v;
+            gr.recv_result_owned = chan.owns_elements;
             gr.recv_ok = true;
         }
         if let Some(s) = chan.senders.pop_front() {
@@ -808,6 +917,7 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
                 .unwrap_or(NULL);
             if let Some(sg) = g.goroutines.get_mut(&s) {
                 sg.pending_send = NULL;
+                sg.pending_send_owned = false;
             }
             chan.buf.push_back(sv);
             g.ready.push_back(s);
@@ -825,9 +935,11 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
             .unwrap_or(NULL);
         if let Some(sg) = g.goroutines.get_mut(&s) {
             sg.pending_send = NULL;
+            sg.pending_send_owned = false;
         }
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.recv_result = sv;
+            gr.recv_result_owned = chan.owns_elements;
             gr.recv_ok = true;
         }
         g.ready.push_back(s);
@@ -837,6 +949,7 @@ fn chan_recv(g: &mut core::Global, gid: i64, core_id: i64) -> bool {
     if chan.closed {
         if let Some(gr) = g.goroutines.get_mut(&gid) {
             gr.recv_result = NULL;
+            gr.recv_result_owned = false;
             gr.recv_ok = false;
         }
         g.ready.push_back(gid);
@@ -880,6 +993,7 @@ pub(crate) fn chan_close(core_id: i64) {
             (Some(value), true, _) => {
                 if let Some(gr) = g.goroutines.get_mut(&r) {
                     gr.recv_result = value;
+                    gr.recv_result_owned = owns_elements;
                     gr.recv_ok = true;
                 }
             }
@@ -887,6 +1001,7 @@ pub(crate) fn chan_close(core_id: i64) {
             (None, true, _) => {
                 if let Some(gr) = g.goroutines.get_mut(&r) {
                     gr.recv_result = NULL;
+                    gr.recv_result_owned = false;
                     gr.recv_ok = false;
                 }
             }
@@ -901,6 +1016,7 @@ pub(crate) fn chan_close(core_id: i64) {
                 abandoned.push(gr.pending_send);
             }
             gr.pending_send = NULL;
+            gr.pending_send_owned = false;
         }
         g.ready.push_back(s);
     }
@@ -942,6 +1058,7 @@ pub(crate) fn park_chan_send(core_id: i64, value: i64) {
     CURRENT_STATE.with(|state| {
         let mut current = state.get();
         current.pending_send = value;
+        current.pending_send_owned = false;
         current.park = Park::Chan {
             core: core_id,
             op: ChanOp::Send,
@@ -958,6 +1075,7 @@ pub(crate) fn park_chan_recv(core_id: i64) {
     CURRENT_STATE.with(|state| {
         let mut current = state.get();
         current.recv_result = NULL;
+        current.recv_result_owned = false;
         current.recv_ok = false;
         current.park = Park::Chan {
             core: core_id,
@@ -987,7 +1105,14 @@ pub(crate) fn recv_result() -> i64 {
     if current_gid().is_none() {
         return NULL;
     }
-    CURRENT_STATE.with(|state| state.get().recv_result)
+    CURRENT_STATE.with(|state| {
+        let mut current = state.get();
+        let result = current.recv_result;
+        current.recv_result = NULL;
+        current.recv_result_owned = false;
+        state.set(current);
+        result
+    })
 }
 
 /// Whether the last receive on this goroutine delivered a real value.
@@ -1003,12 +1128,20 @@ pub(crate) fn recv_ok() -> bool {
 /// wait on a spawned goroutine.
 pub(crate) fn join_blocking(gid: i64) -> i64 {
     loop {
-        let state = core::GLOBAL
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .goroutines
-            .get(&gid)
-            .map(|gr| (gr.done, gr.result, gr.pending_exception));
+        let state = {
+            let mut guard = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+            guard.goroutines.get_mut(&gid).map(|gr| {
+                if gr.done {
+                    // Joining transfers the exception handle to the caller's
+                    // TLS. Clear the scheduler copy so a later drop cannot
+                    // reclaim a handle that the caller now owns.
+                    let exception = std::mem::take(&mut gr.pending_exception);
+                    (true, gr.result, exception)
+                } else {
+                    (false, gr.result, NULL)
+                }
+            })
+        };
         match state {
             Some((true, r, exception)) => {
                 if exception != NULL {

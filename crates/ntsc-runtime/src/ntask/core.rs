@@ -66,8 +66,13 @@ pub(crate) struct Goroutine {
     pub(crate) cleanup: Option<(CleanupFn, i64)>,
     /// The value a blocked sender is handing off, or `NULL`.
     pub(crate) pending_send: i64,
+    /// Whether `pending_send` is an owned channel element.
+    pub(crate) pending_send_owned: bool,
     /// The value a receiver picked up (or the zero value on close), or `NULL`.
     pub(crate) recv_result: i64,
+    /// Whether `recv_result` is an owned channel element not yet consumed by
+    /// the generated future.
+    pub(crate) recv_result_owned: bool,
     /// Whether `recv_result` carries a real value (`false` after a close-drain
     /// or a failed receive). `for v in chan` needs the distinction because a
     /// raw scalar `0` is a legal received value.
@@ -286,6 +291,17 @@ pub(crate) fn register_goroutine_runnable(g: Goroutine) -> i64 {
     id
 }
 
+/// Reserve a contiguous range of scheduler core ids. Callers can then build
+/// a batch of goroutines without taking the global lock once per child; the
+/// ids are still globally unique because the range reservation is atomic with
+/// respect to every other core registration.
+pub(crate) fn reserve_core_ids(count: usize) -> i64 {
+    let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    let start = guard.next_core;
+    guard.next_core = guard.next_core.saturating_add(count.max(1) as i64);
+    start
+}
+
 /// Register a new channel and return its core id.
 pub(crate) fn register_chan(cap: usize, owns_elements: bool) -> i64 {
     let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -320,7 +336,23 @@ pub(crate) fn register_io() -> i64 {
 /// reactor spinning. The same applies to `chan`/`io`/`job` waiters.
 pub(crate) fn drop_goroutine(core: i64) {
     let mut guard = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
-    guard.goroutines.remove(&core);
+    let Some(removed) = guard.goroutines.remove(&core) else {
+        return;
+    };
+    let mut abandoned = Vec::new();
+    if removed.pending_send_owned && removed.pending_send != NULL {
+        abandoned.push(removed.pending_send);
+    }
+    if removed.recv_result_owned && removed.recv_result != NULL {
+        abandoned.push(removed.recv_result);
+    }
+    if removed.pending_exception != NULL {
+        abandoned.push(removed.pending_exception);
+    }
+    if removed.done && removed.result != NULL {
+        abandoned.push(removed.result);
+    }
+    let cleanup = (!removed.done).then_some(removed.cleanup);
     // Timers: remove this gid from any deadline bucket.
     let mut removed_timers = 0i64;
     guard.timers.retain(|_, gids| {
@@ -349,6 +381,13 @@ pub(crate) fn drop_goroutine(core: i64) {
         if op.waiter == Some(core) {
             op.waiter = None;
         }
+    }
+    drop(guard);
+    for value in abandoned {
+        let _ = registry::remove(value);
+    }
+    if let Some(Some((cleanup, future))) = cleanup {
+        cleanup(future);
     }
 }
 
@@ -469,7 +508,9 @@ mod tests {
             handle: NULL,
             cleanup: None,
             pending_send: NULL,
+            pending_send_owned: false,
             recv_result: NULL,
+            recv_result_owned: false,
             recv_ok: false,
             done: false,
             result: NULL,
@@ -506,7 +547,9 @@ mod tests {
             handle: NULL,
             cleanup: None,
             pending_send: NULL,
+            pending_send_owned: false,
             recv_result: NULL,
+            recv_result_owned: false,
             recv_ok: false,
             done: false,
             result: NULL,
@@ -527,5 +570,35 @@ mod tests {
         assert!(chan.receivers.is_empty());
         drop(guard);
         drop_chan(chan_core);
+    }
+
+    #[test]
+    fn dropping_a_goroutine_reclaims_owned_values_and_exception() {
+        extern "C" fn never_done(_: i64) -> i8 {
+            0
+        }
+        let send_value = registry::put_string("send".to_string());
+        let recv_value = registry::put_string("recv".to_string());
+        let exception = registry::put_string("exception".to_string());
+        let core = register_goroutine(Goroutine {
+            tasks: vec![(never_done as PollFn, NULL)],
+            handle: NULL,
+            cleanup: None,
+            pending_send: send_value,
+            pending_send_owned: true,
+            recv_result: recv_value,
+            recv_result_owned: true,
+            recv_ok: true,
+            done: true,
+            result: NULL,
+            pending_exception: exception,
+            joiners: Vec::new(),
+        });
+
+        drop_goroutine(core);
+
+        assert!(registry::get_string(send_value).is_none());
+        assert!(registry::get_string(recv_value).is_none());
+        assert!(registry::get_string(exception).is_none());
     }
 }

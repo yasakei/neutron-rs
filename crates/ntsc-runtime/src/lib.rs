@@ -1385,7 +1385,12 @@ mod tests {
         let state = registry::put_opaque(0i64);
         let task = ntask_go(mark_done, state);
         assert_ne!(task, NULL);
+        // Completion may race the caller, but a joinable handle must remain
+        // addressable until the explicit drop below.
+        std::thread::yield_now();
+        assert!(registry::task_core(task).is_some());
         let _ = ntask_join(task);
+        assert!(registry::task_core(task).is_some());
         assert_eq!(registry::with_opaque(state, |value: &i64| *value), Some(42));
         ntask_goroutine_drop(task);
         ntask_goroutine_drop(task);
