@@ -361,9 +361,35 @@ fn link_windows(
                 .arg(obj_path)
                 .arg(runtime_lib);
             const LIBS: &[&str] = &[
-                "advapi32", "shell32", "user32", "kernel32", "imagehlp", "comctl32", "comdlg32",
-                "winspool", "winmm", "ole32", "oleaut32", "uuid", "rpcrt4", "ws2_32", "bcrypt",
-                "ntdll", "userenv", "crypt32", "shlwapi", "version",
+                "advapi32",
+                "shell32",
+                "user32",
+                "kernel32",
+                "imagehlp",
+                "comctl32",
+                "comdlg32",
+                "winspool",
+                "winmm",
+                "ole32",
+                "oleaut32",
+                "uuid",
+                "rpcrt4",
+                "ws2_32",
+                "bcrypt",
+                "ntdll",
+                "userenv",
+                "crypt32",
+                "shlwapi",
+                "version",
+                // A Rust staticlib does not carry its CRT default-lib directives
+                // into the archive — rustc emits `/defaultlib:msvcrt` only when
+                // it drives the final link itself — so linking the archive with
+                // link.exe must name the /MD CRT set explicitly. Without it a
+                // release-built runtime leaves CRT symbols (memcpy, ceil,
+                // __CxxFrameHandler3, _tls_index, ...) unresolved.
+                "ucrt",
+                "vcruntime",
+                "msvcrt",
             ];
             for lib in LIBS {
                 command.arg(format!("/DEFAULTLIB:{lib}"));
