@@ -892,6 +892,29 @@ pub(crate) fn emit_expression<'ctx>(
                 Ok(obj_val)
             }
         }
+        Expr::ChanSend { .. } | Expr::ChanRecv { .. } => {
+            Err(crate::CodegenError::LLVMError(
+                "a channel send/receive must be a top-level statement of an async function; it is not yet supported here".into(),
+            ))
+        }
+        Expr::Close { channel, .. } => {
+            let chan = emit_expression(fn_ctx, channel)?;
+            let close_fn = fn_ctx
+                .module
+                .get_function("ntask_chan_close")
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError("ntask_chan_close not declared".into())
+                })?;
+            fn_ctx.builder.build_call(
+                close_fn,
+                &[chan.value.into_int_value().into()],
+                "chan_close",
+            )?;
+            Ok(TypedValue::new(
+                default_llvm_value(&Ty::Void, fn_ctx.context),
+                Ty::Void,
+            ))
+        }
     }
 }
 
@@ -1227,6 +1250,12 @@ pub(crate) fn emit_copy_value<'ctx>(
         }
         Ty::Result { ok, err } => {
             return super::result_cell::emit_copy_result_value(fn_ctx, ok, err, &tv);
+        }
+        Ty::Chan(_) => {
+            return Err(crate::CodegenError::LLVMError(
+                "cannot copy a channel; channel values are not yet supported by code generation"
+                    .into(),
+            ));
         }
     };
     let callee = fn_ctx

@@ -189,6 +189,10 @@ A feature touches every stage in order:
 - Leak detection — debug builds report registry entries never dropped
   (`NTSC WARNING: Memory leak detected!`), which catches wrong-kind and
   duplicate drops at runtime.
+- Scheduler race coverage — the opt-in `.github/workflows/tsan.yml` workflow
+  uses nightly only for Rust's unstable ThreadSanitizer flag, builds the
+  standard library with it, and repeats the scheduler stress test. The normal
+  build and test gate remains on stable Rust.
 - The registry's own tests assert `LIVE + PERMANENT == map.len()`, so a
   drop path that silently loses an entry fails the suite.
 - `cargo test -p ntsc-codegen -- --nocapture` — shows the IR emitted by

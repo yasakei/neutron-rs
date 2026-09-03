@@ -38,6 +38,7 @@ pub(crate) fn ty_to_llvm<'ctx>(
         Ty::Any => i64.as_basic_type_enum(),
         Ty::Pointer => i64.as_basic_type_enum(),
         Ty::Slice(_) => i64.as_basic_type_enum(),
+        Ty::Chan(_) => i64.as_basic_type_enum(),
 
         Ty::Shared(_) => i64.as_basic_type_enum(),
 
@@ -88,6 +89,7 @@ pub(crate) fn default_llvm_value<'ctx>(ty: &Ty, context: &'ctx Context) -> Basic
         | Ty::Shared(_)
         | Ty::Pointer
         | Ty::Slice(_)
+        | Ty::Chan(_)
         | Ty::Void => context.i64_type().const_zero().into(),
         Ty::Tuple(elements) => {
             let ll_ty = ty_to_llvm(&Ty::Tuple(elements.clone()), context);

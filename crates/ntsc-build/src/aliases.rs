@@ -444,6 +444,31 @@ impl Rewriter<'_> {
                     body: self.stmts(body),
                 }
             }
+            Stmt::ChanRecvFor {
+                mut variable,
+                channel,
+                body,
+            } => {
+                variable = self.id_token(&variable, true);
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .insert(variable.lexeme().to_string());
+                Stmt::ChanRecvFor {
+                    variable,
+                    channel: self.expr(channel),
+                    body: Box::new(self.stmt(*body)),
+                }
+            }
+            Stmt::Go {
+                call,
+                block,
+                keyword_span,
+            } => Stmt::Go {
+                call: self.expr(call),
+                block: block.map(|b| self.stmts(b)),
+                keyword_span,
+            },
         }
     }
 
@@ -720,6 +745,28 @@ impl Rewriter<'_> {
                 object: Box::new(self.expr(*object)),
                 index,
                 dot_span,
+            },
+            Expr::ChanSend {
+                channel,
+                value,
+                op_span,
+            } => Expr::ChanSend {
+                channel: Box::new(self.expr(*channel)),
+                value: Box::new(self.expr(*value)),
+                op_span,
+            },
+            Expr::ChanRecv {
+                receiver,
+                channel,
+                op_span,
+            } => Expr::ChanRecv {
+                receiver: self.id_token(&receiver, true),
+                channel: Box::new(self.expr(*channel)),
+                op_span,
+            },
+            Expr::Close { channel, keyword } => Expr::Close {
+                channel: Box::new(self.expr(*channel)),
+                keyword,
             },
         }
     }

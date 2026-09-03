@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use inkwell::OptimizationLevel;
+use ntsc_ast::stmt::{Program, Stmt};
 use ntsc_codegen::SUMMARY_MARKER;
 use ntsc_diag::{DiagConfig, Diagnostic, SourceBuffer, SourceMap, Writer, diagnostics_to_json};
 
@@ -417,7 +418,12 @@ fn cmd_build(release: bool, test_mode: bool, json: bool) -> Result<PathBuf, CliE
     let codegen_time = codegen_start.elapsed();
 
     // Find the runtime library and link → binary.
-    let runtime_lib = find_runtime_lib(&cwd)?;
+    // Only the stdlib modules actually imported by the program are built
+    // into the runtime (the monolithic `full` archive is ~39M release;
+    // a `hello` with no heavy imports is ~2-3M). This is the "only build
+    // what is used" path.
+    let needed_features = detect_runtime_features(&loaded.program);
+    let runtime_lib = find_runtime_lib(&cwd, &needed_features, release)?;
     let output_path = out_dir.join(ntsc_codegen::with_executable_extension(&config.output));
     let link_start = Instant::now();
     ntsc_codegen::link_binary(&obj_path, &runtime_lib, &output_path)?;
@@ -740,53 +746,147 @@ fn display_rel(base: &Path, path: &Path) -> String {
         .to_string()
 }
 
+fn detect_runtime_features(program: &Program) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut used = BTreeSet::new();
+    for stmt in &program.statements {
+        if let Stmt::Use {
+            library,
+            is_file_path: false,
+            ..
+        } = stmt
+        {
+            used.insert(library.lexeme().to_string());
+        }
+    }
+    let mut features = Vec::new();
+    let has = |name: &str| used.contains(name);
+    if has("regex") || has("glob") {
+        features.push("regex".to_string());
+    }
+    if has("http") {
+        features.push("http".to_string());
+    }
+    if has("archive") {
+        features.push("archive".to_string());
+    }
+    if has("crypto") || has("hash") || has("encoding") {
+        features.push("crypto".to_string());
+    }
+    features
+}
+
 /// Locate the runtime static library.
 ///
-/// Checks the build directory first, then the Cargo target directory.
-/// The archive name follows the host toolchain (`libntsc_runtime.a` on
-/// Unix and MinGW, `ntsc_runtime.lib` under MSVC).
-fn find_runtime_lib(project_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// Only the stdlib modules actually imported by the program are built
+/// into the runtime (`--no-default-features --features <needed>`). A
+/// `hello` with no heavy imports links a ~2-3M core archive instead of
+/// the full ~39M one, and `cargo` still caches per feature set.
+fn find_runtime_lib(
+    project_dir: &Path,
+    needed_features: &[String],
+    release: bool,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let lib_name = ntsc_codegen::runtime_lib_name();
 
-    // Installers stage the runtime archive relative to the executable
-    // (beside it on Windows and in the macOS bundle, in a sibling
-    // `lib/ntsc` on Unix prefixes), so an installed ntsc links NTSC
-    // programs with no workspace checkout and no cargo toolchain.
-    if let Some(runtime) = find_installed_runtime() {
+    let is_full_needed = {
+        let mut s = needed_features.to_vec();
+        s.sort();
+        s == vec![
+            "archive".to_string(),
+            "crypto".to_string(),
+            "http".to_string(),
+            "regex".to_string(),
+        ]
+    };
+    if is_full_needed && let Some(runtime) = find_installed_runtime() {
         return Ok(runtime);
     }
 
-    // Check standard cargo build output paths.
-    let candidates = [
-        project_dir.join("target").join("debug").join(lib_name),
-        project_dir.join("target").join("release").join(lib_name),
-    ];
-
-    // Also check if we're inside the workspace (for development).
-    let workspace_target = project_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("target").join("debug").join(lib_name));
-
-    for candidate in candidates.iter().chain(workspace_target.iter()) {
-        if candidate.exists() {
-            return Ok(candidate.clone());
-        }
-    }
-
-    // Try to build it ourselves. Locate the workspace from the running
-    // binary so projects outside the checkout still build against the
-    // runtime. An installed binary has no workspace, so this fails with a
-    // message that points at where an installer is expected to have
-    // staged the runtime.
     let rewrite_dir = match find_rewrite_dir(project_dir)?.or_else(find_rewrite_dir_from_exe) {
         Some(dir) if dir.exists() => dir,
         _ => return Err(runtime_not_found_error(lib_name).into()),
     };
 
-    println!("  Building runtime...");
+    let profile_dir = if release { "release" } else { "debug" };
+    let is_full = is_full_needed;
+
+    // Reuse the workspace's already-built full archive for the common
+    // `cargo test`/GATE path where every heavy module is needed and the
+    // archive is already on disk. This avoids rebuilding the 39M full
+    // runtime for every `ntsc build` inside the workspace.
+    if is_full {
+        let candidates = [
+            project_dir.join("target").join(profile_dir).join(lib_name),
+            rewrite_dir.join("target").join(profile_dir).join(lib_name),
+        ];
+        for candidate in &candidates {
+            if candidate.exists() {
+                let dominated = needed_features.is_empty()
+                    && candidate
+                        .metadata()
+                        .map(|m| m.len() > 20_000_000)
+                        .unwrap_or(false);
+                if !dominated {
+                    return Ok(candidate.clone());
+                }
+            }
+        }
+    }
+
+    // Per-feature cache so `hello` (no heavy deps) and `http` programs
+    // don't clobber each other's `libntsc_runtime.a`. Cargo's fingerprint
+    // already separates them, but the output file is the same path, so we
+    // isolate by `target-dir`.
+    let mut feature_key = needed_features.to_vec();
+    feature_key.sort();
+    let key = if feature_key.is_empty() {
+        "core".to_string()
+    } else {
+        feature_key.join(",")
+    };
+    let hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        key.hash(&mut h);
+        format!("{:x}", h.finish())
+    };
+    let target_dir = rewrite_dir
+        .join("target")
+        .join(format!("ntsc-runtime-{}-{}", profile_dir, hash));
+
+    let mut args = vec![
+        "build".to_string(),
+        "-p".to_string(),
+        "ntsc-runtime".to_string(),
+    ];
+    if release {
+        args.push("--release".to_string());
+    }
+    if feature_key.is_empty() {
+        args.push("--no-default-features".to_string());
+    } else if is_full {
+        // `default = ["full"]` already builds everything; no extra flags
+        // needed, but keep the isolated target-dir for cache hygiene.
+    } else {
+        args.push("--no-default-features".to_string());
+        args.push("--features".to_string());
+        args.push(key.clone());
+    }
+    args.push("--target-dir".to_string());
+    args.push(target_dir.display().to_string());
+
+    println!(
+        "  Building runtime ({})...",
+        if feature_key.is_empty() {
+            "core".to_string()
+        } else {
+            key.clone()
+        }
+    );
     let status = std::process::Command::new("cargo")
-        .args(["build", "-p", "ntsc-runtime"])
+        .args(&args)
         .current_dir(&rewrite_dir)
         .status()
         .map_err(|e| format!("failed to run cargo: {e}"))?;
@@ -795,8 +895,7 @@ fn find_runtime_lib(project_dir: &Path) -> Result<PathBuf, Box<dyn std::error::E
         return Err("failed to build ntsc-runtime".into());
     }
 
-    // Try again after building.
-    let built = rewrite_dir.join("target").join("debug").join(lib_name);
+    let built = target_dir.join(profile_dir).join(lib_name);
     if built.exists() {
         return Ok(built);
     }

@@ -201,6 +201,12 @@ fn unique_temp_path(prefix: &str) -> PathBuf {
     dir.join(name)
 }
 
+/// Files this process currently holds advisory locks on, keyed by path.
+/// The lock lives as long as the `File` stays here; `os.file_unlock`
+/// removes and releases it.
+static LOCKED_FILES: LazyLock<Mutex<HashMap<String, std::fs::File>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// `os.file_lock(path)` — acquire an exclusive advisory file lock on the
 /// given path. Creates the file if it does not exist. Returns a file
 /// handle (int) on success. Throws on failure.
@@ -215,22 +221,17 @@ pub extern "C" fn ntsc_os_file_lock(path: i64) -> i64 {
             .read(true)
             .write(true)
             .open(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = file.as_raw_fd();
-            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if ret != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "file is already locked",
-                ));
-            }
+        if let Err(e) = file.try_lock() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("file is already locked: {e}"),
+            ));
         }
         let handle = registry::put_string(path.to_string());
-        // Leak the File so the lock stays held; the handle is used to
-        // release it via `file_unlock`.
-        std::mem::forget(file);
+        LOCKED_FILES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(path.to_string(), file);
         Ok(handle)
     }
     match lock_file(&path) {
@@ -239,19 +240,27 @@ pub extern "C" fn ntsc_os_file_lock(path: i64) -> i64 {
     }
 }
 
-/// `os.file_unlock(path)` — release the advisory file lock.
+/// `os.file_unlock(path)` — release the advisory file lock acquired by
+/// `os.file_lock`. Returns 1 when the path is unlocked in this process
+/// (including when it was never locked here), 0 on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_os_file_unlock(path: i64) -> i8 {
-    let _path = registry::get_string(path).unwrap_or_default();
-    // The lock is released when the process exits or the file descriptor
-    // is closed. Since we leaked the File, we cannot close it from here
-    // without tracking the fd. This is a best-effort unlock.
-    1
+    let path = registry::get_string(path).unwrap_or_default();
+    let file = LOCKED_FILES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&path);
+    match file {
+        // Dropping the File releases the lock too; unlock() makes it explicit.
+        Some(file) => i8::from(file.unlock().is_ok()),
+        None => 1,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ntsc_exception_clear, ntsc_exception_pending};
 
     fn put(s: &str) -> i64 {
         registry::put_string(s.to_string())
@@ -300,5 +309,27 @@ mod tests {
         let f = read(ntsc_os_temp_file(put("ntsc-test-")));
         assert!(!f.is_empty());
         let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn file_lock_is_exclusive_until_unlock() {
+        let path = std::env::temp_dir().join(format!("ntsc-os-lock-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let key = put(path.to_str().unwrap());
+
+        let first = ntsc_os_file_lock(key);
+        assert_ne!(first, 0);
+
+        // A second exclusive lock on the same path must throw.
+        assert_eq!(ntsc_os_file_lock(key), 0);
+        assert_eq!(ntsc_exception_pending(), 1);
+        ntsc_exception_clear();
+        assert_eq!(ntsc_exception_pending(), 0);
+
+        assert_eq!(ntsc_os_file_unlock(key), 1);
+        // The lock is really released: re-acquiring must succeed.
+        assert_ne!(ntsc_os_file_lock(key), 0);
+        assert_eq!(ntsc_os_file_unlock(key), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }

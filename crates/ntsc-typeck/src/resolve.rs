@@ -13,6 +13,145 @@ use crate::names::resolve_program;
 use crate::scope::SymbolTable;
 use crate::ty::Ty;
 
+// Async function name -> element types of its `|>` channel receives, in
+// order of appearance. Populated during type checking and read by codegen so
+// a receive can type its freshly-bound receiver variable. Keyed by the
+// receive's operator span (unique per site), so receives inside `go { }`
+// blocks resolve even though they are checked under the enclosing function.
+std::thread_local! {
+    static CHAN_RECV_TYPES: std::cell::RefCell<HashMap<usize, Ty>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Returns the element type of the `|>` receive (or `for v in chan` loop)
+/// at the given operator/channel span start. Used by codegen to type the
+/// receiver variable of each channel receive it lowers.
+pub fn chan_recv_element_type(span_start: usize) -> Ty {
+    CHAN_RECV_TYPES
+        .with(|map| map.borrow().get(&span_start).cloned())
+        .unwrap_or(Ty::Any)
+}
+
+/// The name of a `go` callee for diagnostics (`worker` from `go worker(..)`).
+fn name_of_callee(callee: &Expr) -> String {
+    match callee {
+        Expr::Variable { name } => name.lexeme().to_string(),
+        _ => "go".into(),
+    }
+}
+
+impl TypeChecker {
+    /// Reject a `go` argument whose type cannot cross a thread boundary.
+    /// Views borrow the spawner's frame; `shared` refcounts are not
+    /// synchronized across goroutines.
+    fn reject_thread_unsafe(&mut self, ty: &Ty, span: Span, callee: &str) {
+        match ty {
+            Ty::View(..) => self.errors.push(TypeError {
+                code: Some("NTSC-E0501"),
+                help: Some(
+                    "a borrow may not outlive the goroutine; move or copy the value instead"
+                        .into(),
+                ),
+                message: format!(
+                    "cannot pass `{ty}` to `go {callee}`: a view cannot cross into a goroutine"
+                ),
+                span,
+            }),
+            Ty::Shared(..) => self.errors.push(TypeError {
+                code: Some("NTSC-E0501"),
+                help: Some(
+                    "`shared` reference counts are not synchronized across goroutines; send the value through a channel instead".into(),
+                ),
+                message: format!(
+                    "cannot pass `{ty}` to `go {callee}`: unsynchronized reference counting"
+                ),
+                span,
+            }),
+            _ => {}
+        }
+    }
+}
+
+// Captured outer locals per `go { ... }` block, keyed by the `go`
+// keyword's span start. Codegen turns each entry into the parameters of
+// the block's synthesized goroutine function; the list is deterministic
+// (sorted by name) and only contains variables of the enclosing function.
+std::thread_local! {
+    static GO_CAPTURES: std::cell::RefCell<HashMap<usize, Vec<(String, Ty)>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Returns the locals a `go { ... }` block captures, sorted by name.
+pub fn go_captures(keyword_span_start: usize) -> Vec<(String, Ty)> {
+    GO_CAPTURES.with(|map| {
+        map.borrow()
+            .get(&keyword_span_start)
+            .cloned()
+            .unwrap_or_default()
+    })
+}
+
+/// Names bound anywhere inside a `go` block (any depth): those never count
+/// as captures of the enclosing function.
+pub(crate) fn collect_go_bindings(stmts: &[Stmt], bound: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Var { name, .. } | Stmt::ForIn { variable: name, .. } => {
+                bound.insert(name.lexeme().to_string());
+            }
+            Stmt::ForAwait { variable, .. } => {
+                bound.insert(variable.lexeme().to_string());
+            }
+            Stmt::For {
+                init: Some(init), ..
+            } => {
+                if let Stmt::Var { name, .. } = init.as_ref() {
+                    bound.insert(name.lexeme().to_string());
+                }
+            }
+            Stmt::ChanRecvFor { variable, .. } => {
+                bound.insert(variable.lexeme().to_string());
+            }
+            Stmt::Destructure { names, .. } => {
+                for name in names {
+                    bound.insert(name.lexeme().to_string());
+                }
+            }
+            Stmt::Block { statements, .. } => collect_go_bindings(statements, bound),
+            Stmt::If {
+                then_branch,
+                elif_branches,
+                else_branch,
+                ..
+            } => {
+                collect_go_bindings(std::slice::from_ref(then_branch), bound);
+                for branch in elif_branches {
+                    collect_go_bindings(std::slice::from_ref(&branch.body), bound);
+                }
+                if let Some(else_branch) = else_branch {
+                    collect_go_bindings(std::slice::from_ref(else_branch), bound);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                collect_go_bindings(std::slice::from_ref(body), bound)
+            }
+            Stmt::Try {
+                catch_var,
+                catch_block,
+                ..
+            } => {
+                if let Some(catch_var) = catch_var {
+                    bound.insert(catch_var.lexeme().to_string());
+                }
+                if let Some(catch_block) = catch_block {
+                    collect_go_bindings(std::slice::from_ref(catch_block), bound);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 thread_local! {
     /// Evaluated constant values produced by the type checker, keyed by
     /// variable name. Codegen reads these to emit folded constants.
@@ -134,6 +273,10 @@ struct TypeChecker {
     /// Nesting depth of async function bodies currently being checked.
     async_depth: usize,
 
+    /// Name of the async function whose body is currently being checked, used
+    /// to key the receiver-element-type registry codegen reads for `|>`.
+    current_fn_name: Option<String>,
+
     unsafe_depth: usize,
 
     /// Names of enum members, which resolve to `int` constants.
@@ -190,6 +333,13 @@ impl TypeChecker {
             .define("async", Ty::Object)
             .expect("global scope should be empty");
 
+        // `chan.new(...)` — the virtual-task channel constructor. The
+        // element type comes from the target slot, so the constructor call
+        // itself is only arity-checked.
+        symbols
+            .define("chan", Ty::Object)
+            .expect("global scope should be empty");
+
         Self {
             symbols,
             errors: Vec::new(),
@@ -197,6 +347,7 @@ impl TypeChecker {
             in_class_body: false,
             async_fns: HashSet::new(),
             async_depth: 0,
+            current_fn_name: None,
             unsafe_depth: 0,
             enum_members: HashSet::new(),
             consts: HashSet::new(),
@@ -561,6 +712,9 @@ impl TypeChecker {
                 producer: condition,
                 ..
             }
+            | Stmt::ChanRecvFor {
+                channel: condition, ..
+            }
             | Stmt::Match {
                 expression: condition,
                 ..
@@ -571,6 +725,9 @@ impl TypeChecker {
             } => condition.span(),
             Stmt::Break { span }
             | Stmt::Continue { span }
+            | Stmt::Go {
+                keyword_span: span, ..
+            }
             | Stmt::Block {
                 open_span: span, ..
             } => *span,
@@ -770,6 +927,142 @@ impl TypeChecker {
                 }
                 self.check_statement(body);
                 self.symbols.pop_scope();
+            }
+            Stmt::ChanRecvFor {
+                variable,
+                channel,
+                body,
+            } => {
+                let channel_ty = self.check_expression(channel);
+                let element_ty = match &channel_ty {
+                    Some(Ty::Chan(element)) => (**element).clone(),
+                    _ => {
+                        if let Some(other) = &channel_ty {
+                            self.errors.push(TypeError {
+                                code: None,
+                                help: Some(
+                                    "only a channel can be iterated with `for v in chan`".into(),
+                                ),
+                                message: format!(
+                                    "cannot iterate over `{other}`; expected a channel"
+                                ),
+                                span: channel.span(),
+                            });
+                        }
+                        Ty::Any
+                    }
+                };
+                self.symbols.push_scope();
+                if let Err(msg) = self.symbols.define(variable.lexeme(), element_ty.clone()) {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: msg,
+                        span: variable.span,
+                    });
+                }
+                CHAN_RECV_TYPES.with(|map| {
+                    map.borrow_mut()
+                        .insert(channel.span().start, element_ty.clone());
+                });
+                self.check_statement(body);
+                self.symbols.pop_scope();
+            }
+            Stmt::Go {
+                call,
+                block,
+                keyword_span,
+            } => {
+                // `go worker(args)` runs an async function's future on the
+                // scheduler; the bare call is legal here (no `await`). Every
+                // argument crosses a thread boundary: views may not outlive
+                // the spawner and `shared` refcounts are unsynchronized.
+                match call {
+                    Expr::Call {
+                        callee, arguments, ..
+                    } if matches!(callee.as_ref(), Expr::Variable { name }
+                            if self.async_fns.contains(name.lexeme())) =>
+                    {
+                        for argument in arguments {
+                            if let Some(ty) = self.check_expression(argument) {
+                                self.reject_thread_unsafe(
+                                    &ty,
+                                    argument.span(),
+                                    &name_of_callee(callee.as_ref()),
+                                );
+                            }
+                        }
+                    }
+                    Expr::Literal {
+                        value: LiteralValue::Nil,
+                        ..
+                    } if block.is_some() => {}
+                    _ => {
+                        self.errors.push(TypeError {
+                            code: Some("NTSC-E0501"),
+                            help: Some(
+                                "spawn an async function: `go worker(args)`, or run a block: `go { ... }`"
+                                    .into(),
+                            ),
+                            message: "`go` requires a call to an async function or a block".into(),
+                            span: call.span(),
+                        });
+                    }
+                }
+                if let Some(block) = block {
+                    let mut uses = HashSet::new();
+                    for stmt in block {
+                        crate::ownership::collect_stmt_uses(stmt, &mut uses);
+                    }
+                    let mut bound = HashSet::new();
+                    collect_go_bindings(block, &mut bound);
+                    let mut captures: Vec<(String, Ty)> = uses
+                        .into_iter()
+                        .filter(|name| !bound.contains(name))
+                        .filter_map(|name| {
+                            let (depth, ty) = self.symbols.lookup_depth(&name)?;
+                            if depth == 0 || matches!(ty, Ty::Function { .. }) {
+                                return None;
+                            }
+                            if let Ty::View(..) = &ty {
+                                self.errors.push(TypeError {
+                                    code: Some("NTSC-E0501"),
+                                    help: Some(
+                                        "a borrow may not outlive the goroutine; move or copy the value instead".into(),
+                                    ),
+                                    message: format!(
+                                        "cannot capture view `{name}` in a `go` block: a borrow cannot cross into a goroutine"
+                                    ),
+                                    span: *keyword_span,
+                                });
+                                return None;
+                            }
+                            if let Ty::Shared(..) = &ty {
+                                self.errors.push(TypeError {
+                                    code: Some("NTSC-E0501"),
+                                    help: Some(
+                                        "`shared` reference counts are not synchronized across goroutines; send the value through a channel instead".into(),
+                                    ),
+                                    message: format!(
+                                        "cannot capture shared `{name}` in a `go` block: unsynchronized reference counting"
+                                    ),
+                                    span: *keyword_span,
+                                });
+                                return None;
+                            }
+                            Some((name, ty.clone()))
+                        })
+                        .collect();
+                    captures.sort_by(|a, b| a.0.cmp(&b.0));
+                    GO_CAPTURES.with(|map| {
+                        map.borrow_mut().insert(keyword_span.start, captures);
+                    });
+                    self.symbols.push_scope();
+                    for stmt in block {
+                        self.check_statement(stmt);
+                    }
+                    self.symbols.pop_scope();
+                }
             }
             Stmt::Return { value } => {
                 if let Some(expr) = value {
@@ -1080,11 +1373,14 @@ impl TypeChecker {
         let prev_async_depth = self.async_depth;
         if is_async {
             self.async_depth += 1;
+            CHAN_RECV_TYPES.with(|map| map.borrow_mut().clear());
+            self.current_fn_name = Some(name.to_string());
         }
 
         if is_async {
             for stmt in body {
                 self.validate_await_placement(stmt, true);
+                self.validate_chan_placement(stmt, true);
                 self.validate_async_return_placement(stmt, true);
             }
         }
@@ -1105,6 +1401,7 @@ impl TypeChecker {
         if is_async {
             for stmt in body {
                 self.validate_await_placement(stmt, true);
+                self.validate_chan_placement(stmt, true);
                 self.validate_async_return_placement(stmt, true);
             }
         }
@@ -1129,6 +1426,7 @@ impl TypeChecker {
 
         self.async_depth = prev_async_depth;
         self.current_return_type = prev_return_type;
+        self.current_fn_name = None;
         self.capture_bases.pop();
         self.symbols.pop_scope();
     }
@@ -1192,6 +1490,43 @@ impl TypeChecker {
                         help: None,
                         message: "await is not allowed inside control flow in async functions"
                             .into(),
+                        span,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Enforce that channel send/receive suspension points only appear at the
+    /// top level of an async body (as a statement-level expression, a
+    /// variable initializer, or a return value), mirroring `await`. A channel
+    /// op nested in control flow would need a suspension point the codegen
+    /// does not yet lower.
+    fn validate_chan_placement(&mut self, stmt: &Stmt, at_top_level: bool) {
+        match stmt {
+            Stmt::Block { statements, .. } if at_top_level => {
+                for inner in statements {
+                    self.validate_chan_placement(inner, true);
+                }
+            }
+            Stmt::Expression { expression } if at_top_level => {
+                if !matches!(expression, Expr::ChanSend { .. } | Expr::ChanRecv { .. })
+                    && let Some(span) = chan_op_span(expression)
+                {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: "channel send/receive must be a top-level statement of an async function".into(),
+                        span,
+                    });
+                }
+            }
+            other => {
+                if let Some(span) = chan_in_stmt(other) {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: "channel operations are not yet allowed inside control flow of async functions".into(),
                         span,
                     });
                 }
@@ -2127,6 +2462,103 @@ impl TypeChecker {
                 self.symbols.pop_scope();
                 Some(Ty::Any)
             }
+            Expr::ChanSend {
+                channel,
+                value,
+                op_span,
+            } => {
+                if self.async_depth == 0 {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: "a channel send is only allowed inside an async function".into(),
+                        span: *op_span,
+                    });
+                }
+                let channel_ty = self.check_expression(channel);
+                let value_ty = self.check_expression(value);
+                match (channel_ty, value_ty) {
+                    (Some(Ty::Chan(element)), Some(actual))
+                        if self.assignable(&element, &actual) =>
+                    {
+                        // send moves the value into the channel; returns the
+                        // unit type.
+                    }
+                    (Some(Ty::Chan(element)), Some(actual)) => self.errors.push(TypeError {
+                        code: None,
+                        help: Some(format!("expected `{}`, got `{actual}`", element)),
+                        message: format!("cannot send `{actual}` into `chan[{}]`", element),
+                        span: *op_span,
+                    }),
+                    (Some(other), _) => self.errors.push(TypeError {
+                        code: None,
+                        help: Some("only a channel can receive a send".into()),
+                        message: format!("cannot send into `{other}`; expected a channel"),
+                        span: *op_span,
+                    }),
+                    _ => {}
+                }
+                Some(Ty::Void)
+            }
+            Expr::ChanRecv {
+                receiver,
+                channel,
+                op_span,
+                ..
+            } => {
+                if self.async_depth == 0 {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: "a channel receive is only allowed inside an async function"
+                            .into(),
+                        span: receiver.span,
+                    });
+                }
+                let channel_ty = self.check_expression(channel);
+                let element_ty = match &channel_ty {
+                    Some(Ty::Chan(element)) => (**element).clone(),
+                    _ => {
+                        if let Some(other) = &channel_ty {
+                            self.errors.push(TypeError {
+                                code: None,
+                                help: Some("only a channel can be received from".into()),
+                                message: format!(
+                                    "cannot receive from `{other}`; expected a channel"
+                                ),
+                                span: channel.span(),
+                            });
+                        }
+                        Ty::Any
+                    }
+                };
+                if let Err(msg) = self.symbols.define(receiver.lexeme(), element_ty.clone()) {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: msg,
+                        span: receiver.span,
+                    });
+                }
+                CHAN_RECV_TYPES.with(|map| {
+                    map.borrow_mut().insert(op_span.start, element_ty.clone());
+                });
+                Some(element_ty)
+            }
+            Expr::Close { channel, keyword } => {
+                let channel_ty = self.check_expression(channel);
+                if let Some(other) = channel_ty
+                    && !matches!(&other, Ty::Chan(_))
+                {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: Some("only a channel can be closed".into()),
+                        message: format!("cannot close `{other}`; expected a channel"),
+                        span: *keyword,
+                    });
+                }
+                Some(Ty::Void)
+            }
             Expr::View {
                 target,
                 mutable,
@@ -2398,6 +2830,81 @@ impl TypeChecker {
                     });
                 }
                 Some(Ty::Void)
+            }
+            Expr::Member { object, property }
+                if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "net")
+                    && property.lexeme() == "recv_line_async" =>
+            {
+                // Awaiting a socket read: the runtime tries the read first and
+                // parks the goroutine only when the socket has nothing pending,
+                // so a handler never holds a worker waiting on a client.
+                if arguments.len() != 1 {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: format!(
+                            "net.recv_line_async expects 1 argument (a socket), got {}",
+                            arguments.len()
+                        ),
+                        span,
+                    });
+                }
+                for argument in arguments {
+                    let _ = self.check_expression(argument);
+                }
+                Some(Ty::String)
+            }
+            Expr::Member { object, property }
+                if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "net")
+                    && property.lexeme() == "accept_async" =>
+            {
+                // Awaiting an offloaded accept: the runtime runs the blocking
+                // `accept` on the worker pool and the goroutine parks until a
+                // client socket is ready, so an accept loop never pins a
+                // worker thread.
+                if arguments.len() != 1 {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: format!(
+                            "net.accept_async expects 1 argument (a listener), got {}",
+                            arguments.len()
+                        ),
+                        span,
+                    });
+                }
+                for argument in arguments {
+                    let _ = self.check_expression(argument);
+                }
+                Some(Ty::Int)
+            }
+            Expr::Member { object, property }
+                if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "http")
+                    && property.lexeme().ends_with("_async") =>
+            {
+                // Awaiting an offloaded http future: the runtime runs the
+                // blocking request on the worker pool and the goroutine
+                // parks until the response handle is ready.
+                let expected_arity = match property.lexeme() {
+                    "get_async" | "delete_async" | "head_async" => 1,
+                    _ => 2,
+                };
+                if arguments.len() != expected_arity {
+                    self.errors.push(TypeError {
+                        code: None,
+                        help: None,
+                        message: format!(
+                            "http.{} expects {expected_arity} argument(s), got {}",
+                            property.lexeme(),
+                            arguments.len()
+                        ),
+                        span,
+                    });
+                }
+                for argument in arguments {
+                    let _ = self.check_expression(argument);
+                }
+                Some(Ty::String)
             }
             Expr::Variable { name } => {
                 let callee_name = name.lexeme();
@@ -3247,6 +3754,9 @@ impl TypeChecker {
                     .map(|t| self.resolve_annotation(Some(t)))
                     .collect(),
             ),
+            Some(TypeAnnotation::Chan(element)) => {
+                Ty::Chan(Box::new(self.resolve_annotation(Some(element))))
+            }
             None => Ty::Any,
         }
     }
@@ -3396,6 +3906,9 @@ fn find_await(expr: &Expr) -> Option<Span> {
         Expr::Propagate { value, .. } => find_await(value),
         Expr::TupleLiteral { elements, .. } => elements.iter().find_map(find_await),
         Expr::TupleIndex { object, .. } => find_await(object),
+        Expr::ChanSend { channel, value, .. } => find_await(channel).or_else(|| find_await(value)),
+        Expr::ChanRecv { channel, .. } => find_await(channel),
+        Expr::Close { channel, .. } => find_await(channel),
     }
 }
 
@@ -3498,7 +4011,216 @@ fn find_await_in_stmt(stmt: &Stmt) -> Option<Span> {
         | Stmt::Trait { .. }
         | Stmt::Impl { .. }
         | Stmt::Use { .. } => None,
+        Stmt::ChanRecvFor { channel, body, .. } => {
+            find_await(channel).or_else(|| find_await_in_stmt(body))
+        }
+        Stmt::Go { call, block, .. } => find_await(call).or_else(|| {
+            block
+                .as_ref()
+                .and_then(|statements| statements.iter().find_map(find_await_in_stmt))
+        }),
     }
+}
+
+/// Returns `true` if a channel send/receive suspension point is reachable
+/// inside `expr`.
+fn find_chan_in_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::ChanSend { .. } | Expr::ChanRecv { .. } => true,
+        Expr::Close { channel, .. } => find_chan_in_expr(channel),
+        Expr::Binary { left, right, .. }
+        | Expr::IndexGet {
+            object: left,
+            index: right,
+        }
+        | Expr::IndexSet {
+            object: left,
+            index: right,
+            ..
+        } => find_chan_in_expr(left) || find_chan_in_expr(right),
+        Expr::Unary { right, .. }
+        | Expr::PostfixUnary { left: right, .. }
+        | Expr::Grouping {
+            expression: right, ..
+        }
+        | Expr::Member { object: right, .. }
+        | Expr::OptionalMember { object: right, .. }
+        | Expr::MemberSet { object: right, .. }
+        | Expr::Assign { value: right, .. }
+        | Expr::Spread { value: right, .. }
+        | Expr::View { target: right, .. }
+        | Expr::Copy {
+            expression: right, ..
+        }
+        | Expr::Borrow { target: right, .. }
+        | Expr::RawDeref { target: right, .. } => find_chan_in_expr(right),
+        Expr::RawDerefSet { target, value, .. } => {
+            find_chan_in_expr(target) || find_chan_in_expr(value)
+        }
+        Expr::Call {
+            callee, arguments, ..
+        } => find_chan_in_expr(callee) || arguments.iter().any(find_chan_in_expr),
+        Expr::Ternary {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            find_chan_in_expr(condition)
+                || find_chan_in_expr(then_branch)
+                || find_chan_in_expr(else_branch)
+        }
+        Expr::ObjectLiteral { properties, .. } => {
+            properties.iter().any(|p| find_chan_in_expr(&p.value))
+        }
+        Expr::ArrayLiteral { elements, .. } => elements.iter().any(find_chan_in_expr),
+        Expr::StructLiteral { fields, update, .. } => {
+            fields.iter().any(|f| find_chan_in_expr(&f.value))
+                || update.as_ref().is_some_and(|u| find_chan_in_expr(u))
+        }
+        Expr::Propagate { value, .. } | Expr::TupleIndex { object: value, .. } => {
+            find_chan_in_expr(value)
+        }
+        Expr::TupleLiteral { elements, .. } => elements.iter().any(find_chan_in_expr),
+        _ => false,
+    }
+}
+
+/// Returns the `op_span` of a direct channel send/receive, else the span of
+/// the outermost expression if a nested channel op is reachable.
+fn chan_op_span(expr: &Expr) -> Option<Span> {
+    match expr {
+        Expr::ChanSend { op_span, .. } | Expr::ChanRecv { op_span, .. } => Some(*op_span),
+        _ if find_chan_in_expr(expr) => Some(expr.span()),
+        _ => None,
+    }
+}
+
+/// Returns the span of the first channel op reachable inside `stmt`.
+fn chan_in_stmt(stmt: &Stmt) -> Option<Span> {
+    match stmt {
+        Stmt::Expression { expression }
+        | Stmt::Var {
+            initializer: Some(expression),
+            ..
+        }
+        | Stmt::Return {
+            value: Some(expression),
+            ..
+        }
+        | Stmt::Destructure {
+            initializer: expression,
+            ..
+        } => (find_chan_in_expr(expression)).then(|| expression.span()),
+        Stmt::Say { expression, .. } => find_chan_in_expr(expression).then(|| expression.span()),
+        Stmt::Block { statements, .. } => statements.iter().find_map(chan_in_stmt),
+        Stmt::If {
+            condition,
+            then_branch,
+            elif_branches,
+            else_branch,
+        } => (find_chan_in_expr(condition))
+            .then(|| condition.span())
+            .or_else(|| {
+                chan_in_stmt(then_branch).or_else(|| {
+                    elif_branches
+                        .iter()
+                        .find_map(|b| {
+                            (find_chan_in_expr(&b.condition))
+                                .then(|| b.condition.span())
+                                .or_else(|| chan_in_stmt(&b.body))
+                        })
+                        .or_else(|| else_branch.as_ref().and_then(|b| chan_in_stmt(b)))
+                })
+            }),
+        Stmt::While { condition, body } | Stmt::DoWhile { condition, body } => {
+            (find_chan_in_expr(condition))
+                .then(|| condition.span())
+                .or_else(|| chan_in_stmt(body))
+        }
+        Stmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => init
+            .as_ref()
+            .and_then(|i| chan_in_stmt(i))
+            .or_else(|| condition.as_ref().and_then(chan_in_expr_stmt))
+            .or_else(|| update.as_ref().and_then(chan_in_expr_stmt))
+            .or_else(|| chan_in_stmt(body)),
+        Stmt::ForIn { iterable, body, .. } => (find_chan_in_expr(iterable))
+            .then(|| iterable.span())
+            .or_else(|| chan_in_stmt(body)),
+        Stmt::ForAwait { producer, body, .. } => (find_chan_in_expr(producer))
+            .then(|| producer.span())
+            .or_else(|| chan_in_stmt(body)),
+        Stmt::Match {
+            expression,
+            cases,
+            default_case,
+        } => (find_chan_in_expr(expression))
+            .then(|| expression.span())
+            .or_else(|| {
+                cases
+                    .iter()
+                    .flat_map(|case| [&case.value])
+                    .find_map(|v| find_chan_in_expr(v).then(|| v.span()))
+                    .or_else(|| {
+                        cases.iter().find_map(|case| {
+                            case.guard
+                                .as_ref()
+                                .and_then(|g| find_chan_in_expr(g).then(|| g.span()))
+                                .or_else(|| chan_in_stmt(&case.body))
+                        })
+                    })
+                    .or_else(|| default_case.as_ref().and_then(|b| chan_in_stmt(b)))
+            }),
+        Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Return { .. } | Stmt::Var { .. } => None,
+        Stmt::Try {
+            try_block,
+            catch_block,
+            finally_block,
+            ..
+        } => chan_in_stmt(try_block)
+            .or_else(|| catch_block.as_ref().and_then(|b| chan_in_stmt(b)))
+            .or_else(|| finally_block.as_ref().and_then(|b| chan_in_stmt(b))),
+        Stmt::Throw { value } => find_chan_in_expr(value).then(|| value.span()),
+        Stmt::Retry {
+            count,
+            body,
+            catch_block,
+            ..
+        } => (find_chan_in_expr(count))
+            .then(|| count.span())
+            .or_else(|| chan_in_stmt(body))
+            .or_else(|| catch_block.as_ref().and_then(|b| chan_in_stmt(b))),
+        Stmt::Unsafe { body } => chan_in_stmt(body),
+        Stmt::Quiet { body, .. } => chan_in_stmt(body),
+        Stmt::Function { .. }
+        | Stmt::AsyncFunction { .. }
+        | Stmt::Test { .. }
+        | Stmt::Class { .. }
+        | Stmt::Enum { .. }
+        | Stmt::TypeAlias { .. }
+        | Stmt::Trait { .. }
+        | Stmt::Impl { .. }
+        | Stmt::Use { .. } => None,
+        Stmt::ChanRecvFor { channel, body, .. } => (find_chan_in_expr(channel))
+            .then(|| channel.span())
+            .or_else(|| chan_in_stmt(body)),
+        Stmt::Go { call, block, .. } => {
+            (find_chan_in_expr(call)).then(|| call.span()).or_else(|| {
+                block
+                    .as_ref()
+                    .and_then(|statements| statements.iter().find_map(chan_in_stmt))
+            })
+        }
+    }
+}
+
+/// Helper for `chan_in_stmt` on a condition expression.
+fn chan_in_expr_stmt(expr: &Expr) -> Option<Span> {
+    find_chan_in_expr(expr).then(|| expr.span())
 }
 
 /// Child statements of a statement, for validating async return
@@ -3566,6 +4288,124 @@ mod tests {
     use super::*;
     use ntsc_lexer::tokenize;
     use ntsc_parser::parse;
+
+    // ── go: callable, thread-boundary args, capture classification ───────
+
+    #[test]
+    fn go_requires_an_async_fn_call_or_block() {
+        let errors =
+            check_source("fun helper() { }\nasync fun main() { go helper() }").unwrap_err();
+        assert!(
+            errors.iter().any(|e| e
+                .message
+                .contains("`go` requires a call to an async function")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_accepts_an_async_fn_call() {
+        check_source("async fun worker(int n) { say(\"w\") }\nasync fun main() { go worker(1) }")
+            .expect("an async fn call is a legal go spawn");
+    }
+
+    #[test]
+    fn go_rejects_view_argument() {
+        let errors = check_source(
+            "async fun worker(string s) { }\nasync fun main() { var string msg = \"hi\"\n view var v = msg\n go worker(v) }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("a view cannot cross into a goroutine")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_rejects_shared_argument() {
+        let errors = check_source(
+            "async fun worker(shared string s) { }\nasync fun main() { shared string g = \"hi\"\n go worker(g) }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("unsynchronized reference counting")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_rejects_view_capture() {
+        let errors = check_source(
+            "async fun main() { var string msg = \"hi\"\n view var v = msg\n go { say(v) } }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("cannot capture view `v`")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_rejects_shared_capture() {
+        let errors = check_source("async fun main() { shared string g = \"hi\"\n go { say(g) } }")
+            .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("cannot capture shared `g`")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn go_scalar_and_channel_captures_are_allowed() {
+        check_source(
+            "async fun main() { var chan[string] words = chan.new(2)\n var int base = 40\n go { say(\"capture \" + base) }\n go { for w in words { say(w) } }\n await async.sleep(1) }",
+        )
+        .expect("scalar and channel captures are safe");
+    }
+
+    #[test]
+    fn go_owned_capture_moves_out_of_the_caller() {
+        let errors = check_source(
+            "async fun main() { var string msg = \"hi\"\n go { say(msg) }\n say(msg) }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("use of moved value: `msg`")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn channel_send_moves_the_value() {
+        let errors = check_source(
+            "async fun main() { var chan[string] ch = chan.new(1)\n var string m = \"x\"\n m |> ch\n say(m) }",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("use of moved value: `m`")),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn channel_receive_binds_an_owned_receiver() {
+        check_source(
+            "async fun main() { var chan[string] ch = chan.new(2)\n \"ping\" |> ch\n x <| ch\n say(x) }",
+        )
+        .expect("a receive binds a fresh owned receiver");
+    }
 
     fn check_source(source: &str) -> Result<(), Vec<TypeError>> {
         let tokens = tokenize(source);
@@ -4339,8 +5179,8 @@ mod tests {
     fn an_unannotated_or_method_member_stays_unchecked() {
         assert!(
             check_source(
-                "class Box { var thing = nil\n fun go() -> void { } }\n\
-                 fun f() { var b = Box()\n var string s = b.thing\n var x = b.go }"
+                "class Box { var thing = nil\n fun run() -> void { } }\n\
+                 fun f() { var b = Box()\n var string s = b.thing\n var x = b.run }"
             )
             .is_ok()
         );
@@ -4353,5 +5193,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn channel_send_and_recv_are_allowed_as_top_level_async_statements() {
+        assert!(
+            check_source("async fun f(chan[int] c) {\n    5 |> c\n    x <| c\n}").is_ok(),
+            "top-level channel send/recv in an async body should type-check"
+        );
+    }
+
+    #[test]
+    fn channel_send_inside_control_flow_is_rejected() {
+        let errors = check_source(
+            "async fun f(chan[int] c) {\n    while (true) {\n        5 |> c\n    }\n}",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("inside control flow")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn channel_send_in_sync_function_is_rejected() {
+        let errors = check_source("fun f(chan[int] c) {\n    5 |> c\n}").unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("only allowed inside an async function")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn channel_recv_in_sync_function_is_rejected() {
+        let errors = check_source("fun f(chan[int] c) {\n    x <| c\n}").unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("only allowed inside an async function")),
+            "{errors:?}"
+        );
     }
 }

@@ -36,6 +36,11 @@ pub enum TokenKind {
     PlusPlus,
     MinusMinus,
 
+    /// `|>` — channel receive (`value |> chan`).
+    PipeGreater,
+    /// `<|` — channel send (`chan <| value`).
+    LessPipe,
+
     AndSym,
 
     OrSym,
@@ -115,6 +120,10 @@ pub enum TokenKind {
 
     Copy,
     Own,
+
+    Go,
+    Chan,
+    Close,
 
     TypeInt,
     TypeFloat,
@@ -204,6 +213,9 @@ impl TokenKind {
             TokenKind::Shared => Some("shared"),
             TokenKind::Copy => Some("copy"),
             TokenKind::Own => Some("own"),
+            TokenKind::Go => Some("go"),
+            TokenKind::Chan => Some("chan"),
+            TokenKind::Close => Some("close"),
             TokenKind::TypeInt => Some("int"),
             TokenKind::TypeFloat => Some("float"),
             TokenKind::TypeString => Some("string"),

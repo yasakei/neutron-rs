@@ -70,6 +70,22 @@ pub enum Stmt {
         body: Box<Stmt>,
     },
 
+    /// `for v in chan { ... }` — receive from a channel until it is closed
+    /// (each iteration binds the received element to `variable`).
+    ChanRecvFor {
+        variable: Token,
+        channel: Expr,
+        body: Box<Stmt>,
+    },
+
+    /// `go worker(args)` / `go { ... }` — spawn a virtual goroutine on the
+    /// task scheduler, running the call (or the inline `block`) concurrently.
+    Go {
+        call: Expr,
+        block: Option<Vec<Stmt>>,
+        keyword_span: Span,
+    },
+
     Function {
         name: Token,
         generic_params: Vec<GenericParam>,

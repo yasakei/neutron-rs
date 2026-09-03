@@ -225,6 +225,19 @@ bundled CA root certificates.
 | `http.download_with_progress(url, dest, chunk_size)` | `string` | Downloads in chunks. Returns JSON with status, bytes, and chunk count. Throws on failure. |
 | `http.concurrent_download(urls, dest, max_parallel)` | `string` | Downloads multiple URLs in parallel. Returns JSON with per-URL results. Throws on failure. |
 
+The `_async` variants run the blocking request on a worker-thread pool and
+hand back a future: `await` parks the calling goroutine without tying up a
+scheduler thread, so many fetches can overlap on few threads.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `http.get_async(url)` | `string` | Awaitable GET; response JSON (`status`, `body`). |
+| `http.post_async(url, data)` | `string` | Awaitable POST. |
+| `http.put_async(url, data)` | `string` | Awaitable PUT. |
+| `http.delete_async(url)` | `string` | Awaitable DELETE. |
+| `http.head_async(url)` | `string` | Awaitable HEAD. |
+| `http.patch_async(url, data)` | `string` | Awaitable PATCH. |
+
 ## Collections
 
 ### Sets
@@ -366,21 +379,34 @@ when given one of these handles.
 ## Networking
 
 Sockets are integer handles. `net.tcp_connect` throws on connection failure.
+Every connected stream has `TCP_NODELAY` enabled (matching Go's default), so a
+small response is not delayed waiting for an ACK.
 
 | Function | Returns | Behavior |
 | --- | --- | --- |
 | `net.tcp_connect(host, port)` | `int` | Connects; returns a socket. |
 | `net.tcp_listen(port)` | `int` | Listens; port `0` picks an ephemeral port. |
 | `net.local_port(handle)` | `int` | Bound port of a listener. |
-| `net.tcp_accept(listener)` | `int` | Accepts a connection. |
+| `net.tcp_accept(listener)` | `int` | Accepts a connection (blocks the calling thread). |
 | `net.send(handle, data)` | `int` | Sends bytes. |
 | `net.send_line(handle, data)` | `int` | Sends a line. |
 | `net.recv(handle, count)` | `string` | Receives up to `count` bytes. |
-| `net.recv_line(handle)` | `string` | Receives a line. |
+| `net.recv_line(handle)` | `string` | Receives a line (blocks the calling thread). |
 | `net.close(handle)` | `bool` | Closes a socket. |
 | `net.udp_bind(port)` | `int` | Binds a UDP socket. |
 | `net.udp_send(handle, host, port, data)` | `int` | Sends a datagram. |
 | `net.udp_recv(handle, count)` | `string` | Receives a datagram. |
+
+The awaitable variants park the goroutine on the reactor instead of holding a
+thread: each poll tries a non-blocking accept/read first, and the goroutine
+sleeps on socket readiness until a client connects or bytes arrive. Because
+nothing is queued to a worker pool, one accept loop can serve an unbounded
+rate of connections, and slow clients never pin a scheduler thread.
+
+| Function | Returns | Behavior |
+| --- | --- | --- |
+| `net.accept_async(listener)` | `int` | Awaitable accept; completes with the client socket. |
+| `net.recv_line_async(sock)` | `string` | Awaitable line read; `""` at end of stream. |
 
 ## Operating system
 
@@ -542,6 +568,13 @@ a plain load or store.
 | `process.spawn_thread(body, arg)` | `int` | Starts an OS thread; returns its handle. `arg` must be thread-safe. |
 | `process.thread_join(id)` | `bool` | Waits for a thread to finish. |
 
+Inside an `async fun`, the `http.*_async` calls run on the offload pool
+instead of the calling thread: the goroutine parks until the response is
+ready, so a slow request never pins a scheduler thread. `process.exec` and
+`process.exec_output` have no awaitable variant yet — they block the calling
+thread; the runtime's offload machinery exists but the `await` front-end does
+not lower process calls.
+
 `process.spawn_thread` takes a lambda with one `int` parameter. Its payload
 must be a scalar or a stdlib handle: owned heap values, `shared` values, and
 views are rejected at compile time. See
@@ -564,7 +597,29 @@ Assertions throw on failure. The test runner also uses them.
 
 | Function | Returns | Behavior |
 | --- | --- | --- |
-| `async.sleep(ms)` | `int` | Suspends the coroutine for approximately `ms` milliseconds. |
+| `async.sleep(ms)` | `void` | Suspends the coroutine for approximately `ms` milliseconds. |
+
+`async fun`/`await` and `go`/`chan[T]` run on the same M:N task scheduler
+(one work-stealing thread pool, one reactor): goroutines and coroutines are
+the same machinery, so there is one concurrency model, not two. See the
+[concurrency guide](../guide/concurrency.md).
+
+## Goroutines and channels (built in)
+
+`go`, `chan[T]`, `close`, `<|`, and `|>` are language syntax rather than a
+module; `chan.new(capacity)` is the one constructor function:
+
+| Expression | Behavior |
+| --- | --- |
+| `go worker(args)` / `go { ... }` | Spawn a goroutine on the scheduler. Arguments and captures are classified by the ownership checker (scalars copy, handles share, owned values move, `view`/`shared` are `NTSC-E0501`). |
+| `chan.new(capacity)` | Create a `chan[T]`; the element type comes from the annotated variable (`var chan[string] jobs = chan.new(4)`). |
+| `v \|> ch` | Send: moves `v` into the channel; parks while the channel is full. |
+| `v <\| ch` | Receive: binds a fresh variable owning the value; parks while empty. Top-level statement of an `async fun` only. |
+| `close(ch)` | Forbid further sends; receivers drain the queued values, then get the zero value. |
+| `for v in ch { ... }` | Receive until the channel is closed and drained. |
+
+The blocking `collections.channel` family and `process.spawn_thread` remain
+available as lower-level alternatives.
 
 ## Glob
 

@@ -1,14 +1,130 @@
 # Concurrency
 
-NTSC offers two concurrency models: OS threads with message-passing channels,
-and cooperative `async`/`await` coroutines. `async` is what the name suggests;
-threads use `process.spawn_thread` and the `collections` channel functions.
+NTSC has one concurrency model: cheap stackless goroutines multiplexed onto a
+multi-threaded work-stealing scheduler with a reactor for all I/O. `go` spawns
+a goroutine, `chan[T]` carries typed messages between them, and `await` (on
+`async fun` or the async stdlib) suspends a goroutine at an I/O point. OS
+threads (`process.spawn_thread`) remain as the escape hatch for genuinely
+blocking native work; the older `collections.channel` functions keep working.
 
-## Threads
+```
+  Goroutines (go / async)   ── thousands, cheap, stackless
+                 │
+        ┌────────┴─────────┐
+        ▼                  ▼
+  Work-stealing        Reactor (non-blocking I/O)
+  scheduler            sockets / timers / channels
+  OS-thread pool       readiness loop; never blocks a thread
+  (= CPU count)
+```
 
-`process.spawn_thread(body, arg)` starts a new OS thread. The body is a lambda
-with a single parameter; the argument is passed to it. It returns a handle
-that `process.thread_join` waits on:
+A blocked channel operation or an `await` parks the goroutine, not the thread:
+the scheduler thread picks up other work, so tens of thousands of in-flight
+I/O operations cost tens of thousands of cheap tasks — not OS threads.
+CPU-bound goroutines spread across the whole pool.
+
+## Goroutines
+
+`go worker(args)` runs an async function on the scheduler; `go { ... }` runs an
+inline block. Spawn is fire-and-forget: `go` returns nothing and never blocks
+the caller. When `main` returns, outstanding goroutines are abandoned (as in
+Go) — hand work a channel or sleep if it must finish first. Abandonment is
+leak-free: the runtime reclaims an abandoned goroutine's future at shutdown,
+releasing every registry value it still owned (strings, arrays, armed sleep
+deadlines, channel handles), so the debug leak report stays clean. There is
+no goroutine `join` in the language yet — completion is coordinated with
+channels; the runtime's join machinery exists for embedders, and it is what
+keeps a goroutine's result and uncaught exception readable until its handle
+is dropped.
+
+```ntsc
+async fun drain(chan[string] jobs) {
+    for j in jobs {
+        handle(j)
+    }
+}
+
+async fun main() -> int {
+    var chan[string] jobs = chan.new(4)
+    go drain(jobs)
+    "render" |> jobs
+    "package" |> jobs
+    close(jobs)
+    await async.sleep(50)   // give the worker time to drain
+    return 0
+}
+```
+
+Fan-out is just a loop:
+
+```ntsc
+for url in urls {
+    go download(url)
+}
+```
+
+## Channels
+
+`chan[T]` is a typed channel. The operators show the direction data moves — the arrow points where the
+value goes: `|>` pipes the value on its left into the channel on its right;
+`<|` feeds the variable on its left from the channel on its right.
+
+```ntsc
+var chan[int] jobs = chan.new(10)   // buffered channel, capacity 10
+
+value |> jobs                       // send: moves value into jobs (parks when full)
+x <| jobs                           // receive: binds fresh x from jobs (parks when empty)
+close(jobs)                         // no more sends; receivers drain, then get zero
+
+for v in jobs {                     // receive until the channel is closed and drained
+    handle(v)
+}
+```
+
+Rules:
+
+- `chan.new(capacity)` creates the channel; the element type comes from the
+  annotated variable (`var chan[string] jobs = ...`).
+- A send **moves** the value into the channel: the sender cannot use it
+  afterwards (using it is `NTSC-E0501`). There is no alias and no double free.
+- A receive binds a fresh variable that owns the value and frees it at scope
+  exit.
+- Sends and receives are legal only as statements at the top level of an
+  `async fun` body (they are suspension points, like `await`); a blocked
+  operation parks the goroutine instead of the thread.
+- `close(ch)` forbids further sends. Values already queued are still received;
+  when the buffer is drained, receives complete with the zero value and
+  `for v in ch` exits.
+- A channel handle may be passed to `go` (and moved through channels) freely:
+  the handle is shared and the channel state lives behind the runtime's lock.
+
+## Memory safety across goroutines
+
+There is no `unsafe`, no interior aliasing, no manual memory anywhere. The
+ownership checker classifies every value that crosses into a goroutine —
+arguments to `go fn(...)` and free variables captured by `go { ... }` — with
+the same total rules used for `process.spawn_thread`:
+
+| Value crossing into a goroutine | What happens | Why it is safe |
+| --- | --- | --- |
+| Scalars (`int`, `float`, `bool`) | Copied | The goroutine shares nothing with the spawner. |
+| Safe handles (channels, files, sockets, threads) | Shared | The resource lives in the mutex-guarded runtime registry; the handle itself is an `int`. The spawner keeps ownership and stays free to use the channel. |
+| Function references | Copied | Code is immutable; a lambda captures nothing. |
+| Owned heap values (`string`, `array`, `object`, class instances) | **Moved** | The value's owning slot is transferred into the goroutine's future; the caller cannot use it afterwards (`NTSC-E0501`), so there is exactly one owner while the goroutine runs and it is freed once at the end. |
+| `view` / `view mut` | **Rejected** (`NTSC-E0501`) | A borrow may outlive the spawner's frame; a goroutine cannot hold one. Move or copy the value instead. |
+| `shared` | **Rejected** (`NTSC-E0501`) | The reference count is not synchronized across threads; copies would race on both the value and its count. Send the data through a channel instead. |
+
+For `ch <| v` the value moves into the channel; for `v |> ch` it moves out to
+the receiver — at every instant a value crossing a channel has exactly one
+owner.
+
+## OS threads
+
+`process.spawn_thread(body, arg)` starts a real OS thread — the escape hatch
+for long-running native work, FFI, or tight loops that should not be
+preempted. The body is a lambda with a single parameter; the argument crosses
+the thread boundary under the same classification table as above, and the
+handle that `process.thread_join` waits on:
 
 ```ntsc
 var tx = collections.channel_sender(rx)
@@ -21,49 +137,34 @@ var producer = process.spawn_thread(fun(int tx) {
 process.thread_join(producer)
 ```
 
-### Channels
+A goroutine is not an OS thread: prefer `go` for concurrency, and reach for
+`spawn_thread` only when something must genuinely block a core.
 
-Channels are message queues with a bounded capacity. Handles are integers.
-`collections.channel(capacity)` creates a queue and returns the receiver;
-`collections.channel_sender(rx)` creates the matching sender:
+### The legacy `collections.channel` family
 
-```ntsc
-var rx = collections.channel(4)
-var tx = collections.channel_sender(rx)
-```
+`collections.channel(capacity)`, `channel_sender`, `channel_send`,
+`channel_recv`, `channel_try_recv`, and `channel_close` still work for
+OS-thread code (they copy string messages and block the calling thread).
+New goroutine code should use `chan[T]`, which is typed and parks instead of
+blocking.
 
-- `collections.channel_send(tx, msg)` blocks until space is available. The
-  message is a string: the runtime copies its text into the queue, so the
-  sender keeps its own value and the receiver gets independent data.
-- `collections.channel_recv(rx)` blocks until a message arrives.
-- `collections.channel_try_recv(rx)` checks without blocking: it returns the
-  pending message, or the empty string when the queue is empty or every sender
-  end is closed.
-- `collections.channel_close(handle)` closes a queue end.
+### Scaling benchmarks
 
-Every handle must eventually be closed.
+`benchmarks/run_concurrency.py` measures the worker pool directly: 10k–100k
+goroutines on a fixed pool, CPU fan-out across cores, blocked-on-`sleep`
+goroutines freeing workers, and concurrent HTTP fan-out — each side by side
+with the equivalent Go goroutine program. Results land in
+`benchmarks/results_concurrency.md`.
 
 ### Threading rules
 
-NTSC has no `Send`/`Sync` traits to implement. Instead the compiler classifies
-every value it hands to another thread, and the classification is total — there
-is nothing to opt into and no escape hatch. A value crosses a thread boundary
-when it is an argument to `process.spawn_thread` (the payload) or to
-`collections.channel_send` (the message).
-
-| Value | Crosses a thread boundary? | Why |
-| --- | --- | --- |
-| `int`, `float`, `bool` and other scalars | Yes | Copied by value; the two threads share nothing. |
-| Stdlib handles (channels, files, sockets, threads) | Yes | A handle is an `int`. The resource behind it lives in the runtime registry, which is mutex-guarded, so concurrent access is synchronized. |
-| Function references | Yes | Code is immutable, and a lambda cannot capture anything, so a function value carries no state. |
-| Owned heap values (`string`, `array`, `object`, class instances) | Through a channel only | `collections.channel_send` copies the text across, so each side owns independent data. `process.spawn_thread` does not: the payload would arrive as a raw handle that both threads alias without synchronization, and the caller's scope exit would free it while the thread is still running. |
-| `shared` values | No | The reference count is not synchronized, so two threads holding copies would race on both the value and its count. Send the data through a channel instead. |
-| `view` / `view mut` | No | A borrow lives only as long as the borrowing scope, which does not have to outlive the thread that receives it. |
-
-So the supported shape is the one in the example above: create the channel in
-the parent, pass only the channel handle to `process.spawn_thread`, and move
-the data itself through `collections.channel_send`. Violations are ownership
-errors (`NTSC-E0501`) reported at compile time:
+NTSC has no `Send`/`Sync` traits to implement. The compiler classifies every
+value handed to another thread, and the classification is total — there is
+nothing to opt into and no escape hatch. A value crosses a thread boundary
+when it is an argument to `go`, a capture of a `go { ... }` block, an argument
+to `process.spawn_thread` (the payload), or the message of
+`collections.channel_send`. The table above is that classification;
+violations are ownership errors (`NTSC-E0501`) reported at compile time:
 
 ```ntsc
 fun main() {
@@ -77,18 +178,20 @@ fun main() {
 
 A user-defined type is thread-safe exactly when its values are: a class
 instance is an owned heap value, so it follows that row of the table. There is
-no way to declare otherwise, which is why the rules above are exhaustive.
+no way to declare otherwise, which is why the rules are exhaustive.
 
-`await` is not a thread boundary. The executor polls every future on one
-thread, so a suspension never moves a value between threads and values that
-cannot cross threads are still free to live across an `await`.
+`await` is not a thread boundary between goroutines: a suspension parks the
+current goroutine and the scheduler resumes it (possibly on a different
+worker), but values live in the goroutine's own future the whole time. Values
+that cannot cross into a `go` are still free to live across an `await` in the
+goroutine that owns them.
 
 ## Async / await
 
-An `async fun` is a coroutine that can suspend at `await` points and resume
-later. The compiler lowers it to a poll-based state machine driven by a
-single-threaded runtime executor; a suspension yields the thread, so async
-code is safe to use alongside threads.
+An `async fun` is a coroutine that suspends at `await` points and resumes
+later. Goroutines and async futures are the same machinery: `async fun main`
+runs as the root goroutine on the scheduler, and `await` parks the current
+goroutine until the awaited future completes.
 
 ```ntsc
 async fun fetch(string url) -> string {
@@ -97,9 +200,6 @@ async fun fetch(string url) -> string {
 }
 
 async fun main() -> int {
-    var n = 1
-    await async.sleep(1)
-    n = n + 1
     var first = await fetch("a")
     var second = await fetch("b")
     say(first)
@@ -123,9 +223,56 @@ async fun main() -> int {
 
 ### The `async` module
 
-`async.sleep(ms)` is the one suspending function. It pauses the coroutine for
-approximately `ms` milliseconds: the future reports "pending" until the
-deadline passes, and the executor re-polls it on a millisecond quantum.
+`async.sleep(ms)` pauses the coroutine for approximately `ms` milliseconds:
+the future reports "pending" until the deadline passes, and the scheduler
+re-polls it on a millisecond quantum.
+
+### Awaitable I/O
+
+Blocking stdlib calls have awaitable variants that free the scheduler thread
+while the goroutine waits. They come in two flavors:
+
+- **Reactor-backed** (`net.accept_async`, `net.recv_line_async`): the wait is
+  an I/O readiness wait handled by the reactor. Each poll tries a
+  non-blocking syscall first, and the goroutine parks on socket readiness
+  until a client connects or bytes arrive. A server built this way serves any
+  number of slow clients on a fixed thread pool.
+- **Offloaded** (`http.*_async`): the blocking request runs on a bounded
+  worker-thread pool, and the calling goroutine parks until the result is
+  ready.
+
+```ntsc
+use net
+use fmt
+
+async fun handle_client(int sock) {
+    var string line = await net.recv_line_async(sock)
+    net.send_line(sock, "ok:" + fmt.i64_to_str(fmt.to_int(line) + 1))
+    net.close(sock)
+}
+
+async fun accept_loop(int listener) {
+    var int sock = await net.accept_async(listener)
+    go handle_client(sock)
+    go accept_loop(listener)   // keep accepting while this client is handled
+}
+
+async fun main() -> int {
+    var int listener = net.tcp_listen(8080)
+    say("listening on " + fmt.i64_to_str(net.local_port(listener)))
+    go accept_loop(listener)
+    await async.sleep(60000)   // serve for a while, then exit
+    net.close(listener)
+    return 0
+}
+```
+
+`http.get_async` offloads the request to the pool the same way, so a
+goroutine waiting on a response never holds a scheduler thread hostage:
+
+```ntsc
+var resp = await http.get_async("https://example.com/")
+```
 
 ### Inline async blocks
 
@@ -145,6 +292,9 @@ async fun main() -> int {
 
 An inline `async { ... }` block compiles to an anonymous future. It cannot
 take parameters and must have a consistent return type across all paths.
+A `go { ... }` block is the same machinery spawned onto the scheduler instead
+of awaited; unlike an inline async block, it captures the local variables it
+references (moved or shared per the table above).
 
 ### `for await`
 

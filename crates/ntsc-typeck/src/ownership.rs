@@ -35,6 +35,7 @@ use ntsc_ast::stmt::{Program, Stmt};
 use ntsc_ast::types::TypeAnnotation;
 
 use crate::resolve::TypeError;
+use crate::ty::Ty;
 
 /// How a value of a given type behaves under assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,11 @@ enum ValueKind {
     /// Explicitly shared (refcounted) heap values — copied, never moved.
     /// Aliasing is the point of `shared`, so copies are always permitted.
     Shared,
+
+    /// A channel handle — reference counted like `Shared`, so copying it is
+    /// what `var b = a` and `go f(ch)` do, but unlike `shared` its count is
+    /// synchronized, so a copy may cross into a goroutine.
+    Chan,
 
     /// Function/closure references — immutable, copyable.
     Function,
@@ -182,6 +188,11 @@ pub struct OwnershipChecker {
     /// scope exits do not revive or poison the wrong variable.
     moved: HashMap<String, Vec<usize>>,
 
+    /// Nesting depth of `go` statements whose call is being checked: a
+    /// `go` call's arguments are shared with the goroutine (handles stay
+    // usable in the caller) instead of moved into the callee.
+    go_depth: usize,
+
     /// Shared views live in the current statement: name → (count, origin).
     statement_views: HashMap<String, (usize, Span)>,
 
@@ -224,6 +235,7 @@ impl OwnershipChecker {
             contents: vec![HashMap::new()],
             class_fields: HashMap::new(),
             moved: HashMap::new(),
+            go_depth: 0,
             statement_views: HashMap::new(),
             statement_mut_views: HashMap::new(),
             held_views: Vec::new(),
@@ -965,6 +977,44 @@ impl OwnershipChecker {
                 self.check_stmt(body);
                 self.pop_scope();
             }
+            Stmt::ChanRecvFor {
+                variable,
+                channel,
+                body,
+            } => {
+                let _ = self.check_expr(channel);
+                self.push_scope();
+                self.define_kind(variable.lexeme(), ValueKind::Heap);
+                self.check_stmt(body);
+                self.pop_scope();
+            }
+            Stmt::Go {
+                call,
+                block,
+                keyword_span,
+            } => {
+                self.go_depth += 1;
+                let _ = self.check_expr(call);
+                self.go_depth -= 1;
+                if let Some(block) = block {
+                    self.push_scope();
+                    self.check_sequence(block);
+                    self.pop_scope();
+                    // Owned (non-channel) captures move into the goroutine's
+                    // future: the caller cannot use them afterwards. Capture
+                    // types come from the typed pass via the GO_CAPTURES
+                    // bridge; channels stay shared (the spawner keeps
+                    // ownership of the registry handle), scalars are copied.
+                    for (name, ty) in crate::resolve::go_captures(keyword_span.start) {
+                        if matches!(
+                            ty,
+                            Ty::String | Ty::Array(_) | Ty::Object | Ty::Class(_) | Ty::Own(_)
+                        ) {
+                            self.move_heap_value(&name, *keyword_span, "go capture");
+                        }
+                    }
+                }
+            }
             Stmt::Return { value } => {
                 if let Some(expr) = value {
                     let _ = self.check_expr(expr);
@@ -1400,8 +1450,10 @@ impl OwnershipChecker {
                 }
                 let target_kind = self.lookup_kind(name.lexeme());
 
-                if matches!(target_kind, Some(ValueKind::Heap | ValueKind::Shared))
-                    && self.is_viewed(name.lexeme()).is_some()
+                if matches!(
+                    target_kind,
+                    Some(ValueKind::Heap | ValueKind::Shared | ValueKind::Chan)
+                ) && self.is_viewed(name.lexeme()).is_some()
                 {
                     self.error(
                         format!("cannot assign to `{}` while it is viewed", name.lexeme()),
@@ -1495,6 +1547,29 @@ impl OwnershipChecker {
                     self.check_stmt(stmt);
                 }
                 self.pop_scope();
+                None
+            }
+            Expr::ChanSend { channel, value, .. } => {
+                let _ = self.check_expr(channel);
+                let _ = self.check_expr(value);
+                // Sending moves the value into the channel; the sender can no
+                // longer use it.
+                if let Expr::Variable { name } = &**value {
+                    self.move_heap_value(name.lexeme(), value.span(), "channel send");
+                }
+                None
+            }
+            Expr::ChanRecv {
+                receiver, channel, ..
+            } => {
+                let _ = self.check_expr(channel);
+                // The received element is owned by the receiver and freed once
+                // at scope exit.
+                self.define_kind(receiver.lexeme(), ValueKind::Heap);
+                Some(ValueKind::Heap)
+            }
+            Expr::Close { channel, .. } => {
+                let _ = self.check_expr(channel);
                 None
             }
             Expr::View {
@@ -1734,7 +1809,10 @@ impl OwnershipChecker {
     }
 
     fn is_borrowable_kind(&self, kind: Option<ValueKind>) -> bool {
-        matches!(kind, Some(ValueKind::Heap | ValueKind::Shared))
+        matches!(
+            kind,
+            Some(ValueKind::Heap | ValueKind::Shared | ValueKind::Chan)
+        )
     }
 
     fn check_call(
@@ -1845,6 +1923,9 @@ impl OwnershipChecker {
                     .lookup_kind(name.lexeme())
                     .unwrap_or(ValueKind::Unknown);
                 match (arg_value_kind, param_kind) {
+                    (ValueKind::Heap, ParamKind::Owned) if self.go_depth > 0 => {
+                        self.register_view(name.lexeme(), ViewKind::Shared, name.span);
+                    }
                     (ValueKind::Heap, ParamKind::Owned) => {
                         self.move_value(name.lexeme(), name.span, "argument");
                     }
@@ -2014,6 +2095,9 @@ fn kind_of_annotation(annotation: &TypeAnnotation) -> ValueKind {
         TypeAnnotation::Dyn(_) | TypeAnnotation::ImplTrait(_) => ValueKind::Heap,
         // Tuples are stack-allocated value types.
         TypeAnnotation::Tuple(_) => ValueKind::Scalar,
+        // A channel handle is reference counted: a copy is a new reference,
+        // never a move, so both the spawner and the goroutine can use it.
+        TypeAnnotation::Chan(_) => ValueKind::Chan,
     }
 }
 
@@ -2047,6 +2131,9 @@ fn root_source(expr: Option<&Expr>) -> Option<&ntsc_ast::token::Token> {
 fn thread_unsafe_reason(kind: ValueKind, heap: HeapPolicy) -> Option<&'static str> {
     match kind {
         ValueKind::Scalar | ValueKind::Function | ValueKind::Unknown => None,
+        // A channel handle is exactly what is meant to cross a thread
+        // boundary: its reference count is synchronized.
+        ValueKind::Chan => None,
         ValueKind::Heap => match heap {
             HeapPolicy::Copies => None,
             HeapPolicy::Rejects(reason) => Some(reason),
@@ -2116,7 +2203,7 @@ fn deep_stmt_uses(stmt: &Stmt) -> HashSet<String> {
     uses
 }
 
-fn collect_stmt_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
+pub(crate) fn collect_stmt_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
     match stmt {
         Stmt::Var { initializer, .. } => {
             if let Some(init) = initializer {
@@ -2174,6 +2261,18 @@ fn collect_stmt_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
         Stmt::ForAwait { producer, body, .. } => {
             collect_expr_uses(producer, uses);
             collect_stmt_uses(body, uses);
+        }
+        Stmt::ChanRecvFor { channel, body, .. } => {
+            collect_expr_uses(channel, uses);
+            collect_stmt_uses(body, uses);
+        }
+        Stmt::Go { call, block, .. } => {
+            collect_expr_uses(call, uses);
+            if let Some(block) = block {
+                for stmt in block {
+                    collect_stmt_uses(stmt, uses);
+                }
+            }
         }
         Stmt::Return { value } => {
             if let Some(value) = value {
@@ -2240,7 +2339,7 @@ fn collect_stmt_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
     }
 }
 
-fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
+pub(crate) fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
     match expr {
         Expr::Variable { name } => {
             uses.insert(name.lexeme().to_string());
@@ -2272,6 +2371,17 @@ fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
                 collect_stmt_uses(stmt, uses);
             }
         }
+        Expr::ChanSend { channel, value, .. } => {
+            collect_expr_uses(channel, uses);
+            collect_expr_uses(value, uses);
+        }
+        Expr::ChanRecv {
+            receiver, channel, ..
+        } => {
+            collect_expr_uses(channel, uses);
+            uses.insert(receiver.lexeme().to_string());
+        }
+        Expr::Close { channel, .. } => collect_expr_uses(channel, uses),
         Expr::Assign { name, value } => {
             uses.insert(name.lexeme().to_string());
             collect_expr_uses(value, uses);

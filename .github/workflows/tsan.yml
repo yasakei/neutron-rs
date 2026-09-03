@@ -1,0 +1,33 @@
+name: Scheduler ThreadSanitizer
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "27 3 * * 0"
+
+jobs:
+  scheduler-tsan:
+    name: scheduler stress (TSAN)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-Z sanitizer=thread"
+      TSAN_OPTIONS: halt_on_error=1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      # Build the standard library with the sanitizer and repeat the
+      # high-fan-out channel test so scheduler races have time to surface.
+      - name: Run scheduler stress test
+        run: |
+          for round in $(seq 1 8); do
+            cargo +nightly test -p ntsc-runtime --lib \
+              scheduler_stress_handles_concurrent_channel_handoffs \
+              -Zbuild-std --target x86_64-unknown-linux-gnu -- \
+              --test-threads=1
+          done

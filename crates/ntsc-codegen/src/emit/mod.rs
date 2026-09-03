@@ -244,6 +244,12 @@ pub(crate) struct FunctionContext<'ctx, 'm> {
     /// names. Populated during async poll emission for standalone blocks and
     /// `wait_any`/`wait_all` argument resolution.
     pub(crate) block_span_to_name: Option<HashMap<usize, String>>,
+
+    /// The annotated slot type of a `var` initializer currently being
+    /// emitted, if any. `chan.new` reads it to size the channel's
+    /// element-ownership flag; it must be reset right after the initializer
+    /// is emitted.
+    pub(crate) expected_ty: Option<Ty>,
 }
 
 impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
@@ -278,6 +284,7 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
             owned_slots: HashSet::new(),
             shadowed_owned_slots: Vec::new(),
             block_span_to_name: None,
+            expected_ty: None,
         }
     }
 
@@ -536,6 +543,7 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
                 | Ty::String
                 | Ty::Object
                 | Ty::Shared(_)
+                | Ty::Chan(_)
                 | Ty::Option(_)
                 | Ty::Result { .. }
                 | Ty::Pointer
@@ -555,7 +563,9 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
     /// and result slots *are* nulled: both are owned cells, so a move that
     /// left the slot intact would let both the destination and this scope's
     /// exit free the same cell. A `dyn` fat pointer owns its header, so it
-    /// is nulled on move for the same reason.
+    /// is nulled on move for the same reason. A `chan` slot holds one
+    /// reference of a counted handle: `return ch` hands that reference to
+    /// the caller, so the slot must not release it again.
     fn null_var_slot(&mut self, name: &str) {
         if let Some((ptr, ty)) = self.lookup_var(name)
             && matches!(
@@ -563,6 +573,7 @@ impl<'ctx, 'm> FunctionContext<'ctx, 'm> {
                 Ty::Array(_)
                     | Ty::String
                     | Ty::Object
+                    | Ty::Chan(_)
                     | Ty::Option(_)
                     | Ty::Dyn(_)
                     | Ty::Result { .. }

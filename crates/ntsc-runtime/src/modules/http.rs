@@ -248,6 +248,109 @@ pub extern "C" fn ntsc_http_request(method: i64, url: i64, data: i64) -> i64 {
     }
 }
 
+// ── Offloaded (async) HTTP ─────────────────────────────────────────────
+//
+// Async variants run the blocking HTTP request on the worker pool instead of
+// the scheduler thread, mirroring the process offload. The pool job returns a
+// `Result<String, String>` (the JSON response vs the error message), which
+// the result ABI delivers as a value or a throw once reaped.
+
+/// Outcome of an offloaded HTTP job: the response JSON or the error message.
+pub(crate) type HttpOutcome = Result<String, String>;
+
+/// Register an offloaded HTTP future that runs `work` on the worker pool.
+fn run_http_offloaded(work: Box<dyn FnOnce() -> Result<String, String> + Send + 'static>) -> i64 {
+    registry::async_op_new(Box::new(move || registry::put_opaque(work())))
+}
+
+/// Deliver the outcome of a completed offloaded HTTP future.
+fn deliver_http(id: i64) -> i64 {
+    let outcome: HttpOutcome =
+        registry::take_opaque(registry::async_op_result(id)).unwrap_or(Err(String::new()));
+    match outcome {
+        Ok(json) => registry::put_string(json),
+        Err(message) => super::throw_str(message),
+    }
+}
+
+/// The `body` (JSON) for an HTTP reply, converting the raw request outcome.
+fn http_reply(
+    label: &'static str,
+    result: Result<(i64, String), String>,
+) -> Result<String, String> {
+    result
+        .map(|(status, body)| make_response(status, &body))
+        .map_err(|e| format!("{label}: {e}"))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_http_get(url: i64) -> i64 {
+    let url = registry::get_string(url).unwrap_or_default();
+    run_http_offloaded(Box::new(move || {
+        http_reply("http.get", http_request_raw("GET", &url, None))
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_http_post(url: i64, data: i64) -> i64 {
+    let url = registry::get_string(url).unwrap_or_default();
+    let data = registry::get_string(data).unwrap_or_default();
+    run_http_offloaded(Box::new(move || {
+        http_reply("http.post", http_request_raw("POST", &url, Some(&data)))
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_http_put(url: i64, data: i64) -> i64 {
+    let url = registry::get_string(url).unwrap_or_default();
+    let data = registry::get_string(data).unwrap_or_default();
+    run_http_offloaded(Box::new(move || {
+        http_reply("http.put", http_request_raw("PUT", &url, Some(&data)))
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_http_delete(url: i64) -> i64 {
+    let url = registry::get_string(url).unwrap_or_default();
+    run_http_offloaded(Box::new(move || {
+        http_reply("http.delete", http_request_raw("DELETE", &url, None))
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_http_patch(url: i64, data: i64) -> i64 {
+    let url = registry::get_string(url).unwrap_or_default();
+    let data = registry::get_string(data).unwrap_or_default();
+    run_http_offloaded(Box::new(move || {
+        http_reply("http.patch", http_request_raw("PATCH", &url, Some(&data)))
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_http_head(url: i64) -> i64 {
+    let url = registry::get_string(url).unwrap_or_default();
+    run_http_offloaded(Box::new(move || {
+        http_request_raw("HEAD", &url, None)
+            .map(|(status, _)| format!("{{\"status\":{}}}", status))
+            .map_err(|e| format!("http.head: {e}"))
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_http_poll(id: i64) -> i8 {
+    registry::async_op_poll(id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_http_result(id: i64) -> i64 {
+    deliver_http(id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_http_drop(id: i64) {
+    registry::async_op_drop(id);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_http_status_code(response: i64) -> i64 {
     let resp = registry::get_string(response).unwrap_or_default();
@@ -859,6 +962,24 @@ mod tests {
         let (url, server) = spawn_plain_server();
         let response = ntsc_http_get(put(&url));
         assert_eq!(read(response), "{\"status\":200,\"body\":\"ok\"}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn async_http_get_offloads_to_pool() {
+        let (url, server) = spawn_plain_server();
+        let url_handle = put(&url);
+        let fut = ntsc_async_http_get(url_handle);
+        let mut spins = 0;
+        while ntsc_async_http_poll(fut) == 0 {
+            spins += 1;
+            assert!(spins < 10_000, "offloaded http.get never completed");
+            std::thread::yield_now();
+        }
+        let response = ntsc_async_http_result(fut);
+        ntsc_async_http_drop(fut);
+        assert_eq!(read(response), "{\"status\":200,\"body\":\"ok\"}");
+        let _ = registry::take_string(url_handle);
         server.join().unwrap();
     }
 

@@ -197,6 +197,31 @@ pub enum Expr {
         index: usize,
         dot_span: Span,
     },
+
+    /// `chan << value` — send `value` into the channel (moves the value; the
+    /// sender can no longer use it). Parks the goroutine when the channel is
+    /// full.
+    ChanSend {
+        channel: Box<Expr>,
+        value: Box<Expr>,
+        op_span: Span,
+    },
+
+    /// `value >> chan` — receive the next element from the channel into
+    /// `receiver` (owned by the receiver; frees once at scope exit). The
+    /// expression's value is the received element.
+    ChanRecv {
+        receiver: Token,
+        channel: Box<Expr>,
+        op_span: Span,
+    },
+
+    /// `close(chan)` — close a channel for further sends; receivers drain
+    /// remaining buffered elements then see the zero value.
+    Close {
+        channel: Box<Expr>,
+        keyword: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -279,6 +304,17 @@ impl Expr {
             Expr::TupleIndex {
                 object, dot_span, ..
             } => object.span().to(*dot_span),
+            Expr::ChanSend {
+                channel,
+                value,
+                op_span,
+            } => channel.span().to(value.span()).to(*op_span),
+            Expr::ChanRecv {
+                receiver,
+                channel,
+                op_span,
+            } => receiver.span.to(channel.span()).to(*op_span),
+            Expr::Close { channel, keyword } => keyword.to(channel.span()),
         }
     }
 }

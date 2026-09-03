@@ -85,6 +85,9 @@ impl Resolver {
         // it stays always in scope.
         global.insert("async".into());
 
+        // `chan` — the virtual-task channel constructor namespace.
+        global.insert("chan".into());
+
         Self {
             scopes: vec![global],
             errors: Vec::new(),
@@ -202,6 +205,27 @@ impl Resolver {
                     resolver.define(variable.lexeme(), variable.span);
                     resolver.resolve_statement(body);
                 });
+            }
+            Stmt::ChanRecvFor {
+                variable,
+                channel,
+                body,
+            } => {
+                self.resolve_expression(channel);
+                self.in_scope(|resolver| {
+                    resolver.define(variable.lexeme(), variable.span);
+                    resolver.resolve_statement(body);
+                });
+            }
+            Stmt::Go { call, block, .. } => {
+                self.resolve_expression(call);
+                if let Some(block) = block {
+                    self.in_scope(|resolver| {
+                        for statement in block {
+                            resolver.resolve_statement(statement);
+                        }
+                    });
+                }
             }
             Stmt::Function { params, body, .. } => self.resolve_function(params, body),
             Stmt::AsyncFunction { params, body, .. } => self.resolve_function(params, body),
@@ -414,6 +438,17 @@ impl Resolver {
                     self.resolve_statement(stmt);
                 }
             }
+            Expr::ChanSend { channel, value, .. } => {
+                self.resolve_expression(channel);
+                self.resolve_expression(value);
+            }
+            Expr::ChanRecv {
+                receiver, channel, ..
+            } => {
+                self.resolve_expression(channel);
+                self.define(receiver.lexeme(), receiver.span);
+            }
+            Expr::Close { channel, .. } => self.resolve_expression(channel),
             Expr::Member { object, .. } | Expr::OptionalMember { object, .. } => {
                 self.resolve_expression(object);
             }

@@ -29,7 +29,9 @@
 //! `ntsc_rethrow` re-arms it (used after a `finally` that ran with a clean
 //! flag).
 
+mod idmap;
 pub mod modules;
+mod ntask;
 mod registry;
 
 use std::io::{self, Write};
@@ -52,6 +54,10 @@ pub extern "C" fn ntsc_runtime_shutdown(report: i8) {
     if ntsc_exception_pending() != 0 {
         ntsc_uncaught_exception();
     }
+    // Drain workers before reporting so the final goroutine drives can
+    // reclaim their registry entries.
+    ntask::reactor::shutdown();
+    ntask::scheduler::shutdown();
     let leaks = registry::live_count();
     if report != 0 && leaks > 0 {
         let entries = registry::live_entries();
@@ -471,6 +477,48 @@ thread_local! {
     static PENDING_EXCEPTION: RefCell<Option<i64>> = const { RefCell::new(None) };
 }
 
+/// Replace the current async task stack with a scheduler-owned stack.
+pub(crate) fn install_async_tasks(tasks: Vec<(AsyncPollFn, i64)>) {
+    ASYNC_TASKS.with(|current| *current.borrow_mut() = tasks);
+}
+
+/// Poll the current scheduler task once, retaining a child pushed by the
+/// poller for the next scheduler turn.
+pub(crate) fn poll_async_tasks_once() {
+    ASYNC_TASKS.with(|tasks| {
+        let (poll, future) = match tasks.borrow().last().copied() {
+            Some(value) => value,
+            None => return,
+        };
+        let depth = tasks.borrow().len();
+        let done = poll(future) == 1;
+        let mut stack = tasks.borrow_mut();
+        if done && stack.len() == depth {
+            stack.pop();
+        }
+    });
+}
+
+pub(crate) fn take_async_tasks() -> Vec<(AsyncPollFn, i64)> {
+    ASYNC_TASKS.with(|tasks| std::mem::take(&mut *tasks.borrow_mut()))
+}
+
+/// Transfer the current thread's pending exception message out of its TLS
+/// slot, so the sender can move it to another thread. Returns `NULL` when
+/// none is pending. Ownership of the returned handle passes to the caller.
+pub(crate) fn take_pending_exception_message() -> i64 {
+    ntsc_exception_take_message()
+}
+
+/// Re-arm `msg` as the pending exception on the current thread. `msg` must
+/// be a valid message handle (or `NULL`). Used to re-raise an exception
+/// captured from another thread's goroutine.
+pub(crate) fn rearm_pending_exception(msg: i64) {
+    if msg != NULL {
+        ntsc_throw(msg);
+    }
+}
+
 /// Throw an exception with the given message. *Consumes* the message
 /// handle and returns 0; the pending flag is observed via
 /// `ntsc_exception_pending`. The caller must not use `msg` afterwards.
@@ -565,6 +613,11 @@ fn throw_string(message: &str) -> i64 {
 /// registry handle.
 pub type AsyncPollFn = extern "C" fn(i64) -> i8;
 
+/// Reclaims one heap-allocated future: runs its drop, then frees it. A
+/// goroutine keeps its root future's cleanup so the scheduler can reclaim a
+/// future that never completed; the trampoline does the same on completion.
+pub type AsyncCleanupFn = extern "C" fn(i64);
+
 thread_local! {
     /// Per-context cooperative task stack: each entry is the poll function
     /// and future handle of an in-progress async function.
@@ -597,6 +650,203 @@ pub extern "C" fn ntsc_async_sleep_drop(id: i64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_async_sleep_poll(id: i64) -> i8 {
     registry::async_sleep_poll(id)
+}
+
+/// Register an offloaded-blocking future: `work(arg)` runs on the worker pool
+/// and its result handle is yielded once the job completes. Returns the
+/// future handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_op_new(work: extern "C" fn(i64) -> i64, arg: i64) -> i64 {
+    registry::async_op_new(Box::new(move || work(arg)))
+}
+
+/// Poll an offloaded-blocking future. The first poll starts the job on the
+/// pool and parks the goroutine; returns `1` once the job is done and its
+/// result is available via [`ntsc_async_op_result`].
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_op_poll(id: i64) -> i8 {
+    registry::async_op_poll(id)
+}
+
+/// Reap the result handle of a completed offloaded future.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_op_result(id: i64) -> i64 {
+    registry::async_op_result(id)
+}
+
+/// Drop an offloaded-blocking future handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntsc_async_op_drop(id: i64) {
+    registry::async_op_drop(id);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Virtual-task scheduler ABI
+// ══════════════════════════════════════════════════════════════════════════
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_go(poll_fn: AsyncPollFn, future: i64) -> i64 {
+    spawn_goroutine(poll_fn, future, None)
+}
+
+/// Spawn a goroutine that owns a heap-allocated future: `cleanup` runs the
+/// future's drop and frees it if the goroutine never completes, so a `go`
+/// still parked when the program ends does not leak the handles its future
+/// holds.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_go_owned(
+    poll_fn: AsyncPollFn,
+    future: i64,
+    cleanup: AsyncCleanupFn,
+) -> i64 {
+    spawn_goroutine(poll_fn, future, Some(cleanup))
+}
+
+/// Spawn a goroutine whose handle the caller discards (`go f(x)`). No registry
+/// wrapper is created: nothing can join or drop it, so the id would only be
+/// allocated to be reclaimed. `cleanup` reclaims the future if it never
+/// completes.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_go_detached(poll_fn: AsyncPollFn, future: i64, cleanup: AsyncCleanupFn) {
+    ntask::scheduler::spawn_runnable(poll_fn, future, Some(cleanup), NULL);
+}
+
+fn spawn_goroutine(poll_fn: AsyncPollFn, future: i64, cleanup: Option<AsyncCleanupFn>) -> i64 {
+    // Reserve the wrapper id first so the goroutine can record it: a child
+    // that finishes on its first poll must find its wrapper.
+    let handle = registry::reserve_id();
+    let core = ntask::scheduler::register(poll_fn, future, cleanup, handle);
+    registry::insert_reserved(handle, registry::Handle::Goroutine { core });
+    ntask::scheduler::make_runnable(core);
+    handle
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_join(goroutine: i64) -> i64 {
+    let Some(core) = registry::task_core(goroutine) else {
+        return NULL;
+    };
+    ntask::scheduler::join_blocking(core)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_join_park(goroutine: i64) -> i8 {
+    let Some(core) = registry::task_core(goroutine) else {
+        return 1;
+    };
+    ntask::scheduler::park_join(core);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_goroutine_drop(goroutine: i64) {
+    registry::goroutine_drop(goroutine);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_new(capacity: i64, owns_elements: i8) -> i64 {
+    let core = ntask::scheduler::register_chan(capacity.max(0) as usize, owns_elements != 0);
+    registry::insert(registry::Handle::Chan { core, count: 1 })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_retain(channel: i64) -> i64 {
+    registry::chan_retain(channel)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_send(channel: i64, value: i64) -> i8 {
+    let Some(core) = registry::task_core(channel) else {
+        return 1;
+    };
+    ntask::scheduler::park_chan_send(core, value);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_recv(channel: i64) -> i8 {
+    let Some(core) = registry::task_core(channel) else {
+        return 1;
+    };
+    ntask::scheduler::park_chan_recv(core);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_recv_result() -> i64 {
+    ntask::scheduler::recv_result()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_recv_ok() -> i8 {
+    ntask::scheduler::recv_ok().into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_close(channel: i64) {
+    if let Some(core) = registry::task_core(channel) {
+        ntask::scheduler::chan_close(core);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_chan_drop(channel: i64) {
+    registry::chan_drop(channel);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_timer_new() -> i64 {
+    let core = ntask::scheduler::register_io();
+    registry::insert(registry::Handle::ReactorReg { core })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_timer_park(timer: i64, deadline_ms: i64) -> i8 {
+    let Some(core) = registry::task_core(timer) else {
+        return 1;
+    };
+    ntask::scheduler::park_timer(deadline_ms);
+    let _ = core;
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_reactor_drop(registration: i64) {
+    registry::reactor_reg_drop(registration);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_io_new() -> i64 {
+    let core = ntask::scheduler::register_io();
+    registry::insert(registry::Handle::AsyncIo { core })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_io_attach(registration: i64, fd: i64, read: i8) {
+    if let Some(core) = registry::task_core(registration) {
+        ntask::reactor::attach_fd(core, fd, read != 0);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_io_park(registration: i64, read: i8) -> i8 {
+    let Some(core) = registry::task_core(registration) else {
+        return 1;
+    };
+    ntask::scheduler::park_fd(core, read != 0);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_io_ready(registration: i64) -> i8 {
+    registry::task_core(registration)
+        .is_some_and(ntask::scheduler::io_ready)
+        .into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntask_io_drop(registration: i64) {
+    registry::async_io_drop(registration);
 }
 
 /// Save the current async context and start a fresh one.
@@ -642,6 +892,12 @@ fn restore_async_context(result: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ntsc_async_run(poll_fn: AsyncPollFn, root: i64) {
     if root == NULL {
+        return;
+    }
+    if std::env::var_os("NTSC_LEGACY_ASYNC").is_none() {
+        let goroutine = ntask_go(poll_fn, root);
+        let _ = ntask_join(goroutine);
+        ntask_goroutine_drop(goroutine);
         return;
     }
     save_async_context();
@@ -1117,6 +1373,315 @@ mod tests {
         assert_eq!(ntsc_async_sleep_poll(sleep), 1);
         assert_eq!(ntsc_async_sleep_poll(sleep), 1);
         ntsc_async_sleep_drop(sleep);
+    }
+
+    #[test]
+    fn virtual_goroutine_runs_and_kind_checked_drop() {
+        extern "C" fn mark_done(id: i64) -> i8 {
+            registry::with_opaque_mut(id, |value: &mut i64| *value = 42)
+                .map(|_| 1)
+                .unwrap_or(1)
+        }
+        let state = registry::put_opaque(0i64);
+        let task = ntask_go(mark_done, state);
+        assert_ne!(task, NULL);
+        // Completion may race the caller, but a joinable handle must remain
+        // addressable until the explicit drop below.
+        std::thread::yield_now();
+        assert!(registry::task_core(task).is_some());
+        let _ = ntask_join(task);
+        assert!(registry::task_core(task).is_some());
+        assert_eq!(registry::with_opaque(state, |value: &i64| *value), Some(42));
+        ntask_goroutine_drop(task);
+        ntask_goroutine_drop(task);
+        let _ = registry::take_opaque::<i64>(state);
+    }
+
+    #[test]
+    fn channel_handle_lifecycle_is_kind_checked() {
+        let channel = ntask_chan_new(2, 0);
+        assert_ne!(channel, NULL);
+        ntask_chan_close(channel);
+        ntask_chan_drop(channel);
+        ntask_chan_drop(channel);
+    }
+
+    #[test]
+    fn offload_future_parks_goroutine_until_pool_finishes() {
+        // Foreign-future await pattern: the goroutine polls the offloaded
+        // future; while the job runs on the pool its worker is parked and
+        // gives way to other work, then resumes when the pool finishes.
+        use super::modules::process::{
+            ntsc_async_process_exec, ntsc_async_process_exec_drop, ntsc_async_process_exec_poll,
+            ntsc_async_process_exec_result,
+        };
+
+        extern "C" fn drive_offload(id: i64) -> i8 {
+            let fut = registry::with_opaque(id, |s: &(i64, i64)| s.0).unwrap();
+            if ntsc_async_process_exec_poll(fut) == 1 {
+                let code = ntsc_async_process_exec_result(fut);
+                registry::with_opaque_mut(id, |s: &mut (i64, i64)| *s = (fut, code));
+                ntsc_async_process_exec_drop(fut);
+                1
+            } else {
+                0
+            }
+        }
+
+        let fut = ntsc_async_process_exec(registry::put_string("exit 0".to_string()));
+        let state = registry::put_opaque((fut, 0i64));
+        let task = ntask_go(drive_offload, state);
+        assert_ne!(task, NULL);
+        let _ = ntask_join(task);
+        let (_, code) = registry::with_opaque(state, |s: &(i64, i64)| *s).unwrap();
+        assert_eq!(code, 0);
+        ntask_goroutine_drop(task);
+        let _ = registry::take_opaque::<(i64, i64)>(state);
+    }
+
+    #[test]
+    fn reactor_handle_lifecycle_is_kind_checked() {
+        let timer = ntask_timer_new();
+        let io = ntask_io_new();
+        assert_ne!(timer, NULL);
+        assert_ne!(io, NULL);
+        ntask_io_attach(io, -1, 1);
+        ntask_reactor_drop(timer);
+        ntask_io_drop(io);
+        ntask_reactor_drop(timer);
+        ntask_io_drop(io);
+    }
+
+    #[test]
+    fn blocked_channel_sender_and_receiver_are_unparked() {
+        #[derive(Clone, Copy)]
+        struct State {
+            channel: i64,
+            value: i64,
+            state: i8,
+        }
+
+        extern "C" fn receive(id: i64) -> i8 {
+            let Some((channel, state)) =
+                registry::with_opaque(id, |s: &State| (s.channel, s.state))
+            else {
+                return 1;
+            };
+            if state == 0 {
+                ntask_chan_recv(channel);
+                registry::with_opaque_mut(id, |s: &mut State| s.state = 1);
+                return 0;
+            }
+            let value = ntask_chan_recv_result();
+            registry::with_opaque_mut(id, |s: &mut State| {
+                s.value = value;
+                s.state = 2;
+            });
+            1
+        }
+
+        extern "C" fn send(id: i64) -> i8 {
+            let Some((channel, value, state)) =
+                registry::with_opaque(id, |s: &State| (s.channel, s.value, s.state))
+            else {
+                return 1;
+            };
+            if state == 0 {
+                ntask_chan_send(channel, value);
+                registry::with_opaque_mut(id, |s: &mut State| s.state = 1);
+                return 0;
+            }
+            1
+        }
+
+        let channel = ntask_chan_new(0, 0);
+        let receiver_state = registry::put_opaque(State {
+            channel,
+            value: 0,
+            state: 0,
+        });
+        let sender_state = registry::put_opaque(State {
+            channel,
+            value: 77,
+            state: 0,
+        });
+        let receiver = ntask_go(receive, receiver_state);
+        let sender = ntask_go(send, sender_state);
+        let _ = ntask_join(receiver);
+        let _ = ntask_join(sender);
+        let receiver_state = registry::take_opaque::<State>(receiver_state).unwrap_or(State {
+            channel,
+            value: 0,
+            state: 0,
+        });
+        assert_eq!(receiver_state.value, 77);
+        ntask_goroutine_drop(receiver);
+        ntask_goroutine_drop(sender);
+        let _ = registry::take_opaque::<State>(sender_state);
+        ntask_chan_drop(channel);
+    }
+
+    #[test]
+    fn scheduler_stress_handles_concurrent_channel_handoffs() {
+        #[derive(Clone, Copy)]
+        struct State {
+            channel: i64,
+            value: i64,
+            received: i64,
+            phase: i8,
+        }
+
+        extern "C" fn receive(id: i64) -> i8 {
+            let Some((channel, phase)) =
+                registry::with_opaque(id, |state: &State| (state.channel, state.phase))
+            else {
+                return 1;
+            };
+            if phase == 0 {
+                ntask_chan_recv(channel);
+                let _ = registry::with_opaque_mut(id, |state: &mut State| state.phase = 1);
+                return 0;
+            }
+            let value = ntask_chan_recv_result();
+            let _ = registry::with_opaque_mut(id, |state: &mut State| {
+                state.received = value;
+                state.phase = 2;
+            });
+            1
+        }
+
+        extern "C" fn send(id: i64) -> i8 {
+            let Some((channel, value, phase)) = registry::with_opaque(id, |state: &State| {
+                (state.channel, state.value, state.phase)
+            }) else {
+                return 1;
+            };
+            if phase == 0 {
+                ntask_chan_send(channel, value);
+                let _ = registry::with_opaque_mut(id, |state: &mut State| state.phase = 1);
+                return 0;
+            }
+            1
+        }
+
+        const PAIRS: usize = 128;
+        const ROUNDS: usize = 4;
+        for round in 0..ROUNDS {
+            let mut tasks = Vec::with_capacity(PAIRS * 2);
+            let mut states = Vec::with_capacity(PAIRS);
+            for pair in 0..PAIRS {
+                let channel = ntask_chan_new(0, 0);
+                let receiver_state = registry::put_opaque(State {
+                    channel,
+                    value: 0,
+                    received: 0,
+                    phase: 0,
+                });
+                let sender_state = registry::put_opaque(State {
+                    channel,
+                    value: (round * PAIRS + pair) as i64,
+                    received: 0,
+                    phase: 0,
+                });
+                states.push((channel, receiver_state, sender_state));
+                tasks.push((ntask_go(receive, receiver_state), receiver_state));
+                tasks.push((ntask_go(send, sender_state), sender_state));
+            }
+
+            for (task, _) in &tasks {
+                let _ = ntask_join(*task);
+            }
+            for (task, _) in tasks {
+                ntask_goroutine_drop(task);
+            }
+            for (channel, receiver_state, sender_state) in states {
+                let received =
+                    registry::with_opaque(receiver_state, |state: &State| state.received)
+                        .expect("receiver state");
+                let expected = registry::with_opaque(sender_state, |state: &State| state.value)
+                    .expect("sender state");
+                assert_eq!(received, expected);
+                let _ = registry::take_opaque::<State>(receiver_state);
+                let _ = registry::take_opaque::<State>(sender_state);
+                ntask_chan_drop(channel);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reactor_wakes_a_goroutine_on_loopback_readiness() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        struct State {
+            io: i64,
+            polls: i8,
+        }
+
+        extern "C" fn wait_readable(id: i64) -> i8 {
+            let Some((io, polls)) =
+                registry::with_opaque(id, |state: &State| (state.io, state.polls))
+            else {
+                return 1;
+            };
+            if polls == 0 {
+                ntask_io_park(io, 1);
+                registry::with_opaque_mut(id, |state: &mut State| state.polls = 1);
+                return 0;
+            }
+            if ntask_io_ready(io) != 0 {
+                registry::with_opaque_mut(id, |state: &mut State| state.polls = 2);
+                return 1;
+            }
+            ntask_io_park(io, 1);
+            0
+        }
+
+        let (mut reader, mut writer) = UnixStream::pair().unwrap_or_else(|_| panic!("unix pair"));
+        let io = ntask_io_new();
+        ntask_io_attach(io, reader.as_raw_fd() as i64, 1);
+        let state = registry::put_opaque(State { io, polls: 0 });
+        let task = ntask_go(wait_readable, state);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = writer.write_all(b"x");
+        });
+        let _ = ntask_join(task);
+        let state = registry::take_opaque::<State>(state).unwrap_or(State { io, polls: 0 });
+        assert_eq!(state.polls, 2);
+        let mut byte = [0u8; 1];
+        let _ = std::io::Read::read_exact(&mut reader, &mut byte);
+        ntask_goroutine_drop(task);
+        ntask_io_drop(io);
+    }
+
+    #[test]
+    fn a_goroutine_that_throws_propagates_its_exception_to_the_joiner() {
+        // Regression: an uncaught throw raised by an async poll runs on a
+        // scheduler worker, so its pending exception lived only on that
+        // worker's TLS. `ntask_join` must re-raise it on the joining thread,
+        // or the caller's `ntsc_runtime_shutdown` would never see it and the
+        // throw would be silently swallowed.
+        extern "C" fn throw_boom(_id: i64) -> i8 {
+            let message = registry::put_string("boom".to_string());
+            ntsc_throw(message);
+            1
+        }
+        assert_eq!(ntsc_exception_pending(), 0);
+        let task = ntask_go(throw_boom, NULL);
+        let _ = ntask_join(task);
+        assert_eq!(
+            ntsc_exception_pending(),
+            1,
+            "join must re-raise on the caller"
+        );
+        let message = ntsc_exception_take_message();
+        let text = registry::get_string(message).unwrap_or_default();
+        ntsc_string_drop(message);
+        assert_eq!(text, "boom");
+        ntask_goroutine_drop(task);
     }
 
     #[test]

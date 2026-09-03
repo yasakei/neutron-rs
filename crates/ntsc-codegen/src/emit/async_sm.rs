@@ -20,6 +20,73 @@ pub(crate) enum AsyncFieldTy {
 
     /// A sub-future slot holding the child's future struct (one per await).
     Future(String),
+
+    /// A sub-future slot holding an `i64` handle to a runtime-owned future
+    /// (`async.sleep`, `http.*_async`), released when the awaiting future
+    /// drops mid-flight.
+    RuntimeFuture(RuntimeFutureKind),
+}
+
+/// A runtime-owned awaited future, keyed by its release function.
+#[derive(Clone, Copy)]
+pub(crate) enum RuntimeFutureKind {
+    Sleep,
+    Http,
+    NetAccept,
+    NetRecvLine,
+}
+
+impl RuntimeFutureKind {
+    /// `None` when the callee is a user async function, whose future is
+    /// embedded inline instead.
+    fn of_child(child_name: &str) -> Option<Self> {
+        match child_name {
+            "sleep" => Some(Self::Sleep),
+            "net.accept_async" => Some(Self::NetAccept),
+            "net.recv_line_async" => Some(Self::NetRecvLine),
+            name if name.starts_with("http.") => Some(Self::Http),
+            _ => None,
+        }
+    }
+
+    fn drop_fn_name(self) -> &'static str {
+        match self {
+            Self::Sleep => "ntsc_async_sleep_drop",
+            Self::Http => "ntsc_async_http_drop",
+            Self::NetAccept => "ntsc_async_net_accept_drop",
+            Self::NetRecvLine => "ntsc_async_net_recv_line_drop",
+        }
+    }
+}
+
+/// The runtime ABI of an awaitable `net` future: the four entry points and the
+/// NTSC type its result carries.
+struct NetFutureAbi {
+    new_fn: &'static str,
+    poll_fn: &'static str,
+    result_fn: &'static str,
+    drop_fn: &'static str,
+    result_ty: Ty,
+}
+
+fn net_future_abi(child_name: &str) -> Option<NetFutureAbi> {
+    match child_name {
+        "net.accept_async" => Some(NetFutureAbi {
+            new_fn: "ntsc_async_net_accept",
+            poll_fn: "ntsc_async_net_accept_poll",
+            result_fn: "ntsc_async_net_accept_result",
+            drop_fn: "ntsc_async_net_accept_drop",
+            result_ty: Ty::Int,
+        }),
+        "net.recv_line_async" => Some(NetFutureAbi {
+            new_fn: "ntsc_async_net_recv_line",
+            poll_fn: "ntsc_async_net_recv_line_poll",
+            result_fn: "ntsc_async_net_recv_line_result",
+            drop_fn: "ntsc_async_net_recv_line_drop",
+            result_ty: Ty::String,
+        }),
+        _ => None,
+    }
 }
 
 /// One `await` point in an async body.
@@ -34,6 +101,42 @@ pub(crate) struct AwaitInfo {
     child_name: String,
     child_ret_ty: Ty,
     child_result_index: u32,
+}
+
+/// The kind of a channel suspension point (a channel send or receive that
+/// parks the goroutine like an `await`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChanOpKind {
+    Send,
+    Recv,
+    /// `for v in ch { ... }`: suspend on a receive each iteration and run
+    /// the body with `v` bound to the received value; leaves the loop when
+    /// the channel is closed and drained.
+    Loop,
+}
+
+/// A single suspension point in the unified state ordering, indexed by its
+/// position (segment ordinal). The await/chan indices reference the
+/// `await_infos`/`chan_infos` lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuspKind {
+    Await(usize),
+    Chan(usize),
+}
+
+/// One channel send/receive suspension point in an async body.
+///
+/// Like `await`, channel ops are recognised only at the top level (statement
+/// boundary, variable initializer, or return value). They park the running
+/// goroutine: `ntask_chan_send`/`ntask_chan_recv` set the goroutine's park
+/// state and the poll returns 0; on resume the goroutine's channel op has
+/// been completed by the scheduler. A receive reads its result through
+/// `ntask_chan_recv_result`.
+pub(crate) struct ChanInfo {
+    stmt_idx: usize,
+    op: ChanOpKind,
+    /// Coercion target type for a receive (`Ty::Void` for a send).
+    recv_ty: Ty,
 }
 
 /// Pre-analyzed layout of a single async function's future struct.
@@ -52,6 +155,21 @@ pub(crate) struct AsyncLayout {
     /// Index of the first sub-future slot (after params, result, and locals).
     sub_field_base: u32,
     await_infos: Vec<AwaitInfo>,
+    /// Channel send/receive suspension points, in top-level statement order.
+    chan_infos: Vec<ChanInfo>,
+    /// The suspend-state index (segment ordinal) for each `await_infos` entry.
+    /// These and the channel points partition the state range
+    /// `1..=suspension_count` in statement order; the segment splitter and
+    /// the poll switch both key off this unified ordering.
+    await_state_index: Vec<u32>,
+    /// The suspend-state index (segment ordinal) for each `chan_infos` entry.
+    chan_state_index: Vec<u32>,
+    /// Total suspension points (awaits + channel ops); the done state is
+    /// `suspension_count + 1`, and there are `suspension_count + 1` segments.
+    suspension_count: u32,
+    /// The suspension points in statement order; position i is segment i's
+    /// resume dispatch and carries state index i.
+    susp_order: Vec<SuspKind>,
     ret_ty: Ty,
 
     /// Anonymous async blocks compiled as part of this layout. Maps the
@@ -89,6 +207,12 @@ pub(crate) fn async_local_ty(
                 Expr::Variable { name } => name.lexeme(),
                 Expr::Member { object, property } if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "async") => {
                     property.lexeme()
+                }
+                Expr::Member { object, property }
+                    if matches!(object.as_ref(), Expr::Variable { name } if name.lexeme() == "http")
+                        && property.lexeme().ends_with("_async") =>
+                {
+                    return Ty::String;
                 }
                 Expr::AsyncBlock { return_type, .. } => {
                     return function_return_ty(return_type);
@@ -147,6 +271,10 @@ pub(crate) fn collect_async_locals(
             }
         }
         Stmt::ForIn { variable, body, .. } | Stmt::ForAwait { variable, body, .. } => {
+            add(variable.lexeme(), Ty::Any, fields);
+            collect_async_locals(body, program, fields, field_names, field_tys);
+        }
+        Stmt::ChanRecvFor { variable, body, .. } => {
             add(variable.lexeme(), Ty::Any, fields);
             collect_async_locals(body, program, fields, field_names, field_tys);
         }
@@ -209,6 +337,16 @@ pub(crate) fn collect_async_locals(
             }
         }
         Stmt::Function { .. } | Stmt::AsyncFunction { .. } => {}
+        Stmt::Expression {
+            expression: Expr::ChanRecv { receiver, .. },
+            ..
+        } => {
+            // A `v |> ch` receive binds its receiver as a fresh local; type it
+            // as `Any` for the field slot (receivers hold ints or owned
+            // handles, both i64), with the precise element type supplied to
+            // `define_var` on resume from the typeck registry.
+            add(receiver.lexeme(), Ty::Any, fields);
+        }
         _ => {}
     }
 }
@@ -269,8 +407,14 @@ pub(crate) fn build_async_layout(
     let sub_field_base = field_names.len() as u32;
 
     let mut await_infos = Vec::new();
+    let mut await_state_index = Vec::new();
+    let mut chan_infos = Vec::new();
     let mut anon_async_blocks = Vec::new();
     let mut anon_counter = 0usize;
+    // Every suspension point (await or channel op) gets a distinct state index
+    // equal to its 1-based ordinal in top-level statement order, shared by the
+    // poll switch, the segment splitter, and the suspend/resume logic.
+    let mut suspension_points = 0u32;
     for (stmt_idx, stmt) in body.iter().enumerate() {
         let is_await_statement = matches!(
             stmt,
@@ -299,20 +443,29 @@ pub(crate) fn build_async_layout(
             // values.
             field_names.push(format!("sub_{child_name}"));
 
-            // `async.sleep` futures live in the runtime registry behind an
-            // i64 handle, so its slot is a plain integer; awaited user
-            // functions embed their child future struct inline.
-            if child_name == "sleep" {
-                field_tys.push(AsyncFieldTy::Native(Ty::Int));
-            } else {
-                field_tys.push(AsyncFieldTy::Future(child_name.clone()));
+            // `async.sleep` and offloaded `http.*_async` futures live in the
+            // runtime registry behind an i64 handle, so their slot is a
+            // handle the drop path must release; awaited user functions embed
+            // their child future struct inline.
+            match RuntimeFutureKind::of_child(&child_name) {
+                Some(kind) => field_tys.push(AsyncFieldTy::RuntimeFuture(kind)),
+                None => field_tys.push(AsyncFieldTy::Future(child_name.clone())),
             }
+            await_state_index.push(suspension_points);
+            suspension_points += 1;
             await_infos.push(AwaitInfo {
                 stmt_idx,
                 child_name,
                 child_ret_ty,
                 child_result_index: 1 + child_param_count as u32,
             });
+        } else if let Some((op, recv_ty)) = chan_target_ty(stmt) {
+            chan_infos.push(ChanInfo {
+                stmt_idx,
+                op,
+                recv_ty,
+            });
+            suspension_points += 1;
         }
     }
 
@@ -326,17 +479,60 @@ pub(crate) fn build_async_layout(
         &mut block_span_to_name,
     );
 
-    Ok(AsyncLayout {
+    // Merge the await and channel suspension points into a single ordered
+    // list (both are already sorted ascending by `stmt_idx`). Position i is
+    // the resume/suspend dispatch for segment i and carries state index i.
+    let mut susp_order = Vec::with_capacity(suspension_points as usize);
+    let mut chan_state_index = Vec::with_capacity(chan_infos.len());
+    let (mut ai, mut ci) = (0usize, 0usize);
+    while ai < await_infos.len() || ci < chan_infos.len() {
+        let pick_await = match (await_infos.get(ai), chan_infos.get(ci)) {
+            (Some(a), Some(c)) => a.stmt_idx <= c.stmt_idx,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if pick_await {
+            susp_order.push(SuspKind::Await(ai));
+            ai += 1;
+        } else {
+            let position = susp_order.len() as u32;
+            susp_order.push(SuspKind::Chan(ci));
+            chan_state_index.push(position);
+            ci += 1;
+        }
+    }
+
+    // Receiver variables are collected as `Any` slots; their precise
+    // element type (which decides whether the future's drop path frees
+    // them) comes from the typeck bridge once the chan infos exist.
+    let mut layout = AsyncLayout {
         name: name.lexeme().to_string(),
         field_tys,
         fields,
         result_index,
         sub_field_base,
         await_infos,
+        chan_infos,
+        await_state_index,
+        chan_state_index,
+        suspension_count: suspension_points,
+        susp_order,
         ret_ty,
         anon_async_blocks,
         block_span_to_name,
-    })
+    };
+    for info in &layout.chan_infos {
+        if info.op == ChanOpKind::Send {
+            continue;
+        }
+        if let Ok(receiver) = chan_stmt_receiver(&body[info.stmt_idx])
+            && let Some(field_index) = layout.fields.get(receiver.lexeme()).copied()
+        {
+            layout.field_tys[field_index as usize] = AsyncFieldTy::Native(info.recv_ty.clone());
+        }
+    }
+    Ok(layout)
 }
 
 /// `(child_name, return_type, anon_body?, anon_return_type?)` returned by
@@ -628,6 +824,35 @@ pub(crate) fn await_callee_info(
                 })?;
             Ok((callee_name.to_string(), ret_ty, None, None))
         }
+        Expr::Member { object, property }
+            if matches!(
+                object.as_ref(),
+                Expr::Variable { name } if name.lexeme() == "net"
+            ) && property.lexeme() == "accept_async" =>
+        {
+            Ok(("net.accept_async".to_string(), Ty::Int, None, None))
+        }
+        Expr::Member { object, property }
+            if matches!(
+                object.as_ref(),
+                Expr::Variable { name } if name.lexeme() == "net"
+            ) && property.lexeme() == "recv_line_async" =>
+        {
+            Ok(("net.recv_line_async".to_string(), Ty::String, None, None))
+        }
+        Expr::Member { object, property }
+            if matches!(
+                object.as_ref(),
+                Expr::Variable { name } if name.lexeme() == "http"
+            ) && property.lexeme().ends_with("_async") =>
+        {
+            Ok((
+                format!("http.{}", property.lexeme()),
+                Ty::String,
+                None,
+                None,
+            ))
+        }
         Expr::AsyncBlock {
             body, return_type, ..
         } => {
@@ -651,8 +876,18 @@ pub(crate) fn await_callee_param_count(
         Option<ntsc_ast::expr::ReturnTypeAnnotation>,
     )],
 ) -> Result<usize, crate::CodegenError> {
-    if child_name == "sleep" {
+    if child_name == "sleep"
+        || child_name == "net.accept_async"
+        || child_name == "net.recv_line_async"
+    {
         return Ok(1);
+    }
+    // Offloaded http futures: 1 arg (get/delete/head) or 2 (post/put/patch).
+    if let Some(method) = child_name.strip_prefix("http.") {
+        return Ok(match method {
+            "get_async" | "delete_async" | "head_async" => 1,
+            _ => 2,
+        });
     }
     // Anonymous async blocks have no params.
     if anon_async_blocks
@@ -705,6 +940,78 @@ pub(crate) fn await_stmt_parts(stmt: &Stmt) -> Result<(&Expr, &[Expr]), crate::C
     }
 }
 
+/// The channel-op kind of a top-level channel suspension statement. Sends
+/// (`ch <| v`) and receives (`v |> ch`) both appear as top-level statement
+/// expressions; the receive's freshly-bound receiver variable is typed from
+/// the element type typeck recorded for the owning function.
+fn chan_target_ty(stmt: &Stmt) -> Option<(ChanOpKind, Ty)> {
+    match stmt {
+        Stmt::Expression {
+            expression: Expr::ChanSend { .. },
+            ..
+        } => Some((ChanOpKind::Send, Ty::Void)),
+        Stmt::ChanRecvFor { channel, .. } => {
+            let element = ntsc_typeck::chan_recv_element_type(channel.span().start);
+            Some((ChanOpKind::Loop, element))
+        }
+        Stmt::Expression {
+            expression: Expr::ChanRecv { op_span, .. },
+            ..
+        } => {
+            let element = ntsc_typeck::chan_recv_element_type(op_span.start);
+            Some((ChanOpKind::Recv, element))
+        }
+        _ => None,
+    }
+}
+
+/// The channel operand expression of a channel suspension statement.
+pub(crate) fn chan_stmt_channel(stmt: &Stmt) -> Result<&Expr, crate::CodegenError> {
+    match stmt {
+        Stmt::Expression {
+            expression: Expr::ChanSend { channel, .. },
+            ..
+        } => Ok(channel),
+        Stmt::Expression {
+            expression: Expr::ChanRecv { channel, .. },
+            ..
+        } => Ok(channel),
+        Stmt::ChanRecvFor { channel, .. } => Ok(channel),
+        _ => Err(crate::CodegenError::LLVMError(
+            "internal: expected a channel suspension statement".into(),
+        )),
+    }
+}
+
+/// The value expression sent by a channel-send suspension statement.
+pub(crate) fn chan_stmt_value(stmt: &Stmt) -> Result<&Expr, crate::CodegenError> {
+    match stmt {
+        Stmt::Expression {
+            expression: Expr::ChanSend { value, .. },
+            ..
+        } => Ok(value),
+        _ => Err(crate::CodegenError::LLVMError(
+            "internal: expected a channel-send statement".into(),
+        )),
+    }
+}
+
+/// The receiver variable of a channel-receive suspension statement.
+pub(crate) fn chan_stmt_receiver(
+    stmt: &Stmt,
+) -> Result<&ntsc_ast::token::Token, crate::CodegenError> {
+    match stmt {
+        Stmt::Expression {
+            expression: Expr::ChanRecv { receiver, .. },
+            ..
+        } => Ok(receiver),
+        Stmt::ChanRecvFor { variable, .. } => Ok(variable),
+        _ => Err(crate::CodegenError::LLVMError(
+            "internal: expected a channel-receive statement".into(),
+        )),
+    }
+}
+
 /// Declare the (opaque) future struct type for an async function. Called
 /// for callees before callers so sub-future fields can reference resolved
 /// types.
@@ -720,6 +1027,7 @@ pub(crate) fn declare_async_future<'ctx>(
         .iter()
         .map(|field| match field {
             AsyncFieldTy::Native(ty) => Ok(ty_to_llvm(ty, context)),
+            AsyncFieldTy::RuntimeFuture(_) => Ok(context.i64_type().as_basic_type_enum()),
             AsyncFieldTy::Future(child) => module
                 .get_struct_type(&format!("ntsc_future_{child}"))
                 .ok_or_else(|| {
@@ -791,7 +1099,11 @@ pub(crate) fn emit_async_function<'ctx>(
     // built-in `async.sleep` has no emitted callee: its future struct and
     // poll function are declared as part of the runtime.
     for info in &layout.await_infos {
-        if info.child_name == "sleep" {
+        if info.child_name == "sleep"
+            || info.child_name == "net.accept_async"
+            || info.child_name == "net.recv_line_async"
+            || info.child_name.starts_with("http.")
+        {
             continue;
         }
         // Anonymous async blocks were already emitted above.
@@ -885,7 +1197,7 @@ pub(crate) fn emit_async_poll<'ctx>(
     let state_field = builder.build_struct_gep(future_ty, future, 0, "state_ptr")?;
     let state = builder.build_load(context.i32_type(), state_field, "state")?;
 
-    let seg_count = layout.await_infos.len() + 1;
+    let seg_count = (layout.suspension_count as usize) + 1;
     let finish_bb = context.append_basic_block(poll_fn, "finish");
     let fallthrough_bb = context.append_basic_block(poll_fn, "fallthrough");
     let seg_blocks: Vec<_> = (0..seg_count)
@@ -1009,6 +1321,19 @@ fn emit_async_drop<'ctx>(
                     builder.build_store(ptr, default_llvm_value(ty, context))?;
                 }
             }
+            AsyncFieldTy::RuntimeFuture(kind) => {
+                // Release the handle so a future dropped while parked on it
+                // does not leave the entry behind. The slot is zero until the
+                // await arms it and the drops are null-safe.
+                let drop_fn = module.get_function(kind.drop_fn_name()).ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!("{} not declared", kind.drop_fn_name()))
+                })?;
+                let handle = builder
+                    .build_load(context.i64_type(), ptr, "runtime_future_drop")?
+                    .into_int_value();
+                builder.build_call(drop_fn, &[handle.into()], "runtime_future_drop_call")?;
+                builder.build_store(ptr, context.i64_type().const_zero())?;
+            }
             AsyncFieldTy::Future(child) => {
                 let child_fn = module
                     .get_function(&format!("ntsc_future_{child}_drop"))
@@ -1043,20 +1368,21 @@ pub(crate) fn emit_async_segment<'ctx>(
     seg_blocks: &[inkwell::basic_block::BasicBlock<'ctx>],
     finish_bb: inkwell::basic_block::BasicBlock<'ctx>,
 ) -> Result<(), crate::CodegenError> {
-    let await_infos = &layout.await_infos;
-    let (start, end, resume_await) = if segment_index == 0 {
-        let end = await_infos
+    let (start, end, resume) = if segment_index == 0 {
+        let end = layout
+            .susp_order
             .first()
-            .map(|info| info.stmt_idx)
+            .map(|kind| susp_stmt_idx(layout, kind))
             .unwrap_or(body.len());
         (0, end, None)
     } else {
-        let prev_await = await_infos[segment_index - 1].stmt_idx;
-        let end = await_infos
+        let prev = layout.susp_order[segment_index - 1];
+        let end = layout
+            .susp_order
             .get(segment_index)
-            .map(|info| info.stmt_idx)
+            .map(|kind| susp_stmt_idx(layout, kind))
             .unwrap_or(body.len());
-        (prev_await + 1, end, Some(segment_index - 1))
+        (susp_stmt_idx(layout, &prev) + 1, end, Some(prev))
     };
 
     for (name, index) in &layout.fields {
@@ -1065,14 +1391,21 @@ pub(crate) fn emit_async_segment<'ctx>(
         }
         let ty = match &layout.field_tys[*index as usize] {
             AsyncFieldTy::Native(ty) => ty.clone(),
-            AsyncFieldTy::Future(_) => continue,
+            AsyncFieldTy::Future(_) | AsyncFieldTy::RuntimeFuture(_) => continue,
         };
         let ptr = fn_ctx.future_field(*index)?;
         fn_ctx.define_var(name, ptr, ty);
     }
 
-    if let Some(await_idx) = resume_await {
-        emit_await_resume(fn_ctx, layout, body, await_idx)?;
+    if let Some(kind) = &resume {
+        match kind {
+            SuspKind::Await(await_idx) => {
+                emit_await_resume(fn_ctx, layout, body, *await_idx)?;
+            }
+            SuspKind::Chan(chan_idx) => {
+                emit_chan_resume(fn_ctx, layout, body, *chan_idx)?;
+            }
+        }
     }
 
     for stmt in &body[start..end] {
@@ -1099,8 +1432,15 @@ pub(crate) fn emit_async_segment<'ctx>(
         }
     }
 
-    if segment_index < await_infos.len() {
-        emit_await_suspend(fn_ctx, layout, body, segment_index)?;
+    if let Some(kind) = layout.susp_order.get(segment_index) {
+        match kind {
+            SuspKind::Await(await_idx) => {
+                emit_await_suspend(fn_ctx, layout, body, *await_idx)?;
+            }
+            SuspKind::Chan(chan_idx) => {
+                emit_chan_suspend(fn_ctx, layout, body, *chan_idx)?;
+            }
+        }
     } else if fn_ctx
         .builder
         .get_insert_block()
@@ -1112,6 +1452,14 @@ pub(crate) fn emit_async_segment<'ctx>(
 
     let _ = seg_blocks;
     Ok(())
+}
+
+/// The source statement index of a suspension point in the unified order.
+fn susp_stmt_idx(layout: &AsyncLayout, kind: &SuspKind) -> usize {
+    match kind {
+        SuspKind::Await(i) => layout.await_infos[*i].stmt_idx,
+        SuspKind::Chan(i) => layout.chan_infos[*i].stmt_idx,
+    }
 }
 
 /// Suspend on await `await_idx`: zero the child's future slot, evaluate the
@@ -1128,6 +1476,104 @@ pub(crate) fn emit_await_suspend<'ctx>(
     let (_callee_expr, arguments) = await_stmt_parts(stmt)?;
 
     let child_slot = fn_ctx.future_field(layout.sub_field_base + await_idx as u32)?;
+
+    // Offloaded accept: create the op, store its handle in the slot, and park
+    // on its poll function (same shape as the offloaded http futures).
+    if let Some(abi) = net_future_abi(&info.child_name) {
+        let new_fn = fn_ctx.module.get_function(abi.new_fn).ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!("{} not declared", abi.new_fn))
+        })?;
+        let arg_values = emit_call_arguments(fn_ctx, arguments)?;
+        let llvm_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+            arg_values.iter().map(|arg| arg.value.into()).collect();
+        let op = fn_ctx
+            .builder
+            .build_call(new_fn, &llvm_args, "net_accept_new")?;
+        let handle = call_result_to_value(fn_ctx, &op);
+        fn_ctx.builder.build_store(child_slot, handle)?;
+
+        let poll_fn = fn_ctx.module.get_function(abi.poll_fn).ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!("{} not declared", abi.poll_fn))
+        })?;
+        let poll_i8 = fn_ctx.builder.build_pointer_cast(
+            poll_fn.as_global_value().as_pointer_value(),
+            fn_ctx.context.ptr_type(AddressSpace::default()),
+            "net_accept_poll_fn",
+        )?;
+        let push_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_push")
+            .ok_or_else(|| crate::CodegenError::LLVMError("ntsc_async_push not declared".into()))?;
+        fn_ctx.builder.build_call(
+            push_fn,
+            &[poll_i8.into(), handle.into_int_value().into()],
+            "async_push",
+        )?;
+        let state_ptr = fn_ctx.future_field(0)?;
+        let next_state = fn_ctx
+            .context
+            .i32_type()
+            .const_int((layout.await_state_index[await_idx] as u64) + 1, false);
+        fn_ctx.builder.build_store(state_ptr, next_state)?;
+        fn_ctx
+            .builder
+            .build_return(Some(&fn_ctx.context.i8_type().const_int(0, false)))?;
+        return Ok(());
+    }
+
+    // Offloaded runtime futures: create the op, store its handle in the
+    // slot, and park on its poll function.
+    if let Some(method) = info.child_name.strip_prefix("http.") {
+        let new_fn_name = format!(
+            "ntsc_async_http_{}",
+            method.strip_suffix("_async").unwrap_or(method)
+        );
+        let new_fn = fn_ctx
+            .module
+            .get_function(&new_fn_name)
+            .ok_or_else(|| crate::CodegenError::LLVMError(format!("{new_fn_name} not declared")))?;
+        let arg_values = emit_call_arguments(fn_ctx, arguments)?;
+        let llvm_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+            arg_values.iter().map(|arg| arg.value.into()).collect();
+        let op = fn_ctx
+            .builder
+            .build_call(new_fn, &llvm_args, "http_async_new")?;
+        let handle = call_result_to_value(fn_ctx, &op);
+        fn_ctx.builder.build_store(child_slot, handle)?;
+
+        let poll_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_http_poll")
+            .ok_or_else(|| {
+                crate::CodegenError::LLVMError("ntsc_async_http_poll not declared".into())
+            })?;
+        let poll_ptr = poll_fn.as_global_value().as_pointer_value();
+        let poll_i8 = fn_ctx.builder.build_pointer_cast(
+            poll_ptr,
+            fn_ctx.context.ptr_type(AddressSpace::default()),
+            "http_poll_fn",
+        )?;
+        let push_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_push")
+            .ok_or_else(|| crate::CodegenError::LLVMError("ntsc_async_push not declared".into()))?;
+        fn_ctx.builder.build_call(
+            push_fn,
+            &[poll_i8.into(), handle.into_int_value().into()],
+            "async_push",
+        )?;
+
+        let state_ptr = fn_ctx.future_field(0)?;
+        let next_state = fn_ctx
+            .context
+            .i32_type()
+            .const_int((layout.await_state_index[await_idx] as u64) + 1, false);
+        fn_ctx.builder.build_store(state_ptr, next_state)?;
+        fn_ctx
+            .builder
+            .build_return(Some(&fn_ctx.context.i8_type().const_int(0, false)))?;
+        return Ok(());
+    }
 
     if info.child_name == "sleep" {
         let sleep_new_fn = fn_ctx
@@ -1176,7 +1622,7 @@ pub(crate) fn emit_await_suspend<'ctx>(
         let next_state = fn_ctx
             .context
             .i32_type()
-            .const_int(1 + await_idx as u64, false);
+            .const_int((layout.await_state_index[await_idx] as u64) + 1, false);
         fn_ctx.builder.build_store(state_ptr, next_state)?;
         fn_ctx
             .builder
@@ -1210,6 +1656,10 @@ pub(crate) fn emit_await_suspend<'ctx>(
 
     let arg_values = emit_call_arguments(fn_ctx, arguments)?;
     for (i, arg_val) in arg_values.iter().enumerate() {
+        // The child releases its parameter references in its drop.
+        if let Some(arg) = arguments.get(i) {
+            retain_chan_value(fn_ctx, arg, arg_val)?;
+        }
         let slot = fn_ctx.builder.build_struct_gep(
             child_struct_ty,
             child_ptr,
@@ -1256,7 +1706,7 @@ pub(crate) fn emit_await_suspend<'ctx>(
     let next_state = fn_ctx
         .context
         .i32_type()
-        .const_int((await_idx as u64) + 1, false);
+        .const_int((layout.await_state_index[await_idx] as u64) + 1, false);
     fn_ctx.builder.build_store(state_ptr, next_state)?;
     fn_ctx
         .builder
@@ -1275,6 +1725,156 @@ pub(crate) fn emit_await_resume<'ctx>(
 ) -> Result<(), crate::CodegenError> {
     let info = &layout.await_infos[await_idx];
     let stmt = &body[info.stmt_idx];
+
+    // Offloaded accept: reap the client socket handle, then drop the op. The
+    // result is an `int` socket handle, not a string.
+    if let Some(abi) = net_future_abi(&info.child_name) {
+        let child_slot = fn_ctx.future_field(layout.sub_field_base + await_idx as u32)?;
+        let handle = fn_ctx
+            .builder
+            .build_load(fn_ctx.context.i64_type(), child_slot, "net_handle")?
+            .into_int_value();
+        let result_fn = fn_ctx.module.get_function(abi.result_fn).ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!("{} not declared", abi.result_fn))
+        })?;
+        let result = fn_ctx
+            .builder
+            .build_call(result_fn, &[handle.into()], "net_accept_result")?;
+        let socket = call_result_to_value(fn_ctx, &result);
+        let drop_fn = fn_ctx.module.get_function(abi.drop_fn).ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!("{} not declared", abi.drop_fn))
+        })?;
+        fn_ctx
+            .builder
+            .build_call(drop_fn, &[handle.into()], "net_accept_drop")?;
+        fn_ctx
+            .builder
+            .build_store(child_slot, fn_ctx.context.i64_type().const_zero())?;
+
+        match stmt {
+            Stmt::Expression { .. } => {
+                if matches!(abi.result_ty, Ty::String) {
+                    emit_drop_value(fn_ctx, &TypedValue::new(socket, Ty::String))?;
+                }
+            }
+            Stmt::Var {
+                name,
+                type_annotation,
+                ..
+            } => {
+                let slot_ty = match type_annotation {
+                    Some(_) => type_annotation_to_ty(type_annotation),
+                    None => abi.result_ty.clone(),
+                };
+                let field_index = layout.fields.get(name.lexeme()).copied().ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "internal: awaited variable `{}` has no future field",
+                        name.lexeme()
+                    ))
+                })?;
+                let slot = fn_ctx.future_field(field_index)?;
+                fn_ctx.define_var(name.lexeme(), slot, slot_ty.clone());
+                let coerced = coerce_value(
+                    fn_ctx,
+                    TypedValue::new(socket, abi.result_ty.clone()),
+                    &slot_ty,
+                )?;
+                fn_ctx.builder.build_store(slot, coerced.value)?;
+            }
+            Stmt::Return { .. } => {
+                let coerced = coerce_value(
+                    fn_ctx,
+                    TypedValue::new(socket, abi.result_ty.clone()),
+                    &layout.ret_ty,
+                )?;
+                emit_async_return(fn_ctx, layout, Some(coerced.value))?;
+            }
+            _ => {
+                return Err(crate::CodegenError::LLVMError(
+                    "internal: unexpected await statement shape".into(),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    // Offloaded http futures: reap the response handle from the op, then
+    // drop the completed op.
+    if let Some(_method) = info.child_name.strip_prefix("http.") {
+        let child_slot = fn_ctx.future_field(layout.sub_field_base + await_idx as u32)?;
+        let handle = fn_ctx
+            .builder
+            .build_load(fn_ctx.context.i64_type(), child_slot, "http_handle")?
+            .into_int_value();
+        let result_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_http_result")
+            .ok_or_else(|| {
+                crate::CodegenError::LLVMError("ntsc_async_http_result not declared".into())
+            })?;
+        let result = fn_ctx
+            .builder
+            .build_call(result_fn, &[handle.into()], "http_async_result")?;
+        let response = call_result_to_value(fn_ctx, &result);
+        let drop_fn = fn_ctx
+            .module
+            .get_function("ntsc_async_http_drop")
+            .ok_or_else(|| {
+                crate::CodegenError::LLVMError("ntsc_async_http_drop not declared".into())
+            })?;
+        fn_ctx
+            .builder
+            .build_call(drop_fn, &[handle.into()], "http_async_drop")?;
+        fn_ctx
+            .builder
+            .build_store(child_slot, fn_ctx.context.i64_type().const_zero())?;
+
+        match stmt {
+            Stmt::Expression { .. } => {
+                emit_drop_value(fn_ctx, &TypedValue::new(response, Ty::String))?;
+            }
+            Stmt::Var {
+                name,
+                type_annotation,
+                ..
+            } => {
+                // An unannotated `var x = await http.get_async(..)` binds to
+                // the response string; without an annotation the variable
+                // would default to `Any`, which loses ownership tracking (a
+                // later move out of the slot would go unnoticed by the drop
+                // path and the sent handle would be freed twice).
+                let slot_ty = match type_annotation {
+                    Some(_) => type_annotation_to_ty(type_annotation),
+                    None => Ty::String,
+                };
+                let field_index = layout.fields.get(name.lexeme()).copied().ok_or_else(|| {
+                    crate::CodegenError::LLVMError(format!(
+                        "internal: awaited variable `{}` has no future field",
+                        name.lexeme()
+                    ))
+                })?;
+                let slot = fn_ctx.future_field(field_index)?;
+                fn_ctx.define_var(name.lexeme(), slot, slot_ty.clone());
+                let coerced =
+                    coerce_value(fn_ctx, TypedValue::new(response, Ty::String), &slot_ty)?;
+                fn_ctx.builder.build_store(slot, coerced.value)?;
+            }
+            Stmt::Return { .. } => {
+                let coerced = coerce_value(
+                    fn_ctx,
+                    TypedValue::new(response, Ty::String),
+                    &layout.ret_ty,
+                )?;
+                emit_async_return(fn_ctx, layout, Some(coerced.value))?;
+            }
+            _ => {
+                return Err(crate::CodegenError::LLVMError(
+                    "internal: unexpected await statement shape".into(),
+                ));
+            }
+        }
+        return Ok(());
+    }
 
     if info.child_name == "sleep" {
         let child_slot = fn_ctx.future_field(layout.sub_field_base + await_idx as u32)?;
@@ -1349,7 +1949,12 @@ pub(crate) fn emit_await_resume<'ctx>(
             type_annotation,
             ..
         } => {
-            let slot_ty = type_annotation_to_ty(type_annotation);
+            // An unannotated `var x = await f(..)` binds the child's result
+            // type (not `Any`) so ownership of an owned handle is tracked.
+            let slot_ty = match type_annotation {
+                Some(_) => type_annotation_to_ty(type_annotation),
+                None => info.child_ret_ty.clone(),
+            };
             let field_index = layout.fields.get(name.lexeme()).copied().ok_or_else(|| {
                 crate::CodegenError::LLVMError(format!(
                     "internal: awaited variable `{}` has no future field",
@@ -1382,6 +1987,238 @@ pub(crate) fn emit_await_resume<'ctx>(
     Ok(())
 }
 
+/// Suspend on a channel send/receive `chan_idx`: evaluate the channel (and
+/// value), park the goroutine via `ntask_chan_send`/`ntask_chan_recv`, store
+/// the resume state, and return 0. On the next poll the scheduler has
+/// completed the op and `emit_chan_resume` reads any received value.
+pub(crate) fn emit_chan_suspend<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    layout: &AsyncLayout,
+    body: &[Stmt],
+    chan_idx: usize,
+) -> Result<(), crate::CodegenError> {
+    let info = &layout.chan_infos[chan_idx];
+    let stmt = &body[info.stmt_idx];
+    let channel_expr = chan_stmt_channel(stmt)?;
+    let channel = emit_expression(fn_ctx, channel_expr)?;
+    let channel_arg = channel.value.into_int_value();
+
+    let result = match info.op {
+        ChanOpKind::Send => {
+            let value_expr = chan_stmt_value(stmt)?;
+            let value = emit_expression(fn_ctx, value_expr)?;
+            // A send moves the value into the channel: null the source
+            // variable's slot when the value was a named owned handle so the
+            // goroutine's drop path does not double-free it.
+            if let Expr::Variable { name } = value_expr
+                && ty_is_owned_handle(&value.ntsc_type)
+                && let Some((ptr, _)) = fn_ctx.variables.get(name.lexeme())
+            {
+                fn_ctx
+                    .builder
+                    .build_store(*ptr, default_llvm_value(&value.ntsc_type, fn_ctx.context))?;
+            }
+            let value_arg = value.value.into_int_value();
+            let send_fn = fn_ctx
+                .module
+                .get_function("ntask_chan_send")
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError("ntask_chan_send not declared".into())
+                })?;
+            fn_ctx.builder.build_call(
+                send_fn,
+                &[channel_arg.into(), value_arg.into()],
+                "chan_send",
+            )?
+        }
+        ChanOpKind::Recv | ChanOpKind::Loop => {
+            let recv_fn = fn_ctx
+                .module
+                .get_function("ntask_chan_recv")
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError("ntask_chan_recv not declared".into())
+                })?;
+            fn_ctx
+                .builder
+                .build_call(recv_fn, &[channel_arg.into()], "chan_recv")?
+        }
+    };
+    let returned = call_result_to_value(fn_ctx, &result).into_int_value();
+    // `ntask_chan_send`/`ntask_chan_recv` return 1 on an invalid channel
+    // handle; assert so a corrupt handle surfaces as a panic. 0 is success.
+    let handle_ok = fn_ctx.builder.build_int_compare(
+        inkwell::IntPredicate::EQ,
+        returned,
+        fn_ctx.context.i8_type().const_zero(),
+        "chan_handle_ok",
+    )?;
+    let handle_ok_i8 = fn_ctx.builder.build_int_z_extend(
+        handle_ok,
+        fn_ctx.context.i8_type(),
+        "chan_handle_ok_i8",
+    )?;
+    fn_ctx.builder.build_call(
+        fn_ctx
+            .module
+            .get_function("ntsc_assert")
+            .ok_or_else(|| crate::CodegenError::LLVMError("ntsc_assert not declared".into()))?,
+        &[
+            handle_ok_i8.into(),
+            fn_ctx.context.i64_type().const_zero().into(),
+        ],
+        "chan_handle_assert",
+    )?;
+
+    let state_ptr = fn_ctx.future_field(0)?;
+    let next_state = fn_ctx
+        .context
+        .i32_type()
+        .const_int((layout.chan_state_index[chan_idx] as u64) + 1, false);
+    fn_ctx.builder.build_store(state_ptr, next_state)?;
+    fn_ctx
+        .builder
+        .build_return(Some(&fn_ctx.context.i8_type().const_int(0, false)))?;
+    Ok(())
+}
+
+/// On resume after a channel receive, read the completed value through
+/// `ntask_chan_recv_result`, coerce it to the statement's target type, and
+/// store it (or return it). A send has nothing to resume.
+pub(crate) fn emit_chan_resume<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    layout: &AsyncLayout,
+    body: &[Stmt],
+    chan_idx: usize,
+) -> Result<(), crate::CodegenError> {
+    let info = &layout.chan_infos[chan_idx];
+    if info.op == ChanOpKind::Send {
+        return Ok(());
+    }
+    let stmt = &body[info.stmt_idx];
+
+    let result_fn = fn_ctx
+        .module
+        .get_function("ntask_chan_recv_result")
+        .ok_or_else(|| {
+            crate::CodegenError::LLVMError("ntask_chan_recv_result not declared".into())
+        })?;
+    let result = fn_ctx
+        .builder
+        .build_call(result_fn, &[], "chan_recv_result")?;
+    let received = call_result_to_value(fn_ctx, &result);
+
+    let receiver = chan_stmt_receiver(stmt)?;
+    let receiver_name = receiver.lexeme();
+    let field_index = layout.fields.get(receiver_name).copied().ok_or_else(|| {
+        crate::CodegenError::LLVMError(format!(
+            "internal: received variable `{receiver_name}` has no future field"
+        ))
+    })?;
+    let slot = fn_ctx.future_field(field_index)?;
+    fn_ctx.define_var(receiver_name, slot, info.recv_ty.clone());
+    let coerced = coerce_value(
+        fn_ctx,
+        TypedValue::new(received, info.recv_ty.clone()),
+        &info.recv_ty,
+    )?;
+    emit_drop_replaced_value(fn_ctx, slot, &info.recv_ty, &coerced)?;
+    fn_ctx.builder.build_store(slot, coerced.value)?;
+
+    if info.op == ChanOpKind::Loop {
+        // Loop receive: run the body only when a real value arrived; a
+        // close-drain (`recv_ok == 0`) skips straight past the loop.
+        let ok_fn = fn_ctx
+            .module
+            .get_function("ntask_chan_recv_ok")
+            .ok_or_else(|| {
+                crate::CodegenError::LLVMError("ntask_chan_recv_ok not declared".into())
+            })?;
+        let ok = fn_ctx.builder.build_call(ok_fn, &[], "chan_recv_ok")?;
+        let ok_val = call_result_to_value(fn_ctx, &ok).into_int_value();
+        let run_body = fn_ctx.builder.build_int_compare(
+            inkwell::IntPredicate::EQ,
+            ok_val,
+            fn_ctx.context.i8_type().const_int(1, false),
+            "recv_got_value",
+        )?;
+        let body_bb = fn_ctx
+            .context
+            .append_basic_block(fn_ctx.function, "chan_loop_body");
+        let end_bb = fn_ctx
+            .context
+            .append_basic_block(fn_ctx.function, "chan_loop_end");
+        fn_ctx
+            .builder
+            .build_conditional_branch(run_body, body_bb, end_bb)?;
+        fn_ctx.builder.position_at_end(body_bb);
+        if let Stmt::ChanRecvFor { body, .. } = stmt {
+            emit_statement_in_function(fn_ctx, body)?;
+        }
+        if fn_ctx
+            .builder
+            .get_insert_block()
+            .is_some_and(|block| block.get_terminator().is_none())
+        {
+            // Back-edge: suspend on the next receive, exactly like the
+            // initial suspension (recv, assert handle, store state, yield).
+            let channel = emit_expression(fn_ctx, &stmt_channel_clone(stmt)?)?;
+            let channel_arg = channel.value.into_int_value();
+            let recv_fn = fn_ctx
+                .module
+                .get_function("ntask_chan_recv")
+                .ok_or_else(|| {
+                    crate::CodegenError::LLVMError("ntask_chan_recv not declared".into())
+                })?;
+            let result =
+                fn_ctx
+                    .builder
+                    .build_call(recv_fn, &[channel_arg.into()], "chan_recv_next")?;
+            let returned = call_result_to_value(fn_ctx, &result).into_int_value();
+            let handle_ok = fn_ctx.builder.build_int_compare(
+                inkwell::IntPredicate::EQ,
+                returned,
+                fn_ctx.context.i8_type().const_zero(),
+                "chan_handle_ok_next",
+            )?;
+            let handle_ok_i8 = fn_ctx.builder.build_int_z_extend(
+                handle_ok,
+                fn_ctx.context.i8_type(),
+                "chan_handle_ok_next_i8",
+            )?;
+            fn_ctx.builder.build_call(
+                fn_ctx.module.get_function("ntsc_assert").ok_or_else(|| {
+                    crate::CodegenError::LLVMError("ntsc_assert not declared".into())
+                })?,
+                &[
+                    handle_ok_i8.into(),
+                    fn_ctx.context.i64_type().const_zero().into(),
+                ],
+                "chan_handle_assert_next",
+            )?;
+            let state_ptr = fn_ctx.future_field(0)?;
+            let next_state = fn_ctx
+                .context
+                .i32_type()
+                .const_int((layout.chan_state_index[chan_idx] as u64) + 1, false);
+            fn_ctx.builder.build_store(state_ptr, next_state)?;
+            fn_ctx
+                .builder
+                .build_return(Some(&fn_ctx.context.i8_type().const_int(0, false)))?;
+        }
+        fn_ctx.builder.position_at_end(end_bb);
+    }
+    Ok(())
+}
+
+/// The channel operand expression of a channel suspension statement,
+/// cloned so the loop back-edge can re-evaluate it.
+fn stmt_channel_clone(stmt: &Stmt) -> Result<Expr, crate::CodegenError> {
+    match stmt {
+        Stmt::ChanRecvFor { channel, .. } => Ok(channel.clone()),
+        _ => chan_stmt_channel(stmt).cloned(),
+    }
+}
+
 /// Complete the future: store the result, set the done state, return 1.
 pub(crate) fn emit_async_return<'ctx>(
     fn_ctx: &mut FunctionContext<'ctx, '_>,
@@ -1396,12 +2233,355 @@ pub(crate) fn emit_async_return<'ctx>(
     let done_state = fn_ctx
         .context
         .i32_type()
-        .const_int((layout.await_infos.len() as u64) + 1, false);
+        .const_int((layout.suspension_count as u64) + 1, false);
     fn_ctx.builder.build_store(state_ptr, done_state)?;
     fn_ctx
         .builder
         .build_return(Some(&fn_ctx.context.i8_type().const_int(1, false)))?;
     Ok(())
+}
+
+/// Spawn a goroutine for `Stmt::Go`: allocate and zero the callee's future,
+/// fill its parameter/capture slots, then `ntask_go` it onto the scheduler
+/// and drop the handle. The callee's future struct and poll must already
+/// exist (module-level async functions are emitted by the pipeline; `go { }`
+/// blocks by the pre-pass in `module.rs`).
+pub(crate) fn emit_go_program_spawn<'ctx>(
+    fn_ctx: &mut FunctionContext<'ctx, '_>,
+    stmt: &Stmt,
+) -> Result<(), crate::CodegenError> {
+    let Stmt::Go {
+        call,
+        block,
+        keyword_span,
+    } = stmt
+    else {
+        return Err(crate::CodegenError::LLVMError(
+            "internal: expected a go statement".into(),
+        ));
+    };
+
+    let (child_name, arguments): (String, Vec<Expr>) = if let Some(_block) = block {
+        let name = format!("__ntsc_go_{}", keyword_span.start);
+        let captures = ntsc_typeck::go_captures(keyword_span.start);
+        let args = captures
+            .iter()
+            .map(|(capture, _)| Expr::Variable {
+                name: ntsc_ast::token::Token::new(
+                    ntsc_ast::token::TokenKind::Identifier(capture.clone()),
+                    ntsc_ast::span::Span::dummy(),
+                ),
+            })
+            .collect();
+        (name, args)
+    } else {
+        match call {
+            Expr::Call {
+                callee, arguments, ..
+            } => {
+                let name = match callee.as_ref() {
+                    Expr::Variable { name } => name.lexeme().to_string(),
+                    _ => {
+                        return Err(crate::CodegenError::LLVMError(
+                            "go requires a call to a named async function".into(),
+                        ));
+                    }
+                };
+                (name, arguments.clone())
+            }
+            _ => {
+                return Err(crate::CodegenError::LLVMError(
+                    "go requires a call or a block".into(),
+                ));
+            }
+        }
+    };
+
+    let child_struct_name = format!("ntsc_future_{child_name}");
+    let child_struct_ty = fn_ctx
+        .module
+        .get_struct_type(&child_struct_name)
+        .ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!(
+                "internal: go callee future {child_struct_name} not declared"
+            ))
+        })?;
+    let child_size = child_struct_ty.size_of().ok_or_else(|| {
+        crate::CodegenError::LLVMError(format!("internal: {child_struct_name} has no size"))
+    })?;
+
+    let malloc_fn = fn_ctx
+        .module
+        .get_function("malloc")
+        .ok_or_else(|| crate::CodegenError::LLVMError("malloc not declared".into()))?;
+    let child_ptr = call_result_to_value(
+        fn_ctx,
+        &fn_ctx
+            .builder
+            .build_call(malloc_fn, &[child_size.into()], "go_future_alloc")?,
+    )
+    .into_pointer_value();
+    let child_ptr = fn_ctx.builder.build_pointer_cast(
+        child_ptr,
+        fn_ctx.context.ptr_type(AddressSpace::default()),
+        "go_future",
+    )?;
+    let zero = fn_ctx.context.i8_type().const_zero();
+    fn_ctx
+        .builder
+        .build_memset(child_ptr, 1, zero, child_size)?;
+
+    let arg_values = emit_call_arguments(fn_ctx, &arguments)?;
+    for (i, arg_val) in arg_values.iter().enumerate() {
+        // The goroutine's future releases its own `chan` reference on drop.
+        retain_chan_value(fn_ctx, &arguments[i], arg_val)?;
+        let slot =
+            fn_ctx
+                .builder
+                .build_struct_gep(child_struct_ty, child_ptr, 1 + i as u32, "go_arg")?;
+        fn_ctx.builder.build_store(slot, arg_val.value)?;
+        if ty_is_owned_handle(&arg_val.ntsc_type)
+            && !matches!(arg_val.ntsc_type, Ty::Chan(_))
+            && let Expr::Variable { name } = &arguments[i]
+            && let Some((ptr, _)) = fn_ctx.variables.get(name.lexeme())
+        {
+            fn_ctx
+                .builder
+                .build_store(*ptr, default_llvm_value(&arg_val.ntsc_type, fn_ctx.context))?;
+        }
+    }
+
+    let poll_fn = fn_ctx
+        .module
+        .get_function(&format!("ntsc_future_{child_name}_go_poll"))
+        .or_else(|| {
+            fn_ctx
+                .module
+                .get_function(&format!("ntsc_future_{child_name}_poll"))
+        })
+        .ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!(
+                "internal: go callee poll ntsc_future_{child_name}_poll not declared"
+            ))
+        })?;
+    let poll_ptr = fn_ctx.builder.build_pointer_cast(
+        poll_fn.as_global_value().as_pointer_value(),
+        fn_ctx.context.ptr_type(AddressSpace::default()),
+        "go_poll_fn",
+    )?;
+    let child_handle =
+        fn_ctx
+            .builder
+            .build_ptr_to_int(child_ptr, fn_ctx.context.i64_type(), "go_handle")?;
+    // `go f(x)` discards the handle, so spawn detached: no registry wrapper is
+    // allocated for something nothing can join. The cleanup thunk still lets
+    // the scheduler reclaim a future that never completes. It is created on
+    // demand here, so a spawn that runs before the callee's trampoline was
+    // emitted still hands the scheduler a cleanup — a missing thunk used to
+    // fall back to a spawn without cleanup, leaking the future and every
+    // handle its slots hold at shutdown.
+    let cleanup_fn = get_or_create_goroutine_cleanup(fn_ctx.context, fn_ctx.module, &child_name)?;
+    let cleanup_ptr = fn_ctx.builder.build_pointer_cast(
+        cleanup_fn.as_global_value().as_pointer_value(),
+        fn_ctx.context.ptr_type(AddressSpace::default()),
+        "go_cleanup_fn",
+    )?;
+    let go_detached_fn = fn_ctx
+        .module
+        .get_function("ntask_go_detached")
+        .ok_or_else(|| crate::CodegenError::LLVMError("ntask_go_detached not declared".into()))?;
+    fn_ctx.builder.build_call(
+        go_detached_fn,
+        &[poll_ptr.into(), child_handle.into(), cleanup_ptr.into()],
+        "go_spawn",
+    )?;
+    Ok(())
+}
+
+/// Emit `ntsc_future_<name>_go_poll(i64 future) -> i8`: the goroutine entry
+/// wrapper. Drives the child's poll; on completion it reclaims the
+/// heap-allocated future through the cleanup thunk, since the scheduler does
+/// not know how the future was allocated.
+pub(crate) fn emit_goroutine_trampoline<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    child_name: &str,
+) -> Result<(), crate::CodegenError> {
+    let trampoline_name = format!("ntsc_future_{child_name}_go_poll");
+    if module.get_function(&trampoline_name).is_some() {
+        return Ok(());
+    }
+    let child_poll = module
+        .get_function(&format!("ntsc_future_{child_name}_poll"))
+        .ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!(
+                "internal: go callee poll ntsc_future_{child_name}_poll not declared"
+            ))
+        })?;
+    let cleanup_fn = get_or_create_goroutine_cleanup(context, module, child_name)?;
+
+    let trampoline = module.add_function(
+        &trampoline_name,
+        context
+            .i8_type()
+            .fn_type(&[context.i64_type().into()], false),
+        Some(inkwell::module::Linkage::External),
+    );
+    let entry = context.append_basic_block(trampoline, "entry");
+    let builder = context.create_builder();
+    builder.position_at_end(entry);
+
+    let handle = trampoline
+        .get_nth_param(0)
+        .ok_or_else(|| crate::CodegenError::LLVMError("missing trampoline param".into()))?
+        .into_int_value();
+    let done = builder.build_call(child_poll, &[handle.into()], "go_poll")?;
+    let done_val = done
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| crate::CodegenError::LLVMError("poll returned void".into()))?
+        .into_int_value();
+    let is_done = builder.build_int_compare(
+        inkwell::IntPredicate::EQ,
+        done_val,
+        context.i8_type().const_int(1, false),
+        "go_done",
+    )?;
+
+    let cleanup = context.append_basic_block(trampoline, "cleanup");
+    let exit = context.append_basic_block(trampoline, "exit");
+    builder.build_conditional_branch(is_done, cleanup, exit)?;
+
+    builder.position_at_end(cleanup);
+    builder.build_call(cleanup_fn, &[handle.into()], "go_future_cleanup")?;
+    builder.build_unconditional_branch(exit)?;
+
+    builder.position_at_end(exit);
+    builder.build_return(Some(&done_val))?;
+    Ok(())
+}
+
+/// Get (or emit) `ntsc_future_<name>_go_cleanup(i64 future)`: reclaims one
+/// heap-allocated goroutine future. The trampoline calls it on completion; the
+/// scheduler calls it at shutdown for a goroutine that never completed.
+fn get_or_create_goroutine_cleanup<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    child_name: &str,
+) -> Result<FunctionValue<'ctx>, crate::CodegenError> {
+    let name = format!("ntsc_future_{child_name}_go_cleanup");
+    if let Some(existing) = module.get_function(&name) {
+        return Ok(existing);
+    }
+    let child_drop = module
+        .get_function(&format!("ntsc_future_{child_name}_drop"))
+        .ok_or_else(|| {
+            crate::CodegenError::LLVMError(format!(
+                "internal: go callee drop ntsc_future_{child_name}_drop not declared"
+            ))
+        })?;
+    let free_fn = module
+        .get_function("free")
+        .ok_or_else(|| crate::CodegenError::LLVMError("free not declared".into()))?;
+
+    let function = module.add_function(
+        &name,
+        context
+            .void_type()
+            .fn_type(&[context.i64_type().into()], false),
+        Some(inkwell::module::Linkage::External),
+    );
+    let entry = context.append_basic_block(function, "entry");
+    let builder = context.create_builder();
+    builder.position_at_end(entry);
+
+    let handle = function
+        .get_nth_param(0)
+        .ok_or_else(|| crate::CodegenError::LLVMError("missing cleanup param".into()))?
+        .into_int_value();
+    let is_null = builder.build_int_compare(
+        inkwell::IntPredicate::EQ,
+        handle,
+        context.i64_type().const_zero(),
+        "go_cleanup_null",
+    )?;
+    let body = context.append_basic_block(function, "body");
+    let done = context.append_basic_block(function, "done");
+    builder.build_conditional_branch(is_null, done, body)?;
+
+    builder.position_at_end(body);
+    let ptr = builder.build_int_to_ptr(
+        handle,
+        context.ptr_type(AddressSpace::default()),
+        "go_future_ptr",
+    )?;
+    builder.build_call(child_drop, &[ptr.into()], "go_future_drop")?;
+    builder.build_call(free_fn, &[ptr.into()], "go_future_free")?;
+    builder.build_unconditional_branch(done)?;
+
+    builder.position_at_end(done);
+    builder.build_return(None)?;
+    Ok(function)
+}
+
+/// Convert a checker type back to a param annotation. Capture types are
+/// scalar or handle types, so the general cases reduce to a small table.
+fn ty_to_annotation(ty: &Ty) -> ntsc_ast::types::TypeAnnotation {
+    use ntsc_ast::types::TypeAnnotation as Ann;
+    match ty {
+        Ty::Int => Ann::Int,
+        Ty::Float => Ann::Float,
+        Ty::Bool => Ann::Bool,
+        Ty::String => Ann::String,
+        Ty::Array(element) => Ann::Array(Some(Box::new(ty_to_annotation(element)))),
+        Ty::Chan(element) => Ann::Chan(Box::new(ty_to_annotation(element))),
+        _ => Ann::Any,
+    }
+}
+
+/// Compile a `go { ... }` block as a synthetic async function whose params
+/// are the block's captured outer locals (in the sorted order typeck
+/// recorded), then emit its future through the normal async machinery.
+/// Called from the module pre-pass, which runs before any body is emitted,
+/// so the future struct exists when the spawn site references it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_go_block_future<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    program: &Program,
+    name: &str,
+    block: &[Stmt],
+    captures: &[(String, Ty)],
+    done: &mut HashSet<String>,
+    in_progress: &mut HashSet<String>,
+) -> Result<(), crate::CodegenError> {
+    if module
+        .get_function(&format!("ntsc_future_{name}_poll"))
+        .is_some()
+    {
+        return Ok(());
+    }
+    let name_token = ntsc_ast::token::Token::new(
+        ntsc_ast::token::TokenKind::Identifier(name.to_string()),
+        ntsc_ast::span::Span::dummy(),
+    );
+    let params = captures
+        .iter()
+        .map(|(capture, ty)| ntsc_ast::expr::FunctionParam {
+            name: ntsc_ast::token::Token::new(
+                ntsc_ast::token::TokenKind::Identifier(capture.clone()),
+                ntsc_ast::span::Span::dummy(),
+            ),
+            type_annotation: Some(ty_to_annotation(ty)),
+        })
+        .collect();
+    let decl = Stmt::AsyncFunction {
+        name: name_token,
+        params,
+        return_type: None,
+        body: block.to_vec(),
+    };
+    emit_async_function(context, module, program, &decl, done, in_progress)
 }
 
 /// Synchronous `__ntsc_user_main` for an async `main`: stack-allocate and

@@ -8,24 +8,30 @@ description = "Runtime support library for NTSC-compiled binaries"
 [lib]
 crate-type = ["staticlib", "rlib"]
 
+[features]
+default = ["full"]
+full = ["regex", "http", "archive", "crypto"]
+regex = ["dep:regex"]
+http = ["dep:rustls", "dep:webpki-roots"]
+archive = ["dep:tar", "dep:flate2", "dep:crc32fast"]
+crypto = ["dep:sha2", "dep:base64", "dep:md5", "dep:hmac", "dep:crc32fast"]
+
 [dependencies]
-sha2 = "0.10"
-base64 = "0.22"
-regex = "1.11"
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+regex = { version = "1.11", optional = true }
 # TLS for `https://` in the `http` module. rustls is pure Rust (no system
 # OpenSSL dependency) and webpki-roots bundles Mozilla's CA bundle, so a
 # compiled binary stays self-contained. The `ring` provider is used instead
 # of the default `aws-lc-rs` because it needs no C toolchain or cmake.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1.0"
-tar = "0.4"
-flate2 = "1.1"
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-crc32fast = "1.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1.0", optional = true }
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1.1", optional = true }
+crc32fast = { version = "1.4", optional = true }
 libc = "0.2"
-md5 = "0.7"
-hmac = "0.12"
+md5 = { version = "0.7", optional = true }
+hmac = { version = "0.12", optional = true }
 
 [dev-dependencies]
 # Generates a self-signed certificate for the offline TLS round-trip test.

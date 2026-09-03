@@ -145,18 +145,23 @@ pub extern "C" fn ntsc_arrays_range(start: i64, end: i64) -> i64 {
     registry::array_range(start, end)
 }
 
-/// `arrays.every(arr, cond)` — stub: returns 1 iff the array is non-empty;
-/// `cond` is ignored.
+/// `arrays.every(arr, pred)` — 1 iff `pred` is true for every element
+/// (vacuously 1 for an empty array). `pred` receives the raw element
+/// bits: an integer value, or a string handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn ntsc_arrays_every(arr: i64, _cond: i64) -> i8 {
-    i8::from(registry::array_len(arr) > 0)
+pub extern "C" fn ntsc_arrays_every(arr: i64, pred: extern "C" fn(i64) -> i8) -> i8 {
+    let elements = registry::array_to_vec(arr);
+    // The predicate may call back into the registry, so iteration runs over
+    // a pre-read snapshot of the element bits, as in `sort.sort_by`.
+    i8::from(elements.into_iter().all(|elem| pred(elem) != 0))
 }
 
-/// `arrays.some(arr, cond)` — stub: returns 1 iff the array is non-empty;
-/// `cond` is ignored.
+/// `arrays.some(arr, pred)` — 1 iff `pred` is true for at least one
+/// element; 0 for an empty array. `pred` receives the raw element bits.
 #[unsafe(no_mangle)]
-pub extern "C" fn ntsc_arrays_some(arr: i64, _cond: i64) -> i8 {
-    i8::from(registry::array_len(arr) > 0)
+pub extern "C" fn ntsc_arrays_some(arr: i64, pred: extern "C" fn(i64) -> i8) -> i8 {
+    let elements = registry::array_to_vec(arr);
+    i8::from(elements.into_iter().any(|elem| pred(elem) != 0))
 }
 
 /// `arrays.flat(arr)` — flatten one level (clone with the flatten flag;
@@ -207,5 +212,36 @@ mod tests {
         assert_eq!(registry::array_len(r), 3);
         assert_eq!(registry::array_get(r, 0), Some(1));
         registry::array_drop(r);
+    }
+
+    extern "C" fn gt_one(elem: i64) -> i8 {
+        i8::from(elem > 1)
+    }
+
+    extern "C" fn gte_one(elem: i64) -> i8 {
+        i8::from(elem >= 1)
+    }
+
+    extern "C" fn gt_three(elem: i64) -> i8 {
+        i8::from(elem > 3)
+    }
+
+    #[test]
+    fn test_every_some_call_predicate() {
+        let arr = ntsc_arrays_range(1, 4);
+        assert_eq!(ntsc_arrays_every(arr, gte_one), 1);
+        assert_eq!(ntsc_arrays_every(arr, gt_one), 0);
+        assert_eq!(ntsc_arrays_every(arr, gt_three), 0);
+        assert_eq!(ntsc_arrays_some(arr, gt_one), 1);
+        assert_eq!(ntsc_arrays_some(arr, gt_three), 0);
+        registry::array_drop(arr);
+    }
+
+    #[test]
+    fn test_every_some_empty_array() {
+        let arr = ntsc_arrays_new();
+        assert_eq!(ntsc_arrays_every(arr, gt_one), 1);
+        assert_eq!(ntsc_arrays_some(arr, gt_one), 0);
+        registry::array_drop(arr);
     }
 }

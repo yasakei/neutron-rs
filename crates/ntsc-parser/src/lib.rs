@@ -96,6 +96,8 @@ fn token_debug_name(kind: &TokenKind) -> &'static str {
         TokenKind::Less => "<",
         TokenKind::LessEqual => "<=",
         TokenKind::LessLess => "<<",
+        TokenKind::LessPipe => "<|",
+        TokenKind::PipeGreater => "|>",
         TokenKind::PlusPlus => "++",
         TokenKind::MinusMinus => "--",
         TokenKind::AndSym => "&&",
@@ -168,6 +170,9 @@ fn token_debug_name(kind: &TokenKind) -> &'static str {
         TokenKind::Shared => "shared",
         TokenKind::Copy => "copy",
         TokenKind::Own => "own",
+        TokenKind::Go => "go",
+        TokenKind::Chan => "chan",
+        TokenKind::Close => "close",
         TokenKind::Eof => "end of file",
     }
 }
@@ -445,6 +450,7 @@ impl<'src> Parser<'src> {
                     })
                 }
             }
+            TokenKind::Go => self.parse_go_statement(),
             TokenKind::Class => self.parse_class_declaration(),
             TokenKind::Enum => self.parse_enum_declaration(),
             TokenKind::Type => self.parse_type_alias_declaration(),
@@ -1174,6 +1180,19 @@ impl<'src> Parser<'src> {
                 _ => TypeAnnotation::from_token(&token),
             };
         }
+        // `chan[T]` — a virtual-task channel type.
+        if self.peek().kind == TokenKind::Chan {
+            self.advance();
+            self.expect(TokenKind::LeftBracket, "expected '[' after 'chan'")
+                .ok()?;
+            let element = self.parse_type_annotation(true)?;
+            self.expect(
+                TokenKind::RightBracket,
+                "expected ']' after chan element type",
+            )
+            .ok()?;
+            return Some(TypeAnnotation::Chan(Box::new(element)));
+        }
         // `dyn` stays contextual so existing code can still use it as a
         // plain identifier (`var dyn = []`); it begins a trait object only
         // when a type follows it.
@@ -1527,6 +1546,31 @@ impl<'src> Parser<'src> {
             });
         }
 
+        // `for v in chan { ... }` — receive from a channel until it closes.
+        if self.peek_at_ident(0) && self.peek_at(1) == &TokenKind::In {
+            let variable = self.expect_ident("expected channel element variable name")?;
+            self.expect(TokenKind::In, "expected 'in' after 'for variable'")?;
+            let channel = self.parse_expression()?;
+            self.skip_newlines();
+            self.expect(TokenKind::LeftBrace, "expected '{' for channel-for body")?;
+            let mut body = Vec::new();
+            self.skip_newlines();
+            while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+                body.push(self.parse_statement()?);
+                self.skip_newlines();
+            }
+            self.expect(TokenKind::RightBrace, "expected '}'")?;
+            return Ok(Stmt::ChanRecvFor {
+                variable,
+                channel,
+                body: Box::new(Stmt::Block {
+                    statements: body,
+                    open_span: Span::dummy(),
+                    close_span: Span::dummy(),
+                }),
+            });
+        }
+
         if self.check(&TokenKind::LeftParen) {
             // Look ahead for `for (var key in expr)`; rewind to the saved
             // position if it does not match.
@@ -1599,6 +1643,39 @@ impl<'src> Parser<'src> {
             variable,
             iterable,
             body,
+        })
+    }
+
+    fn parse_go_statement(&mut self) -> Result<Stmt, ParseError> {
+        let keyword_span = self.advance().span;
+        self.skip_newlines();
+
+        if self.check(&TokenKind::LeftBrace) {
+            // `go { ... }` — spawn a goroutine running the inline block.
+            self.advance();
+            let mut body = Vec::new();
+            self.skip_newlines();
+            while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+                body.push(self.parse_statement()?);
+                self.skip_newlines();
+            }
+            self.expect(TokenKind::RightBrace, "expected '}' after go block")?;
+            return Ok(Stmt::Go {
+                call: Expr::Literal {
+                    value: LiteralValue::Nil,
+                    span: keyword_span,
+                },
+                block: Some(body),
+                keyword_span,
+            });
+        }
+
+        // `go fn(args)` — spawn a goroutine evaluating the expression.
+        let call = self.parse_expression()?;
+        Ok(Stmt::Go {
+            call,
+            block: None,
+            keyword_span,
         })
     }
 
@@ -1903,6 +1980,17 @@ impl<'src> Parser<'src> {
                     span: tok.span,
                 })
             }
+            TokenKind::Close => {
+                // `close(chan)` — close a channel for further sends.
+                let keyword = self.advance().span;
+                self.expect(TokenKind::LeftParen, "expected '(' after 'close'")?;
+                let channel = self.parse_expression()?;
+                self.expect(TokenKind::RightParen, "expected ')' after close argument")?;
+                Ok(Expr::Close {
+                    channel: Box::new(channel),
+                    keyword,
+                })
+            }
             TokenKind::Identifier(_) => {
                 let tok = self.advance();
                 let tok = if self.looks_like_generic_call() {
@@ -2014,6 +2102,21 @@ impl<'src> Parser<'src> {
                 } else {
                     Err(ParseError {
                         message: "unexpected 'async' in expression".into(),
+                        span: self.peek().span,
+                    })
+                }
+            }
+            TokenKind::Chan => {
+                // `chan.new(capacity)` in expression position: the keyword
+                // names the constructor namespace.
+                if matches!(self.peek_at(1), TokenKind::Dot) {
+                    let tok = self.advance();
+                    Ok(Expr::Variable {
+                        name: Token::new(TokenKind::Identifier("chan".to_string()), tok.span),
+                    })
+                } else {
+                    Err(ParseError {
+                        message: "unexpected 'chan' in expression; use `chan.new(capacity)`".into(),
                         span: self.peek().span,
                     })
                 }
@@ -2291,7 +2394,10 @@ impl<'src> Parser<'src> {
             TokenKind::Pipe => Precedence::BitwiseOr,
             TokenKind::Caret => Precedence::BitwiseXor,
             TokenKind::Ampersand => Precedence::BitwiseAnd,
-            TokenKind::LessLess | TokenKind::GreaterGreater => Precedence::Shift,
+            TokenKind::LessLess
+            | TokenKind::GreaterGreater
+            | TokenKind::LessPipe
+            | TokenKind::PipeGreater => Precedence::Shift,
             TokenKind::Plus | TokenKind::Minus => Precedence::Term,
             TokenKind::Star | TokenKind::Slash | TokenKind::Percent => Precedence::Factor,
             TokenKind::PlusPlus | TokenKind::MinusMinus => Precedence::Call,
@@ -2334,6 +2440,33 @@ impl<'src> Parser<'src> {
                     op,
                     right: Box::new(right),
                 })
+            }
+            // The arrow points where the data flows: `v |> ch` pipes the
+            // value into the channel (send); `r <| ch` feeds the receiver
+            // from the channel (receive).
+            TokenKind::PipeGreater => {
+                let op_span = self.advance().span;
+                let channel = self.parse_precedence(op_prec.next_higher())?;
+                Ok(Expr::ChanSend {
+                    channel: Box::new(channel),
+                    value: Box::new(left),
+                    op_span,
+                })
+            }
+            TokenKind::LessPipe => {
+                let op_span = self.advance().span;
+                let channel = self.parse_precedence(op_prec.next_higher())?;
+                match left {
+                    Expr::Variable { name } => Ok(Expr::ChanRecv {
+                        receiver: name,
+                        channel: Box::new(channel),
+                        op_span,
+                    }),
+                    _ => Err(ParseError {
+                        message: "receive target must be a variable".to_string(),
+                        span: op_span,
+                    }),
+                }
             }
             TokenKind::Equal => {
                 self.advance();
@@ -3675,6 +3808,51 @@ for (var i = 0; i < 10; i = i + 1) {
         let source = "say(a << 2 >> 1)";
         let prog = parse_source(source).unwrap();
         assert_eq!(prog.statements.len(), 1);
+    }
+
+    #[test]
+    fn channel_send_and_receive_parse() {
+        // `<|` receives, `|>` sends; they do not collide with the `<<`/`>>`
+        // shift operators.
+        let source = "jobs <| value\nvalue |> jobs";
+        let prog = parse_source(source).unwrap();
+        assert_eq!(prog.statements.len(), 2);
+        assert!(matches!(
+            &prog.statements[0],
+            Stmt::Expression {
+                expression: Expr::ChanRecv { .. }
+            }
+        ));
+        assert!(matches!(
+            &prog.statements[1],
+            Stmt::Expression {
+                expression: Expr::ChanSend { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn channel_receive_rejects_non_variable_target() {
+        let source = "(a + b) <| jobs";
+        let err = parse_source(source).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.message.contains("receive target must be a variable"))
+        );
+    }
+
+    #[test]
+    fn shift_operators_still_binary_after_channel_tokens() {
+        // `8 >> -2` is a shift, not a channel receive.
+        let source = "var x = 8 >> -2";
+        let prog = parse_source(source).unwrap();
+        match &prog.statements[0] {
+            Stmt::Var {
+                initializer: Some(expr),
+                ..
+            } => assert!(matches!(expr, Expr::Binary { .. })),
+            other => panic!("expected Var with binary shift, got {other:?}"),
+        }
     }
 
     #[test]

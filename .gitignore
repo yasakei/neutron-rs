@@ -36,7 +36,12 @@ benchmarks/_build/
 /AGENTS.md
 /TODO.md
 /pkgman.md
+/ntroutine.md
 
 # Agents
 .claude/
 .codex/
+
+# Python benchmark harness
+**/__pycache__/
+*.pyc

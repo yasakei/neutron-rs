@@ -268,6 +268,28 @@ fn shift_expr(expr: &mut Expr, base: usize) {
             shift_expr(object, base);
             shift_span(dot_span, base);
         }
+        Expr::ChanSend {
+            channel,
+            value,
+            op_span,
+        } => {
+            shift_expr(channel, base);
+            shift_expr(value, base);
+            shift_span(op_span, base);
+        }
+        Expr::ChanRecv {
+            receiver,
+            channel,
+            op_span,
+        } => {
+            shift_token(receiver, base);
+            shift_expr(channel, base);
+            shift_span(op_span, base);
+        }
+        Expr::Close { channel, keyword } => {
+            shift_expr(channel, base);
+            shift_span(keyword, base);
+        }
     }
 }
 
@@ -370,6 +392,28 @@ fn shift_stmt(stmt: &mut Stmt, base: usize) {
             shift_token(variable, base);
             shift_expr(producer, base);
             shift_stmt(body, base);
+        }
+        Stmt::ChanRecvFor {
+            variable,
+            channel,
+            body,
+        } => {
+            shift_token(variable, base);
+            shift_expr(channel, base);
+            shift_stmt(body, base);
+        }
+        Stmt::Go {
+            call,
+            block,
+            keyword_span,
+        } => {
+            shift_expr(call, base);
+            if let Some(block) = block {
+                for stmt in block {
+                    shift_stmt(stmt, base);
+                }
+            }
+            shift_span(keyword_span, base);
         }
         Stmt::Function {
             generic_params,

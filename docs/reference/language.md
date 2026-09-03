@@ -65,14 +65,15 @@ Integers are decimal only. There are no hex, octal, or binary literals.
 
 ```
 and        as         async      await      break      case
-catch      class      continue   copy       default    do
-elif       else       enum       false      finally    for
-from       fun        if         in         int        match
-mut        nil        or         option     own        retry
-return     unsafe     say        shared     slice      static
-string     super      test       this       throw      true
-try        use        var        view       while      quiet
-bool       float      array      object     any        result
+catch      chan       class      close      continue   copy
+default    do         elif       else       enum       false
+finally    for        from       fun        go         if
+in         int        match      mut        nil        or
+option     own        retry      return     unsafe     say
+shared     slice      static     string     super      test
+this       throw      true       try        use        var
+view       while      quiet      bool       float      array
+object     any        result
 ```
 
 `&` and `*` are prefix operators that also form pointer type annotations
@@ -85,6 +86,7 @@ bool       float      array      object     any        result
 +   -   *   /   %    ++   --   !   ~
 <   <=  >   >=  ==   !=   &&   ||  !
 <<  >>  &   |   ^
+<|  |>
 =   ?:  ?    ...  ?.  ->   =>   ( ) { } [ ] , . :
 ```
 
@@ -117,6 +119,8 @@ bool       float      array      object     any        result
 | `&T` / `&mut T` | Addressable reference / exclusive reference. |
 | `*const T` / `*mut T` | Raw pointer, usable only inside `unsafe`. |
 | `slice[T]` | Bounds-checked window over an `array[T]`. |
+| `chan[T]` | Virtual-task channel carrying elements of type `T`; created with `chan.new(capacity)`. Send with `\|>` (moves the value in), receive with `<\|` (moves it out). |
+
 | `(T, U, ...)` | Tuple type. |
 | class name | Instance of that class. |
 
@@ -536,6 +540,58 @@ for await name in producer { ... }
 Evaluates `producer` and iterates over its elements. Currently equivalent to
 `for (var name in producer)` but reserved for future streaming iteration where
 `producer` is an async iterable.
+
+### Go
+
+```
+go worker(args)
+go { ... }
+```
+
+`go` spawns a goroutine: a cheap stackless task on the work-stealing
+scheduler (one worker thread per CPU core). The call form runs an `async fun`
+on the scheduler; the block form compiles the block to an anonymous future.
+`go` never blocks the caller and returns nothing; when the process `main`
+returns, outstanding goroutines are abandoned (as in Go) — the runtime
+reclaims their futures and owned values at shutdown, so abandonment leaks
+nothing. There is no goroutine `join` in the language yet: coordinate
+completion with channels or `async.sleep`.
+
+Arguments and captured variables cross a thread boundary and are classified
+by the ownership checker: scalars are copied, safe handles (channels, files,
+sockets) are shared, owned heap values (`string`, `array`, `object`, class
+instances) are moved into the goroutine and can no longer be used by the
+caller, and `view`/`shared` values are rejected (`NTSC-E0501`). See
+[Ownership](#ownership) and the
+[concurrency guide](../guide/concurrency.md).
+
+### Channels
+
+`chan[T]` is a typed channel between goroutines, created with
+`chan.new(capacity)`:
+
+```ntsc
+var chan[int] jobs = chan.new(4)
+
+7 |> jobs        // send: moves 7 into `jobs` (parks while full)
+x <| jobs        // receive: binds a fresh `x` from `jobs` (parks while empty)
+close(jobs)      // no more sends; receivers drain what is queued
+```
+
+- `|>` sends: the arrow points where the data flows — the value is *moved
+  into* the channel on its right; the sender cannot use it afterwards
+  (`NTSC-E0501` on later use).
+- `<|` receives: the channel on the right feeds the variable on its left.
+  Legal only as a statement at the top level of an `async fun` body; it binds
+  a fresh variable that owns the received value.
+- `close(expr)` closes the channel. Receivers drain the values already queued,
+  then a receive completes with the zero value.
+- `for name in channel { ... }` receives one value per iteration until the
+  channel is closed and drained; also legal only at the top level of an
+  `async fun` body.
+
+Channel sends/receives are suspension points: a blocked operation parks the
+goroutine without tying up a scheduler thread.
 
 ### Break and continue
 

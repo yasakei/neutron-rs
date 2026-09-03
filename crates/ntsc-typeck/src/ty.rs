@@ -79,6 +79,11 @@ pub enum Ty {
 
     /// `(T1, T2, ...)` — a fixed-size, heterogeneous product type.
     Tuple(Vec<Ty>),
+
+    /// A virtual-task channel communicating elements of `Ty`, used to move
+    /// values between goroutines. Sends move values in; receives move them
+    /// out.
+    Chan(Box<Ty>),
 }
 
 impl Ty {
@@ -126,6 +131,7 @@ impl Ty {
                 let inner: Vec<_> = elems.iter().map(|e| e.label()).collect();
                 format!("({})", inner.join(", "))
             }
+            Self::Chan(inner) => format!("chan[{}]", inner.label()),
         }
     }
 
@@ -219,6 +225,7 @@ impl Ty {
             (Self::Tuple(a), Self::Tuple(b)) => {
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.is_assignable_from(y))
             }
+            (Self::Chan(a), Self::Chan(b)) => a.is_assignable_from(b),
 
             // A view-typed target accepts: another view (a shared target
             // takes shared or mutable views, a mutable target takes only

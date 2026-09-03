@@ -1,0 +1,39 @@
+// ntroutine — goroutines and channels: spawn a few workers, feed them jobs
+// over a buffered channel, and let each worker report back when it finishes.
+//
+// Build and run with:
+//   ntsc build
+//   ./build/debug/ntroutine
+
+async fun worker(string name, chan[string] jobs, chan[string] done) {
+    for job in jobs {
+        say(name + " handled " + job)
+    }
+    name |> done
+}
+
+async fun main() -> int {
+    var chan[string] jobs = chan.new(4)
+    var chan[string] done = chan.new(3)
+
+    go worker("alpha", jobs, done)
+    go worker("beta", jobs, done)
+    go worker("gamma", jobs, done)
+
+    "apple" |> jobs
+    "pear" |> jobs
+    "plum" |> jobs
+    close(jobs)
+
+    var int finished = 0
+    for who in done {
+        say(who + " finished")
+        finished = finished + 1
+        if (finished == 3) {
+            close(done)
+        }
+    }
+
+    say("ntroutine example: all workers done")
+    return 0
+}

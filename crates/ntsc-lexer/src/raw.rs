@@ -63,12 +63,16 @@ pub(crate) enum RawToken {
     GreaterEqual,
     #[token(">>")]
     GreaterGreater,
+    #[token("|>")]
+    PipeGreater,
     #[token(">")]
     Greater,
     #[token("<=")]
     LessEqual,
     #[token("<<")]
     LessLess,
+    #[token("<|")]
+    LessPipe,
     #[token("<")]
     Less,
     #[token("++")]
@@ -217,6 +221,16 @@ pub(crate) enum RawToken {
     Copy,
     #[token("own")]
     Own,
+
+    // `go`/`chan`/`close` — virtual-task concurrency vocabulary.
+    #[token("go")]
+    Go,
+
+    #[token("chan")]
+    Chan,
+
+    #[token("close")]
+    Close,
 
     // ── Type annotation keywords ─────────────────────────────────
     #[token("int")]

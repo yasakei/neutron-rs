@@ -114,9 +114,10 @@ def compile_ntsc(ntsc_bin, src_file, out_dir):
 
     # Write neutron.toml
     with open(os.path.join(bench_tmp, "neutron.toml"), "w") as f:
-        f.write(f'target "{host_triple()}"\n')
-        f.write(f'entry "src/main.nt"\n')
-        f.write(f'output "{out_bin}"\n')
+        f.write("[package]\n")
+        f.write(f'target = "{host_triple()}"\n')
+        f.write(f'entry = "src/main.nt"\n')
+        f.write(f'output = "{out_bin}"\n')
 
     # Copy source as main.nt
     with open(src_file) as f:

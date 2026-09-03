@@ -22,7 +22,9 @@
 //! deadlock and must never happen.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+use crate::idmap::IdMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -34,8 +36,33 @@ pub(crate) const NULL: i64 = 0;
 /// slots).
 pub(crate) const PTR_SIZE: usize = std::mem::size_of::<i64>();
 
-static REGISTRY: LazyLock<Mutex<HashMap<i64, Handle>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The handle table, sharded by id: a hot request touches several handles
+/// (strings, sockets, futures) across workers, and one global mutex
+/// serializes exactly that traffic.
+const REGISTRY_SHARDS: usize = 64;
+static REGISTRY: LazyLock<Box<[Mutex<IdMap<Handle>>]>> = LazyLock::new(|| {
+    (0..REGISTRY_SHARDS)
+        .map(|_| Mutex::new(IdMap::default()))
+        .collect()
+});
+
+/// The shard holding `id`. Every registry operation takes exactly one shard
+/// and never holds it while calling back into the registry, so there is no
+/// lock ordering to violate.
+#[inline]
+fn shard_lock(id: i64) -> std::sync::MutexGuard<'static, IdMap<Handle>> {
+    REGISTRY[(id.unsigned_abs() as usize) & (REGISTRY_SHARDS - 1)]
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Lock every shard in index order, for whole-table reads.
+fn all_shards() -> Vec<std::sync::MutexGuard<'static, IdMap<Handle>>> {
+    REGISTRY
+        .iter()
+        .map(|shard| shard.lock().unwrap_or_else(|p| p.into_inner()))
+        .collect()
+}
 static NEXT_ID: AtomicI64 = AtomicI64::new(1);
 static LIVE: AtomicI64 = AtomicI64::new(0);
 
@@ -44,8 +71,8 @@ static LIVE: AtomicI64 = AtomicI64::new(0);
 /// never removed, and are excluded from leak reporting.
 static PERMANENT: AtomicI64 = AtomicI64::new(0);
 static PERMANENT_IDS: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-static LEAK_SITES: LazyLock<Mutex<HashMap<i64, (i64, i64)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static LEAK_SITES: LazyLock<Mutex<IdMap<(i64, i64)>>> =
+    LazyLock::new(|| Mutex::new(IdMap::default()));
 
 /// Bumped whenever an entry is removed. A cached capability is only reused
 /// while this is unchanged, so a dropped handle can never be served from a
@@ -111,6 +138,33 @@ pub(crate) enum Handle {
 
     /// The state machine of an `async.sleep(ms)` future.
     AsyncSleep { state: i32, ms: i64, deadline: i64 },
+
+    /// A scheduled virtual goroutine owned by the task scheduler.
+    Goroutine { core: i64 },
+
+    /// A channel core owned by the task scheduler, reference counted
+    /// like `Shared` so `go` and assignments can borrow the handle
+    /// without destroying the channel for peers. `core` is the
+    /// scheduler's `Chan` id, `count` is the number of live `Handle`
+    /// copies.
+    Chan { core: i64, count: u64 },
+
+    /// A reactor registration for timers or descriptor readiness.
+    ReactorReg { core: i64 },
+
+    /// An asynchronous I/O future associated with a reactor core.
+    AsyncIo { core: i64 },
+
+    /// An offloaded blocking future (sync `http.*`/`process.*` run on the
+    /// worker pool): `state` 0 = not started, 1 = awaiting an offloaded job,
+    /// 2 = done, holding the reaped result handle. The `work` closure runs
+    /// the blocking operation on the pool and completes the op it started.
+    AsyncOp {
+        state: i32,
+        work: Option<Box<dyn FnOnce() -> i64 + Send + 'static>>,
+        op: i64,
+        result: i64,
+    },
 
     /// An opaque value owned by a stdlib module (files, sockets,
     /// channels...).
@@ -277,7 +331,7 @@ pub(crate) fn slice_drop(id: i64) {
     if id == NULL {
         return;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     if matches!(guard.get(&id), Some(Handle::Slice(_))) {
         guard.remove(&id);
         LIVE.fetch_sub(1, Ordering::Relaxed);
@@ -326,7 +380,7 @@ pub(crate) fn memory_drop(id: i64) {
     if id == NULL {
         return;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     if matches!(guard.get(&id), Some(Handle::Memory(_))) {
         guard.remove(&id);
         LIVE.fetch_sub(1, Ordering::Relaxed);
@@ -412,21 +466,15 @@ pub(crate) struct SharedData {
     pub(crate) count: u64,
 }
 
-fn lock() -> std::sync::MutexGuard<'static, HashMap<i64, Handle>> {
-    REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 fn next_id() -> i64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 fn insert_locked(
-    guard: &mut std::sync::MutexGuard<'_, HashMap<i64, Handle>>,
+    guard: &mut std::sync::MutexGuard<'_, IdMap<Handle>>,
+    id: i64,
     handle: Handle,
 ) -> i64 {
-    let id = next_id();
     guard.insert(id, handle);
     // Bumped under the lock, like every other counter mutation, so the two
     // can never be observed out of step (see `counters_agree_with_map`).
@@ -436,14 +484,30 @@ fn insert_locked(
 
 /// Register an owned value and return its fresh handle.
 pub(crate) fn insert(handle: Handle) -> i64 {
-    insert_locked(&mut lock(), handle)
+    let id = next_id();
+    let mut guard = shard_lock(id);
+    insert_locked(&mut guard, id, handle)
+}
+
+/// Reserve a handle id before its value exists, for a caller that must know the
+/// id up front (a goroutine records its own wrapper id).
+pub(crate) fn reserve_id() -> i64 {
+    next_id()
+}
+
+/// Register `handle` under an id previously taken from [`reserve_id`].
+pub(crate) fn insert_reserved(id: i64, handle: Handle) {
+    let mut guard = shard_lock(id);
+    if guard.insert(id, handle).is_none() {
+        LIVE.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Register an owned value as permanent: it lives for the whole program
 /// and is never removed, so it is excluded from leak reporting.
 pub(crate) fn insert_permanent(handle: Handle) -> i64 {
     let id = next_id();
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     guard.insert(id, handle);
 
     PERMANENT.fetch_add(1, Ordering::Relaxed);
@@ -460,7 +524,7 @@ pub(crate) fn remove(id: i64) -> Option<Handle> {
     if id == NULL {
         return None;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     let taken = guard.remove(&id);
     if taken.is_some() {
         LIVE.fetch_sub(1, Ordering::Relaxed);
@@ -476,7 +540,7 @@ pub(crate) fn borrow<R>(id: i64, f: impl FnOnce(&Handle) -> R) -> Option<R> {
     if id == NULL {
         return None;
     }
-    let guard = lock();
+    let guard = shard_lock(id);
     let handle = guard.get(&id)?;
     Some(f(handle))
 }
@@ -488,7 +552,7 @@ pub(crate) fn borrow_mut<R>(id: i64, f: impl FnOnce(&mut Handle) -> R) -> Option
     if id == NULL {
         return None;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     let handle = guard.get_mut(&id)?;
     Some(f(handle))
 }
@@ -502,7 +566,7 @@ pub(crate) fn live_count() -> i64 {
 /// The shutdown reporter uses this instead of only printing the aggregate
 /// count, which makes the first debugging pass identify the surviving object.
 pub(crate) fn mark_leak_site(id: i64, line: i64, column: i64) {
-    if id == NULL || !lock().contains_key(&id) {
+    if id == NULL || !shard_lock(id).contains_key(&id) {
         return;
     }
     LEAK_SITES
@@ -519,15 +583,16 @@ pub(crate) struct LeakEntry {
 }
 
 pub(crate) fn live_entries() -> Vec<LeakEntry> {
-    let guard = lock();
+    let shards = all_shards();
     let permanent = PERMANENT_IDS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let sites = LEAK_SITES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut entries: Vec<_> = guard
+    let mut entries: Vec<_> = shards
         .iter()
+        .flat_map(|guard| guard.iter())
         .filter_map(|(&id, handle)| {
             if permanent.contains(&id) {
                 return None;
@@ -537,6 +602,11 @@ pub(crate) fn live_entries() -> Vec<LeakEntry> {
                 Handle::Array(_) => "array",
                 Handle::Shared(_) => "shared",
                 Handle::AsyncSleep { .. } => "async future",
+                Handle::Goroutine { .. } => "goroutine",
+                Handle::Chan { .. } => "channel",
+                Handle::ReactorReg { .. } => "reactor registration",
+                Handle::AsyncIo { .. } => "async io future",
+                Handle::AsyncOp { .. } => "offloaded future",
                 Handle::Opaque(_) => "opaque",
                 Handle::Memory(_) => "pointer capability",
                 Handle::Slice(_) => "slice",
@@ -587,7 +657,7 @@ pub(crate) fn take_string(id: i64) -> Option<String> {
     if id == NULL {
         return None;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     if !matches!(guard.get(&id), Some(Handle::String(_))) {
         return None;
     }
@@ -607,7 +677,7 @@ pub(crate) fn clone_string(id: i64) -> Option<i64> {
         return None;
     }
     let text = {
-        let guard = lock();
+        let guard = shard_lock(id);
         match guard.get(&id) {
             Some(Handle::String(s)) => s.clone(),
             _ => return None,
@@ -621,7 +691,7 @@ pub(crate) fn get_string(id: i64) -> Option<String> {
     if id == NULL {
         return None;
     }
-    let guard = lock();
+    let guard = shard_lock(id);
     match guard.get(&id) {
         Some(Handle::String(s)) => Some(s.clone()),
         _ => None,
@@ -634,7 +704,7 @@ pub(crate) fn with_string<R>(id: i64, f: impl FnOnce(&str) -> R) -> Option<R> {
     if id == NULL {
         return None;
     }
-    let guard = lock();
+    let guard = shard_lock(id);
     match guard.get(&id) {
         Some(Handle::String(s)) => Some(f(s)),
         _ => None,
@@ -643,21 +713,17 @@ pub(crate) fn with_string<R>(id: i64, f: impl FnOnce(&str) -> R) -> Option<R> {
 
 /// Concatenate two strings, registering the result.
 pub(crate) fn string_concat(a: i64, b: i64) -> Option<i64> {
-    let (sa, sb) = {
-        let guard = lock();
-        let sa = match guard.get(&a) {
-            Some(Handle::String(s)) => s.clone(),
-            // The null handle (and any unknown handle) reads as an empty
-            // string, so concatenating a value that failed to produce a
-            // handle still yields the surviving text instead of collapsing
-            // the whole expression to null.
-            _ => String::new(),
-        };
-        let sb = match guard.get(&b) {
-            Some(Handle::String(s)) => s.clone(),
-            _ => String::new(),
-        };
-        (sa, sb)
+    let sa = match shard_lock(a).get(&a) {
+        Some(Handle::String(s)) => s.clone(),
+        // The null handle (and any unknown handle) reads as an empty
+        // string, so concatenating a value that failed to produce a
+        // handle still yields the surviving text instead of collapsing
+        // the whole expression to null.
+        _ => String::new(),
+    };
+    let sb = match shard_lock(b).get(&b) {
+        Some(Handle::String(s)) => s.clone(),
+        _ => String::new(),
     };
     Some(put_string(format!("{sa}{sb}")))
 }
@@ -667,13 +733,13 @@ pub(crate) fn string_equals(a: i64, b: i64) -> bool {
     if a == NULL || b == NULL {
         return false;
     }
-    let guard = lock();
-    let sa = match guard.get(&a) {
-        Some(Handle::String(s)) => s,
+    let sa = match shard_lock(a).get(&a) {
+        Some(Handle::String(s)) => s.clone(),
         _ => return false,
     };
+    let guard = shard_lock(b);
     let sb = match guard.get(&b) {
-        Some(Handle::String(s)) => s,
+        Some(Handle::String(s)) => s.as_str(),
         _ => return false,
     };
     sa == sb
@@ -734,20 +800,19 @@ pub(crate) fn array_get(id: i64, index: i64) -> Option<i64> {
 /// into a fresh handle owned by the array; all other elements are stored
 /// by value.
 pub(crate) fn array_push(id: i64, elem: i64) -> bool {
-    let mut guard = lock();
-    let string_elements = match guard.get(&id) {
+    let mut value = elem;
+    let string_elements = match shard_lock(id).get(&id) {
         Some(Handle::Array(arr)) => arr.string_elements,
         _ => return false,
     };
-    let value = if string_elements {
-        let text = match guard.get(&elem) {
+    if string_elements {
+        let text = match shard_lock(elem).get(&elem) {
             Some(Handle::String(s)) => s.clone(),
             _ => return false,
         };
-        insert_locked(&mut guard, Handle::String(text))
-    } else {
-        elem
-    };
+        value = insert(Handle::String(text));
+    }
+    let mut guard = shard_lock(id);
     let arr = match guard.get_mut(&id) {
         Some(Handle::Array(arr)) => arr,
         _ => return false,
@@ -764,20 +829,19 @@ pub(crate) fn array_set(id: i64, index: i64, elem: i64) -> bool {
     if id == NULL || index < 0 {
         return false;
     }
-    let mut guard = lock();
-    let string_elements = match guard.get(&id) {
+    let mut value = elem;
+    let string_elements = match shard_lock(id).get(&id) {
         Some(Handle::Array(arr)) => arr.string_elements,
         _ => return false,
     };
-    let value = if string_elements {
-        let text = match guard.get(&elem) {
+    if string_elements {
+        let text = match shard_lock(elem).get(&elem) {
             Some(Handle::String(s)) => s.clone(),
             _ => return false,
         };
-        insert_locked(&mut guard, Handle::String(text))
-    } else {
-        elem
-    };
+        value = insert(Handle::String(text));
+    }
+    let mut guard = shard_lock(id);
     let arr = match guard.get_mut(&id) {
         Some(Handle::Array(arr)) => arr,
         _ => return false,
@@ -786,12 +850,13 @@ pub(crate) fn array_set(id: i64, index: i64, elem: i64) -> bool {
         return false;
     }
     let old = std::mem::replace(&mut arr.elements[index as usize], value);
+    drop(guard);
 
     // The new string handle is always freshly registered, so it can never
-    // alias `old`; reclaim the replaced element without re-acquiring the
-    // registry lock (which we still hold).
-    if string_elements && guard.remove(&old).is_some() {
-        LIVE.fetch_sub(1, Ordering::Relaxed);
+    // alias `old`; reclaim the replaced string element through `take_string`,
+    // which locks the handle's own shard and decrements `LIVE`.
+    if string_elements {
+        take_string(old);
     }
     true
 }
@@ -803,7 +868,7 @@ pub(crate) fn array_drop(id: i64) {
         return;
     }
     let is_array = {
-        let guard = lock();
+        let guard = shard_lock(id);
         matches!(guard.get(&id), Some(Handle::Array(_)))
     };
     if !is_array {
@@ -826,7 +891,7 @@ pub(crate) fn array_pop(id: i64) -> Option<i64> {
     if id == NULL {
         return None;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     let arr = match guard.get_mut(&id) {
         Some(Handle::Array(arr)) => arr,
         _ => return None,
@@ -950,7 +1015,7 @@ fn array_slice_inner(id: i64, start: i64, end: i64) -> i64 {
         return NULL;
     }
     let (elem_size, string_elements, elements) = {
-        let guard = lock();
+        let guard = shard_lock(id);
         let arr = match guard.get(&id) {
             Some(Handle::Array(a)) => a,
             _ => return NULL,
@@ -988,7 +1053,7 @@ fn array_reverse_inner(id: i64) -> i64 {
         return NULL;
     }
     let (elem_size, string_elements, elements) = {
-        let guard = lock();
+        let guard = shard_lock(id);
         let arr = match guard.get(&id) {
             Some(Handle::Array(a)) => a,
             _ => return NULL,
@@ -1014,7 +1079,7 @@ fn array_clear_inner(id: i64) -> i64 {
         return NULL;
     }
     let (elem_size, string_elements) = {
-        let guard = lock();
+        let guard = shard_lock(id);
         match guard.get(&id) {
             Some(Handle::Array(a)) => (a.elem_size, a.string_elements),
             _ => return NULL,
@@ -1032,7 +1097,7 @@ fn array_remove_at_inner(id: i64, index: i64) -> i64 {
         return NULL;
     }
     let (elem_size, string_elements, elements) = {
-        let guard = lock();
+        let guard = shard_lock(id);
         let arr = match guard.get(&id) {
             Some(Handle::Array(a)) => a,
             _ => return NULL,
@@ -1063,7 +1128,7 @@ fn array_shuffle_inner(id: i64) -> i64 {
     if cloned == NULL {
         return NULL;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(cloned);
     let arr = match guard.get_mut(&cloned) {
         Some(Handle::Array(arr)) => arr,
         _ => return NULL,
@@ -1102,18 +1167,21 @@ fn array_sort_inner(id: i64, mode: i8) -> i64 {
     // Pre-read string elements so the sort below only mutates the element
     // vector (no registry borrow is held across the comparison loop).
     let strings: Option<Vec<Option<String>>> = {
-        let guard = lock();
-        let arr = match guard.get(&cloned) {
-            Some(Handle::Array(a)) => a,
-            _ => return NULL,
+        let (string_elements, element_handles) = {
+            let guard = shard_lock(cloned);
+            let arr = match guard.get(&cloned) {
+                Some(Handle::Array(a)) => a,
+                _ => return NULL,
+            };
+            (arr.string_elements, arr.elements.clone())
         };
-        if !arr.string_elements {
+        if !string_elements {
             None
         } else {
             Some(
-                arr.elements
+                element_handles
                     .iter()
-                    .map(|&h| match guard.get(&h) {
+                    .map(|&h| match shard_lock(h).get(&h) {
                         Some(Handle::String(s)) => Some(s.clone()),
                         _ => None,
                     })
@@ -1121,7 +1189,7 @@ fn array_sort_inner(id: i64, mode: i8) -> i64 {
             )
         }
     };
-    let mut guard = lock();
+    let mut guard = shard_lock(cloned);
     let arr = match guard.get_mut(&cloned) {
         Some(Handle::Array(arr)) => arr,
         _ => return NULL,
@@ -1175,7 +1243,7 @@ pub(crate) fn shared_release(id: i64) -> i64 {
     if id == NULL {
         return NULL;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     {
         let shared = match guard.get_mut(&id) {
             Some(Handle::Shared(shared)) => shared,
@@ -1224,7 +1292,7 @@ pub(crate) fn async_sleep_new(ms: i64) -> i64 {
 /// Poll an `async.sleep(ms)` future: arm it on the first poll, then
 /// return `1` once the deadline has passed and `0` otherwise.
 pub(crate) fn async_sleep_poll(id: i64) -> i8 {
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     let sleep = match guard.get_mut(&id) {
         Some(Handle::AsyncSleep {
             state,
@@ -1237,22 +1305,27 @@ pub(crate) fn async_sleep_poll(id: i64) -> i8 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let now_ms = now.as_millis() as i64;
-    match *sleep.0 {
+    let (result, park_until) = match *sleep.0 {
         0 => {
             *sleep.2 = now_ms.saturating_add(*sleep.1);
             *sleep.0 = 1;
-            0
+            (0, Some(*sleep.2))
         }
         1 => {
             if now_ms >= *sleep.2 {
                 *sleep.0 = 2;
-                1
+                (1, None)
             } else {
-                0
+                (0, Some(*sleep.2))
             }
         }
-        _ => 1,
+        _ => (1, None),
+    };
+    drop(guard);
+    if let Some(deadline) = park_until {
+        crate::ntask::scheduler::park_timer(deadline);
     }
+    result
 }
 
 /// Drop an `async.sleep(ms)` future.
@@ -1265,13 +1338,226 @@ pub(crate) fn async_sleep_drop(id: i64) {
     if id == NULL {
         return;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     if !matches!(guard.get(&id), Some(Handle::AsyncSleep { .. })) {
         return;
     }
     if guard.remove(&id).is_some() {
         LIVE.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+fn remove_kind(id: i64, predicate: impl FnOnce(&Handle) -> bool) -> Option<Handle> {
+    if id == NULL {
+        return None;
+    }
+    if borrow(id, predicate).unwrap_or(false) {
+        remove(id)
+    } else {
+        None
+    }
+}
+
+// ── Offloaded blocking futures ──────────────────────────────────────────
+
+/// Register an offloaded-blocking future that runs `work` on the worker pool
+/// and yields its result handle. Returns the future handle.
+pub(crate) fn async_op_new(work: Box<dyn FnOnce() -> i64 + Send + 'static>) -> i64 {
+    insert(Handle::AsyncOp {
+        state: 0,
+        work: Some(work),
+        op: 0,
+        result: NULL,
+    })
+}
+
+/// Poll an offloaded future: on the first poll it starts the job on the pool
+/// and parks the goroutine; once the pool completes the job it reaps the
+/// result and reports readiness. All scheduler calls happen outside the
+/// registry lock to avoid a lock-ordering inversion with the task core.
+pub(crate) fn async_op_poll(id: i64) -> i8 {
+    let start_work: Option<Box<dyn FnOnce() -> i64 + Send + 'static>> =
+        shard_lock(id).get_mut(&id).and_then(|handle| match handle {
+            Handle::AsyncOp { state: 0, work, .. } => work.take(),
+            _ => None,
+        });
+    if let Some(work) = start_work {
+        let op_id = crate::ntask::scheduler::register_op();
+        crate::ntask::scheduler::run_offload(move || {
+            let value = work();
+            crate::ntask::scheduler::complete_op(op_id, value);
+        });
+        if let Some(handle) = shard_lock(id).get_mut(&id)
+            && let Handle::AsyncOp { state, op, .. } = handle
+        {
+            *state = 1;
+            *op = op_id;
+        }
+        crate::ntask::scheduler::park_op(op_id);
+        return 0;
+    }
+
+    let op = shard_lock(id).get(&id).and_then(|handle| match handle {
+        Handle::AsyncOp { state: 1, op, .. } => Some(*op),
+        _ => None,
+    });
+    if let Some(op) = op {
+        if !crate::ntask::scheduler::op_done(op) {
+            crate::ntask::scheduler::park_op(op);
+            return 0;
+        }
+        let value = crate::ntask::scheduler::op_result(op);
+        if let Some(handle) = shard_lock(id).get_mut(&id)
+            && let Handle::AsyncOp { state, result, .. } = handle
+        {
+            *state = 2;
+            *result = value;
+        }
+    }
+    1
+}
+
+/// Reap the result handle of a completed offloaded future.
+pub(crate) fn async_op_result(id: i64) -> i64 {
+    if id == NULL {
+        return NULL;
+    }
+    shard_lock(id)
+        .get(&id)
+        .map(|handle| match handle {
+            Handle::AsyncOp {
+                state: 2, result, ..
+            } => *result,
+            _ => NULL,
+        })
+        .unwrap_or(NULL)
+}
+
+/// Drop an offloaded future. If it is still running, its pending op is
+/// dropped; a completed result handle is left for the caller to reap.
+pub(crate) fn async_op_drop(id: i64) {
+    if id == NULL {
+        return;
+    }
+    let pending_op = shard_lock(id).get(&id).and_then(|handle| match handle {
+        Handle::AsyncOp { state: 1, op, .. } if *op != 0 => Some(*op),
+        _ => None,
+    });
+    if let Some(op) = pending_op {
+        crate::ntask::scheduler::drop_op(op);
+    }
+    let _ = remove_kind(id, |handle| matches!(handle, Handle::AsyncOp { .. }));
+}
+
+// ── Goroutine handles ───────────────────────────────────────────────────
+
+/// Remove the `Handle::Goroutine` wrapper `handle`, so a fire-and-forget spawn
+/// does not leak its entry. A `NULL` or already-dropped handle is a no-op.
+pub(crate) fn remove_goroutine_handle(handle: i64) {
+    if handle == NULL {
+        return;
+    }
+    let mut guard = shard_lock(handle);
+    if !matches!(guard.get(&handle), Some(Handle::Goroutine { .. })) {
+        return;
+    }
+    if guard.remove(&handle).is_some() {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn goroutine_drop(id: i64) {
+    let Some(Handle::Goroutine { core }) =
+        remove_kind(id, |handle| matches!(handle, Handle::Goroutine { .. }))
+    else {
+        return;
+    };
+    crate::ntask::scheduler::drop_goroutine(core);
+}
+
+pub(crate) fn chan_retain(id: i64) -> i64 {
+    with_chan_mut(id, |handle| {
+        if let Handle::Chan { count, .. } = handle {
+            *count = count.saturating_add(1);
+        }
+    });
+    id
+}
+
+fn with_chan_mut<R>(id: i64, f: impl FnOnce(&mut Handle) -> R) -> Option<R> {
+    borrow_mut(id, |h| match h {
+        Handle::Chan { .. } => Some(f(h)),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Drop a channel handle. Like Go, dropping a `chan` variable does **not**
+/// close the channel — `close(ch)` is explicit. Reference counted like
+/// `Shared`: the `Chan` core stays alive until the last handle is gone.
+/// Previously this did `chan_close` + `drop_chan`, which woke a parked
+/// sender as a no-op after the peer's `ch` went out of scope and made
+/// `go sender(ch)` appear to complete after `main` returned, unlike Go
+/// where it stays blocked.
+pub(crate) fn chan_drop(id: i64) {
+    if id == NULL {
+        return;
+    }
+    let mut guard = shard_lock(id);
+    let count = match guard.get_mut(&id) {
+        Some(Handle::Chan { count, .. }) => {
+            *count = count.saturating_sub(1);
+            *count
+        }
+        _ => return,
+    };
+    if count > 0 {
+        return;
+    }
+    let taken = guard.remove(&id);
+    if taken.is_some() {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+    drop(guard);
+    if let Some(Handle::Chan { core, .. }) = taken {
+        crate::ntask::scheduler::drop_chan(core);
+    }
+}
+
+/// Drop a reactor registration handle.
+pub(crate) fn reactor_reg_drop(id: i64) {
+    let Some(Handle::ReactorReg { core }) =
+        remove_kind(id, |handle| matches!(handle, Handle::ReactorReg { .. }))
+    else {
+        return;
+    };
+    // Unwatch the fd before the core is removed so the reactor never polls a
+    // stale descriptor.
+    crate::ntask::reactor::detach_fd(core);
+    crate::ntask::scheduler::drop_io(core);
+}
+
+/// Drop an asynchronous I/O future handle.
+pub(crate) fn async_io_drop(id: i64) {
+    let Some(Handle::AsyncIo { core }) =
+        remove_kind(id, |handle| matches!(handle, Handle::AsyncIo { .. }))
+    else {
+        return;
+    };
+    // Unwatch the fd before the core is removed so the reactor never polls a
+    // stale descriptor.
+    crate::ntask::reactor::detach_fd(core);
+    crate::ntask::scheduler::drop_io(core);
+}
+
+pub(crate) fn task_core(id: i64) -> Option<i64> {
+    borrow(id, |handle| match handle {
+        Handle::Goroutine { core }
+        | Handle::Chan { core, .. }
+        | Handle::ReactorReg { core }
+        | Handle::AsyncIo { core } => Some(*core),
+        _ => None,
+    })?
 }
 
 // ── Opaque module values ───────────────────────────────────────────────────
@@ -1312,7 +1598,7 @@ pub(crate) fn take_opaque<T: Any + Send>(id: i64) -> Option<T> {
     if id == NULL {
         return None;
     }
-    let mut guard = lock();
+    let mut guard = shard_lock(id);
     if !matches!(
         guard.get(&id),
         Some(Handle::Opaque(opaque)) if opaque.is::<T>()
@@ -1326,6 +1612,35 @@ pub(crate) fn take_opaque<T: Any + Send>(id: i64) -> Option<T> {
         }
         _ => None,
     }
+}
+
+/// Run `f` over the opaque value behind `id` with the registry lock released,
+/// then put the (possibly modified) value back at the same `id`. Blocking
+/// socket operations must use this so they do not hold the registry lock for
+/// the whole wait.
+pub(crate) fn with_opaque_io<T: Any + Send, R>(id: i64, f: impl FnOnce(T) -> (T, R)) -> Option<R> {
+    if id == NULL {
+        return None;
+    }
+    let taken = {
+        let mut guard = shard_lock(id);
+        match guard.get(&id) {
+            Some(Handle::Opaque(opaque)) if opaque.is::<T>() => guard.remove(&id),
+            _ => return None,
+        }
+    };
+    let (t, r) = match taken {
+        Some(Handle::Opaque(opaque)) => match opaque.downcast::<T>() {
+            Ok(boxed) => f(*boxed),
+            Err(opaque) => {
+                shard_lock(id).insert(id, Handle::Opaque(opaque));
+                return None;
+            }
+        },
+        _ => return None,
+    };
+    shard_lock(id).insert(id, Handle::Opaque(Box::new(t)));
+    Some(r)
 }
 
 // ── High-level array operations used by lib.rs / modules ───────────────────
@@ -1571,11 +1886,11 @@ mod tests {
     /// of an absolute snapshot of `LIVE`: a snapshot races with every
     /// other test in the process.
     fn assert_counters_agree_with_map(step: &str) {
-        let guard = lock();
+        let shards = all_shards();
         let live = LIVE.load(Ordering::Relaxed);
         let permanent = PERMANENT.load(Ordering::Relaxed);
-        let entries = guard.len() as i64;
-        drop(guard);
+        let entries = shards.iter().map(|g| g.len() as i64).sum::<i64>();
+        drop(shards);
         assert_eq!(
             live + permanent,
             entries,
@@ -1585,7 +1900,7 @@ mod tests {
 
     /// Whether `id` still has an entry in the registry.
     fn is_registered(id: i64) -> bool {
-        lock().contains_key(&id)
+        shard_lock(id).contains_key(&id)
     }
 
     /// Regression: `take_string`/`take_opaque` remove the entry directly
@@ -1647,6 +1962,42 @@ mod tests {
         assert_counters_agree_with_map("take of the released inner value");
     }
 
+    /// Contention probe: 50k put/get/remove cycles from N threads. If the
+    /// 4-thread wall time is far worse than 4x a single thread's, the global
+    /// registry lock is a bottleneck and sharding would pay.
+    #[test]
+    fn registry_contention_probe() {
+        use std::time::Instant;
+
+        let cycle = |base: i64| {
+            for i in 0..50_000 {
+                let s = put_string(format!("probe-{base}-{i}"));
+                assert!(get_string(s).is_some());
+                let _ = take_string(s);
+            }
+        };
+
+        let single = Instant::now();
+        cycle(1_000_000);
+        let single = single.elapsed();
+
+        let start = Instant::now();
+        let handles: Vec<_> = (0..4)
+            .map(|t| std::thread::spawn(move || cycle(2_000_000 + t * 1_000_000)))
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let four = start.elapsed();
+
+        println!("registry probe: 1 thread {single:?}, 4 threads {four:?}");
+        // Informational: the assert only guards against pathological collapse.
+        assert!(
+            four.as_millis() < single.as_millis() * 20,
+            "registry contention collapse: 1 thread {single:?}, 4 threads {four:?}"
+        );
+    }
+
     /// Permanent entries are live for the whole program and must be
     /// excluded from the leak-reporting counter.
     #[test]
@@ -1655,5 +2006,56 @@ mod tests {
         assert!(is_registered(id));
         assert_eq!(get_string(id), Some("literal".to_string()));
         assert_counters_agree_with_map("insert_permanent");
+    }
+
+    /// A channel handle is reference counted: `go f(ch)` and `var b = ch`
+    /// retain it, so the core survives until the last holder drops it, and
+    /// only the removing drop touches `LIVE`.
+    #[test]
+    fn chan_handles_are_reference_counted_and_balance_the_live_counter() {
+        let core = crate::ntask::scheduler::register_chan(1, false);
+        let id = insert(Handle::Chan { core, count: 1 });
+        assert_counters_agree_with_map("chan insert");
+
+        assert_eq!(chan_retain(id), id);
+        assert_eq!(chan_retain(id), id);
+        assert_counters_agree_with_map("two chan retains");
+
+        chan_drop(id);
+        assert!(is_registered(id));
+        assert_counters_agree_with_map("chan drop with copies left");
+        chan_drop(id);
+        assert!(is_registered(id));
+        assert_counters_agree_with_map("second chan drop with a copy left");
+
+        chan_drop(id);
+        assert!(!is_registered(id));
+        assert_counters_agree_with_map("final chan drop");
+
+        chan_drop(id);
+        assert_counters_agree_with_map("chan drop of a stale handle");
+    }
+
+    /// Dropping a channel handle must not close the channel: `close(ch)` is
+    /// explicit, so a peer parked on a send stays parked when the other side
+    /// goes out of scope, as in Go.
+    #[test]
+    fn dropping_a_chan_handle_does_not_close_the_channel() {
+        let core = crate::ntask::scheduler::register_chan(0, false);
+        let id = insert(Handle::Chan { core, count: 1 });
+        chan_retain(id);
+
+        chan_drop(id);
+
+        let closed = crate::ntask::core::GLOBAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chans
+            .get(&core)
+            .map(|chan| chan.closed);
+        assert_eq!(closed, Some(false));
+
+        chan_drop(id);
+        assert!(!is_registered(id));
     }
 }

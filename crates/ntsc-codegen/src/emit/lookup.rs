@@ -60,6 +60,9 @@ pub(crate) fn type_annotation_to_ty(ann: &Option<ntsc_ast::types::TypeAnnotation
                 .map(|t| type_annotation_to_ty(&Some(t.clone())))
                 .collect(),
         ),
+        Some(TypeAnnotation::Chan(element)) => {
+            Ty::Chan(Box::new(type_annotation_to_ty(&Some(*element.clone()))))
+        }
         None => Ty::Any,
     }
 }

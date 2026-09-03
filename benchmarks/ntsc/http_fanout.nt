@@ -1,0 +1,49 @@
+// http_fanout.nt — `g` goroutines, each performing one awaited
+// `http.get_async` against a local server and reporting the response length
+// over a channel. The runtime offloads each blocking request to a bounded
+// worker pool and parks the goroutine, so thousands of in-flight requests
+// overlap on a handful of OS threads — never one thread per request.
+//
+//   usage: NTS_BENCH_N=64 NTS_BENCH_PORT=8080 ntsc_http_fanout
+//          (default g = 64, port = 8080)
+use http
+use sys
+use strings
+use fmt
+
+async fun fetch(int id, int port, chan[int] done) {
+    var string url = "http://127.0.0.1:" + port + "/item?id=" + id
+    var string body = await http.get_async(url)
+    strings.length(body) |> done
+}
+
+async fun main() -> int {
+    var int g = 64
+    var int port = 8080
+    var string n_env = sys.env("NTS_BENCH_N")
+    if (!strings.is_empty(n_env)) {
+        g = fmt.to_int(n_env)
+    }
+    var string port_env = sys.env("NTS_BENCH_PORT")
+    if (!strings.is_empty(port_env)) {
+        port = fmt.to_int(port_env)
+    }
+
+    var chan[int] done = chan.new(512)
+    var int id = 0
+    while (id < g) {
+        go fetch(id, port, done)
+        id = id + 1
+    }
+
+    var int total = 0
+    var int received = 0
+    for siz in done {
+        total = total + siz
+        received = received + 1
+        if (received == g) {
+            close(done)
+        }
+    }
+    return total
+}
