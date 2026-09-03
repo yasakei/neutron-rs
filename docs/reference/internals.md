@@ -296,6 +296,16 @@ shutdown — polls, steals, busy/spin/park time, and idle share — to diagnose
 load imbalance. The counters are relaxed atomics on the worker's own slot and
 cost nothing when the variable is unset.
 
+### Validation limits
+
+The scheduler's functional tests cover handoff, parking, reactor wakeups, and
+abandonment, and `scheduler_stress_handles_concurrent_channel_handoffs` adds a
+high fan-out channel stress case. Some end-to-end suites intentionally use
+wall-clock sleeps for slow clients and server-start windows, so they remain the
+most likely source of a transient CI failure. The normal CI gate does not run
+ThreadSanitizer or loom; the opt-in `.github/workflows/tsan.yml` workflow runs
+the scheduler stress test repeatedly under ThreadSanitizer on Linux.
+
 ## Optimization
 
 Debug builds skip optimization and emit no optimization passes. Release builds

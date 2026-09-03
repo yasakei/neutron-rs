@@ -1521,6 +1521,93 @@ mod tests {
         ntask_chan_drop(channel);
     }
 
+    #[test]
+    fn scheduler_stress_handles_concurrent_channel_handoffs() {
+        #[derive(Clone, Copy)]
+        struct State {
+            channel: i64,
+            value: i64,
+            received: i64,
+            phase: i8,
+        }
+
+        extern "C" fn receive(id: i64) -> i8 {
+            let Some((channel, phase)) =
+                registry::with_opaque(id, |state: &State| (state.channel, state.phase))
+            else {
+                return 1;
+            };
+            if phase == 0 {
+                ntask_chan_recv(channel);
+                let _ = registry::with_opaque_mut(id, |state: &mut State| state.phase = 1);
+                return 0;
+            }
+            let value = ntask_chan_recv_result();
+            let _ = registry::with_opaque_mut(id, |state: &mut State| {
+                state.received = value;
+                state.phase = 2;
+            });
+            1
+        }
+
+        extern "C" fn send(id: i64) -> i8 {
+            let Some((channel, value, phase)) = registry::with_opaque(id, |state: &State| {
+                (state.channel, state.value, state.phase)
+            }) else {
+                return 1;
+            };
+            if phase == 0 {
+                ntask_chan_send(channel, value);
+                let _ = registry::with_opaque_mut(id, |state: &mut State| state.phase = 1);
+                return 0;
+            }
+            1
+        }
+
+        const PAIRS: usize = 128;
+        const ROUNDS: usize = 4;
+        for round in 0..ROUNDS {
+            let mut tasks = Vec::with_capacity(PAIRS * 2);
+            let mut states = Vec::with_capacity(PAIRS);
+            for pair in 0..PAIRS {
+                let channel = ntask_chan_new(0, 0);
+                let receiver_state = registry::put_opaque(State {
+                    channel,
+                    value: 0,
+                    received: 0,
+                    phase: 0,
+                });
+                let sender_state = registry::put_opaque(State {
+                    channel,
+                    value: (round * PAIRS + pair) as i64,
+                    received: 0,
+                    phase: 0,
+                });
+                states.push((channel, receiver_state, sender_state));
+                tasks.push((ntask_go(receive, receiver_state), receiver_state));
+                tasks.push((ntask_go(send, sender_state), sender_state));
+            }
+
+            for (task, _) in &tasks {
+                let _ = ntask_join(*task);
+            }
+            for (task, _) in tasks {
+                ntask_goroutine_drop(task);
+            }
+            for (channel, receiver_state, sender_state) in states {
+                let received =
+                    registry::with_opaque(receiver_state, |state: &State| state.received)
+                        .expect("receiver state");
+                let expected = registry::with_opaque(sender_state, |state: &State| state.value)
+                    .expect("sender state");
+                assert_eq!(received, expected);
+                let _ = registry::take_opaque::<State>(receiver_state);
+                let _ = registry::take_opaque::<State>(sender_state);
+                ntask_chan_drop(channel);
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn reactor_wakes_a_goroutine_on_loopback_readiness() {

@@ -228,6 +228,9 @@ fn an_unknown_handle_is_refused_by_every_operation() {
     ntsc_string_drop(UNKNOWN);
     ntsc_array_drop(UNKNOWN);
     ntsc_async_sleep_drop(UNKNOWN);
+    // Closing an unknown channel is also a harmless no-op.
+    ntsc_runtime::ntask_chan_close(UNKNOWN);
+    ntsc_runtime::ntask_chan_drop(UNKNOWN);
 }
 
 #[test]

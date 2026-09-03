@@ -968,7 +968,6 @@ pub(crate) fn chan_close(core_id: i64) {
     let mut g = core::GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
     let (drained, senders, owns_elements, count) = {
         let Some(chan) = g.chans.get_mut(&core_id) else {
-            eprintln!("[sched] chan_close: not found");
             return;
         };
         if chan.closed {
